@@ -727,9 +727,10 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
 </div>
 
 <script>
-/* ============================================================
-   STATE
-   ============================================================ */
+/* ============ CONFIG ============ */
+const API = 'https://tradeedge-a5y0.onrender.com';
+
+/* ============ STATE ============ */
 const DOM = {
   pages: document.querySelectorAll('.page'),
   navLinks: document.querySelectorAll('.nav-links a'),
@@ -740,15 +741,35 @@ const DOM = {
 let autoBuyEnabled = false;
 let currentUser = null;
 let impersonating = false;
+let impersonateBackup = null;
 const GREEN = 'var(--success)';
 const RED = 'var(--danger)';
 const chgSpan = c => `<span style="color:${c.includes('+') ? GREEN : RED}">${c}</span>`;
 
-/* ============================================================
-   TOTP
-   ============================================================ */
-const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+/* ============ API CLIENT ============ */
+function getToken() { return localStorage.getItem('ta_token'); }
+function setToken(t) { localStorage.setItem('ta_token', t); }
+function getUser() { try { return JSON.parse(localStorage.getItem('ta_user') || 'null'); } catch { return null; } }
+function setUser(u) { localStorage.setItem('ta_user', JSON.stringify(u)); }
+function clearSession() { localStorage.removeItem('ta_token'); localStorage.removeItem('ta_user'); }
 
+async function api(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  const token = getToken();
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const res = await fetch(API + path, { ...opts, headers });
+  let data = {};
+  try { data = await res.json(); } catch {}
+  if (!res.ok) {
+    const err = new Error(data.error || `HTTP ${res.status}`);
+    err.status = res.status; err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+/* ============ TOTP ============ */
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 function base32Encode(bytes) {
   let bits = '', out = '';
   for (const b of bytes) bits += b.toString(2).padStart(8, '0');
@@ -758,11 +779,7 @@ function base32Encode(bytes) {
 function base32Decode(str) {
   str = str.toUpperCase().replace(/=+$/, '');
   let bits = '';
-  for (const c of str) {
-    const v = B32.indexOf(c);
-    if (v === -1) continue;
-    bits += v.toString(2).padStart(5, '0');
-  }
+  for (const c of str) { const v = B32.indexOf(c); if (v === -1) continue; bits += v.toString(2).padStart(5, '0'); }
   const bytes = [];
   for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.slice(i, i + 8), 2));
   return new Uint8Array(bytes);
@@ -790,33 +807,7 @@ function generateSecret() {
   return base32Encode(bytes);
 }
 
-/* ============================================================
-   SECURITY HELPERS
-   ============================================================ */
-async function hashPassword(password, salt) {
-  const enc = new TextEncoder();
-  const keyMat = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' },
-    keyMat, 256
-  );
-  return Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-const makeSalt = () => crypto.randomUUID();
-
-function saveSession(username, sessionId) {
-  localStorage.setItem('ta_session', JSON.stringify({
-    username, sessionId, expiresAt: Date.now() + 7 * 60 * 60 * 1000
-  }));
-}
-function loadSession() {
-  try {
-    const s = JSON.parse(localStorage.getItem('ta_session') || 'null');
-    if (!s || s.expiresAt <= Date.now()) return null;
-    return s;
-  } catch { return null; }
-}
-
+/* ============ PASSWORD GEN ============ */
 function generateStrongPassword(len = 12) {
   const U = 'ABCDEFGHJKMNPQRSTUVWXYZ', L = 'abcdefghjkmnpqrstuvwxyz', D = '23456789', S = '!@#$%&*';
   const all = U + L + D + S;
@@ -828,72 +819,50 @@ function fillRandomPassword() {
   document.getElementById('newPassword').value = generateStrongPassword();
   showToast('🎲 Generated', 'Strong password generated');
 }
-function findUserByLogin(users, input) {
-  const clean = input.trim().toLowerCase();
-  if (users[clean]) return users[clean];
-  const digits = clean.replace(/\D/g, '');
-  if (digits.length >= 10) return Object.values(users).find(u => u.mobile === digits);
-  return null;
-}
 
-/* ============================================================
-   AUDIT LOG
-   ============================================================ */
-function auditLog(action, details = '', level = 'info') {
-  const log = JSON.parse(localStorage.getItem('ta_audit') || '[]');
-  log.unshift({
-    ts: Date.now(),
-    actor: currentUser?.username || 'system',
-    action, details, level
-  });
-  localStorage.setItem('ta_audit', JSON.stringify(log.slice(0, 200)));
-}
-function clearAudit() {
-  if (!confirm('Clear entire audit log?')) return;
-  localStorage.setItem('ta_audit', '[]');
-  renderAudit();
-  showToast('🗑️ Cleared', 'Audit log cleared');
-}
-function renderAudit() {
-  const log = JSON.parse(localStorage.getItem('ta_audit') || '[]');
+/* ============ AUDIT ============ */
+async function renderAudit() {
   const box = document.getElementById('auditLog');
   if (!box) return;
-  if (!log.length) {
-    box.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No activity yet.</div>';
-    return;
-  }
-  const badgeFor = lvl => ({ success: 'badge-success', danger: 'badge-danger', warn: 'badge-warn' }[lvl] || 'badge-info');
-  box.innerHTML = log.map(e => `
-    <div class="audit-row">
-      <div class="audit-time">${new Date(e.ts).toLocaleString()}</div>
-      <div class="audit-actor">${e.actor}</div>
-      <div class="audit-action"><span class="audit-badge ${badgeFor(e.level)}">${e.action}</span></div>
-      <div class="audit-details">${e.details}</div>
-    </div>
-  `).join('');
+  try {
+    const rows = await api('/api/audit');
+    if (!rows.length) { box.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No activity yet.</div>'; return; }
+    const badgeFor = lvl => ({ success: 'badge-success', danger: 'badge-danger', warn: 'badge-warn' }[lvl] || 'badge-info');
+    box.innerHTML = rows.map(e => `
+      <div class="audit-row">
+        <div class="audit-time">${new Date(e.created_at).toLocaleString()}</div>
+        <div class="audit-actor">${e.actor}</div>
+        <div class="audit-action"><span class="audit-badge ${badgeFor(e.level)}">${e.action}</span></div>
+        <div class="audit-details">${e.details || ''}</div>
+      </div>`).join('');
+  } catch (e) { box.innerHTML = `<div style="color:var(--danger)">${e.message}</div>`; }
+}
+async function clearAudit() {
+  if (!confirm('Clear entire audit log?')) return;
+  try { await api('/api/audit', { method: 'DELETE' }); renderAudit(); showToast('🗑️ Cleared', 'Audit log cleared'); }
+  catch (e) { showToast('⚠️ Error', e.message); }
 }
 
-/* ============================================================
-   PRICING
-   ============================================================ */
-function getPrices() {
-  return JSON.parse(localStorage.getItem('ta_prices') || 'null') || { Demo: 0, Basic: 999, Pro: 2999 };
+/* ============ PRICES ============ */
+async function loadPrices() {
+  try {
+    const p = await api('/api/prices');
+    document.getElementById('priceDemo').value = p.Demo || 0;
+    document.getElementById('priceBasic').value = p.Basic || 0;
+    document.getElementById('pricePro').value = p.Pro || 0;
+  } catch {}
 }
-function savePrices() {
+async function savePrices() {
   const p = {
     Demo: +document.getElementById('priceDemo').value || 0,
     Basic: +document.getElementById('priceBasic').value || 0,
     Pro: +document.getElementById('pricePro').value || 0
   };
-  localStorage.setItem('ta_prices', JSON.stringify(p));
-  auditLog('PRICES_UPDATED', `Demo:₹${p.Demo} Basic:₹${p.Basic} Pro:₹${p.Pro}`, 'info');
-  renderKPIs();
-  showToast('✅ Saved', 'Plan prices updated');
+  try { await api('/api/prices', { method: 'PUT', body: JSON.stringify(p) }); renderKPIs(); showToast('✅ Saved', 'Plan prices updated'); }
+  catch (e) { showToast('⚠️ Error', e.message); }
 }
 
-/* ============================================================
-   DURATIONS
-   ============================================================ */
+/* ============ DURATIONS ============ */
 const DURATIONS = {
   '5d':  { label: '5 days',   days: 5 },
   '7d':  { label: '7 days',   days: 7 },
@@ -904,9 +873,7 @@ const DURATIONS = {
   '1y':  { label: '1 year',   days: 365 }
 };
 
-/* ============================================================
-   STRATEGIES
-   ============================================================ */
+/* ============ STRATEGIES ============ */
 const STRATEGIES = {
   advanceorb: {
     name: 'Advance ORB', icon: '📈', entryRule: 'Opening Range Breakout', risk: '2%',
@@ -945,106 +912,7 @@ const STRATEGIES = {
   }
 };
 
-/* ============================================================
-   USER STORAGE + MIGRATION
-   ============================================================ */
-function loadUsers() {
-  const raw = localStorage.getItem('ta_users');
-  if (raw) return JSON.parse(raw);
-  const seed = {
-    admin: { name: 'Admin', username: 'admin', role: 'admin', plan: '—', expiresAt: null,
-             salt: null, passwordHash: null, _needsSetup: true, disabled: false }
-  };
-  localStorage.setItem('ta_users', JSON.stringify(seed));
-  return seed;
-}
-function saveUsers(u) { localStorage.setItem('ta_users', JSON.stringify(u)); }
-
-async function ensureHashes(users) {
-  let changed = false;
-  for (const u of Object.values(users)) {
-    if (u.password) {
-      u.salt = makeSalt();
-      u.passwordHash = await hashPassword(u.password, u.salt);
-      delete u.password; changed = true;
-    }
-    if (u._needsSetup && u.role === 'admin') {
-      u.salt = makeSalt();
-      u.passwordHash = await hashPassword('admin123', u.salt);
-      delete u._needsSetup; changed = true;
-    }
-    if (u.disabled === undefined) { u.disabled = false; changed = true; }
-  }
-  if (changed) saveUsers(users);
-  return users;
-}
-
-function daysLeft(expiresAt) {
-  if (!expiresAt) return Infinity;
-  return Math.ceil((new Date(expiresAt) - Date.now()) / 86400000);
-}
-function calcExpiry(from, days) {
-  const now = new Date();
-  const base = from && new Date(from) > now ? new Date(from) : now;
-  base.setDate(base.getDate() + days);
-  return base.toISOString().split('T')[0];
-}
-function isActiveToday(u) {
-  if (!u.lastActive) return false;
-  const d = new Date(u.lastActive);
-  const t = new Date();
-  return d.toDateString() === t.toDateString();
-}
-
-/* ============================================================
-   AUTH
-   ============================================================ */
-async function doLogin() {
-  const input = document.getElementById('authUser').value.trim();
-  const password = document.getElementById('authPass').value;
-  const err = document.getElementById('authError');
-
-  const users = await ensureHashes(loadUsers());
-  const u = findUserByLogin(users, input);
-  const lockKey = u?.username || input.toLowerCase();
-
-  const lock = JSON.parse(localStorage.getItem('ta_lock') || '{}');
-  if (lock[lockKey]?.until > Date.now()) {
-    const m = Math.ceil((lock[lockKey].until - Date.now()) / 60000);
-    err.textContent = `Too many attempts. Try again in ${m} min.`;
-    return;
-  }
-
-  const ok = u && u.passwordHash && (u.passwordHash === await hashPassword(password, u.salt));
-
-  if (!ok) {
-    const e = lock[lockKey] || { count: 0 };
-    e.count = (e.count || 0) + 1;
-    if (e.count >= 3) { e.until = Date.now() + 15 * 60000; e.count = 0; }
-    lock[lockKey] = e;
-    localStorage.setItem('ta_lock', JSON.stringify(lock));
-    err.textContent = 'Invalid credentials';
-    auditLog('LOGIN_FAILED', `Input: ${input}`, 'danger');
-    return;
-  }
-  delete lock[lockKey];
-  localStorage.setItem('ta_lock', JSON.stringify(lock));
-
-  if (u.disabled) {
-    err.textContent = 'Account disabled. Contact admin.';
-    auditLog('LOGIN_BLOCKED', `Disabled account: ${u.username}`, 'warn');
-    return;
-  }
-  if (u.role !== 'admin' && daysLeft(u.expiresAt) <= 0) {
-    showExpired(u);
-    auditLog('LOGIN_BLOCKED', `Expired: ${u.username}`, 'warn');
-    return;
-  }
-
-  err.textContent = '';
-  startTotpStep(u, users);
-}
-
+/* ============ LOGIN FLOW ============ */
 let pendingLoginUser = null;
 
 function showLoginStep(step) {
@@ -1053,25 +921,35 @@ function showLoginStep(step) {
   document.getElementById('loginStep2Setup').style.display = step === 'setup' ? 'block' : 'none';
 }
 
-async function startTotpStep(user, users) {
-  pendingLoginUser = { user, users };
+async function doLogin() {
+  const input = document.getElementById('authUser').value.trim();
+  const password = document.getElementById('authPass').value;
+  const err = document.getElementById('authError');
+  err.textContent = '';
+  if (!input || !password) { err.textContent = 'Enter username and password'; return; }
 
-  if (user.totpSecret) {
-    showLoginStep('verify');
-    document.getElementById('authTotp').value = '';
-    document.getElementById('authTotpError').textContent = '';
-    setTimeout(() => document.getElementById('authTotp').focus(), 100);
-  } else {
-    const secret = generateSecret();
-    pendingLoginUser.newSecret = secret;
-    const uri = `otpauth://totp/TradeAlgo:${user.username}?secret=${secret}&issuer=TradeAlgo`;
-    document.getElementById('setupQR').src =
-      `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(uri)}`;
-    document.getElementById('setupSecret').value = secret;
-    document.getElementById('setupCode').value = '';
-    document.getElementById('setupError').textContent = '';
-    showLoginStep('setup');
-    setTimeout(() => document.getElementById('setupCode').focus(), 100);
+  try {
+    const r = await api('/api/login', { method: 'POST', body: JSON.stringify({ input, password }) });
+    pendingLoginUser = r;
+    if (r.needsSetup) {
+      const secret = generateSecret();
+      pendingLoginUser.newSecret = secret;
+      const uri = `otpauth://totp/TradeAlgo:${r.username}?secret=${secret}&issuer=TradeAlgo`;
+      document.getElementById('setupQR').src = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(uri)}`;
+      document.getElementById('setupSecret').value = secret;
+      document.getElementById('setupCode').value = '';
+      document.getElementById('setupError').textContent = '';
+      showLoginStep('setup');
+      setTimeout(() => document.getElementById('setupCode').focus(), 100);
+    } else {
+      document.getElementById('authTotp').value = '';
+      document.getElementById('authTotpError').textContent = '';
+      showLoginStep('verify');
+      setTimeout(() => document.getElementById('authTotp').focus(), 100);
+    }
+  } catch (e) {
+    if (e.data?.expired) { showExpired({ name: input, expiresAt: e.data.expiresAt }); return; }
+    err.textContent = e.message;
   }
 }
 
@@ -1079,50 +957,38 @@ async function verifyLoginTotp() {
   const code = document.getElementById('authTotp').value.trim();
   const err = document.getElementById('authTotpError');
   if (!/^\d{6}$/.test(code)) { err.textContent = 'Enter 6 digits'; return; }
-
-  const { user, users } = pendingLoginUser;
-  if (!await verifyTotp(user.totpSecret, code)) {
+  if (!await verifyTotp(pendingLoginUser.totpSecret, code)) {
     err.textContent = 'Invalid code. Try again.';
-    auditLog('TOTP_FAILED', `User: ${user.username}`, 'danger');
     return;
   }
-  await completeLogin(user, users, '2FA');
+  await completeLogin({ username: pendingLoginUser.username });
 }
 
 async function confirmSetup() {
   const code = document.getElementById('setupCode').value.trim();
   const err = document.getElementById('setupError');
   if (!/^\d{6}$/.test(code)) { err.textContent = 'Enter 6 digits'; return; }
-
-  const { user, users, newSecret } = pendingLoginUser;
-  if (!await verifyTotp(newSecret, code)) {
+  if (!await verifyTotp(pendingLoginUser.newSecret, code)) {
     err.textContent = 'Code did not match. Check your app and try again.';
     return;
   }
-
-  users[user.username].totpSecret = newSecret;
-  user.totpSecret = newSecret;
-  saveUsers(users);
-  auditLog('TOTP_ENABLED', `User: ${user.username}`, 'success');
-  await completeLogin(user, users, '2FA setup');
+  await completeLogin({ username: pendingLoginUser.username, totpSecret: pendingLoginUser.newSecret });
 }
 
-async function completeLogin(user, users, reason) {
-  user.lastActive = Date.now();
-  user.sessionId = crypto.randomUUID();
-  users[user.username] = user;
-  saveUsers(users);
-  currentUser = { ...user, username: user.username };
-  saveSession(user.username, user.sessionId);
-  pendingLoginUser = null;
-  showLoginStep(1);
-  showApp();
-  auditLog('LOGIN_SUCCESS', `User: ${user.username} (${reason})`, 'success');
-
-  if (user.role !== 'admin') {
-    const dl = daysLeft(user.expiresAt);
-    if (dl <= 7) setTimeout(() => showToast('⚠️ Expiring Soon', `Expires in ${dl} day${dl===1?'':'s'}`), 500);
-  }
+async function completeLogin(payload) {
+  try {
+    const r = await api('/api/complete-login', { method: 'POST', body: JSON.stringify(payload) });
+    setToken(r.token);
+    setUser(r.user);
+    currentUser = r.user;
+    pendingLoginUser = null;
+    showLoginStep(1);
+    showApp();
+    if (r.user.role !== 'admin' && r.user.expiresAt) {
+      const dl = Math.ceil((new Date(r.user.expiresAt) - Date.now()) / 86400000);
+      if (dl <= 7) setTimeout(() => showToast('⚠️ Expiring Soon', `Expires in ${dl} day${dl===1?'':'s'}`), 500);
+    }
+  } catch (e) { showToast('⚠️ Login Error', e.message); }
 }
 
 function cancelTotp() {
@@ -1133,11 +999,12 @@ function cancelTotp() {
 }
 
 function logout() {
-  if (currentUser) auditLog('LOGOUT', `User: ${currentUser.username}`, 'info');
+  const token = getToken();
+  if (token) api('/api/logout', { method: 'POST' }).catch(() => {});
   currentUser = null;
   impersonating = false;
-  localStorage.removeItem('ta_session');
-  localStorage.removeItem('ta_admin_session');
+  impersonateBackup = null;
+  clearSession();
   document.body.classList.remove('impersonating');
   document.getElementById('impersonateBanner').style.display = 'none';
   document.getElementById('authUser').value = '';
@@ -1160,6 +1027,7 @@ function showExpired(user) {
   document.getElementById('expiredMsg').innerHTML =
     `Hi <strong>${user.name}</strong>, your subscription expired on <strong>${user.expiresAt}</strong>.<br>Please contact admin to renew.`;
 }
+
 function showApp() {
   document.body.classList.remove('logged-out');
   document.getElementById('authScreen').style.display = 'none';
@@ -1169,7 +1037,7 @@ function showApp() {
     el.style.display = (currentUser.role === 'admin' && !impersonating) ? '' : 'none';
   });
 
-  const initials = currentUser.name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
+  const initials = (currentUser.name || 'U').split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
   document.getElementById('avatarEl').textContent = initials;
   document.getElementById('avatarName').textContent = currentUser.name;
   document.getElementById('avatarRole').textContent = currentUser.role;
@@ -1184,34 +1052,25 @@ function showApp() {
   }
 
   if (currentUser.role === 'admin' && !impersonating) {
-    renderKPIs();
-    renderUsers();
-    loadPrices();
-    renderAudit();
+    renderKPIs(); renderUsers(); loadPrices(); renderAudit();
   }
   navigateTo('screener');
 
   if (!window._expiryTimer) {
-    window._expiryTimer = setInterval(() => {
+    window._expiryTimer = setInterval(async () => {
       if (!currentUser || impersonating) return;
-      const users = loadUsers();
-      const u = users[currentUser.username];
-      if (u && u.sessionId && u.sessionId !== currentUser.sessionId) {
-        showToast('⛔ Session Ended', 'Logged in on another device');
-        setTimeout(logout, 1500);
-        return;
-      }
-      if (currentUser.role !== 'admin' && daysLeft(currentUser.expiresAt) <= 0) {
-        showToast('⛔ Expired', 'Subscription ended');
-        setTimeout(logout, 1500);
+      try { await api('/api/session-check'); }
+      catch (e) {
+        if (e.status === 401) {
+          showToast('⛔ Session Ended', e.message || 'Logged in on another device');
+          setTimeout(logout, 1500);
+        }
       }
     }, 30000);
   }
 }
 
-/* ============================================================
-   TABS
-   ============================================================ */
+/* ============ TABS ============ */
 function switchTab(name, e) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
@@ -1221,232 +1080,161 @@ function switchTab(name, e) {
   if (name === 'prices') loadPrices();
 }
 
-/* ============================================================
-   KPIs
-   ============================================================ */
-function renderKPIs() {
-  const users = Object.values(loadUsers()).filter(u => u.role !== 'admin');
-  const prices = getPrices();
-  const total = users.length;
-  const activeToday = users.filter(isActiveToday).length;
-  const expiring = users.filter(u => { const d = daysLeft(u.expiresAt); return d > 0 && d <= 7; }).length;
-  const expired = users.filter(u => daysLeft(u.expiresAt) <= 0).length;
-  const mrr = users.filter(u => daysLeft(u.expiresAt) > 0 && !u.disabled)
-                   .reduce((sum, u) => sum + (prices[u.plan] || 0), 0);
-
-  document.getElementById('adminKPIs').innerHTML = `
-    <div class="stat-box"><div class="label">👥 Total Users</div><div class="value">${total}</div><div class="sub">All registered</div></div>
-    <div class="stat-box"><div class="label">🟢 Active Today</div><div class="value">${activeToday}</div><div class="sub green">Logged in today</div></div>
-    <div class="stat-box"><div class="label">⏰ Expiring (7d)</div><div class="value">${expiring}</div><div class="sub warn">Renew soon</div></div>
-    <div class="stat-box"><div class="label">🔴 Expired</div><div class="value">${expired}</div><div class="sub red">Need renewal</div></div>
-    <div class="stat-box"><div class="label">💰 MRR</div><div class="value">₹${mrr.toLocaleString()}</div><div class="sub green">Monthly revenue</div></div>
-  `;
+/* ============ KPIs ============ */
+async function renderKPIs() {
+  try {
+    const users = (await api('/api/users')).filter(u => u.role !== 'admin');
+    const prices = await api('/api/prices');
+    const total = users.length;
+    const activeToday = users.filter(u => u.lastActive && new Date(u.lastActive).toDateString() === new Date().toDateString()).length;
+    const expiring = users.filter(u => {
+      if (!u.expiresAt) return false;
+      const d = Math.ceil((new Date(u.expiresAt) - Date.now()) / 86400000);
+      return d > 0 && d <= 7;
+    }).length;
+    const expired = users.filter(u => u.expiresAt && new Date(u.expiresAt) < new Date()).length;
+    const mrr = users.filter(u => u.expiresAt && new Date(u.expiresAt) > new Date() && !u.disabled)
+                     .reduce((s, u) => s + (prices[u.plan] || 0), 0);
+    document.getElementById('adminKPIs').innerHTML = `
+      <div class="stat-box"><div class="label">👥 Total Users</div><div class="value">${total}</div><div class="sub">All registered</div></div>
+      <div class="stat-box"><div class="label">🟢 Active Today</div><div class="value">${activeToday}</div><div class="sub green">Logged in today</div></div>
+      <div class="stat-box"><div class="label">⏰ Expiring (7d)</div><div class="value">${expiring}</div><div class="sub warn">Renew soon</div></div>
+      <div class="stat-box"><div class="label">🔴 Expired</div><div class="value">${expired}</div><div class="sub red">Need renewal</div></div>
+      <div class="stat-box"><div class="label">💰 MRR</div><div class="value">₹${mrr.toLocaleString()}</div><div class="sub green">Monthly revenue</div></div>`;
+  } catch {}
 }
 
-function loadPrices() {
-  const p = getPrices();
-  document.getElementById('priceDemo').value = p.Demo;
-  document.getElementById('priceBasic').value = p.Basic;
-  document.getElementById('pricePro').value = p.Pro;
-}
-
-/* ============================================================
-   USER MANAGEMENT
-   ============================================================ */
-function renderUsers() {
-  const users = loadUsers();
+/* ============ USERS ============ */
+async function renderUsers() {
   const search = (document.getElementById('userSearch')?.value || '').toLowerCase();
   const filter = document.getElementById('userFilter')?.value || 'all';
+  try {
+    let list = await api('/api/users');
+    if (search) list = list.filter(u =>
+      u.name.toLowerCase().includes(search) || u.username.includes(search) || (u.mobile || '').includes(search));
+    if (filter === 'active')   list = list.filter(u => u.role !== 'admin' && !u.disabled && u.expiresAt && new Date(u.expiresAt) > new Date());
+    if (filter === 'expiring') list = list.filter(u => u.expiresAt && (() => { const d = Math.ceil((new Date(u.expiresAt)-Date.now())/86400000); return d > 0 && d <= 7; })());
+    if (filter === 'expired')  list = list.filter(u => u.role !== 'admin' && u.expiresAt && new Date(u.expiresAt) < new Date());
+    if (filter === 'disabled') list = list.filter(u => u.disabled);
 
-  let list = Object.values(users);
-  if (search) list = list.filter(u =>
-    u.name.toLowerCase().includes(search) ||
-    u.username.includes(search) ||
-    (u.mobile || '').includes(search)
-  );
-  if (filter === 'active')   list = list.filter(u => u.role !== 'admin' && !u.disabled && daysLeft(u.expiresAt) > 0);
-  if (filter === 'expiring') list = list.filter(u => { const d = daysLeft(u.expiresAt); return d > 0 && d <= 7; });
-  if (filter === 'expired')  list = list.filter(u => u.role !== 'admin' && daysLeft(u.expiresAt) <= 0);
-  if (filter === 'disabled') list = list.filter(u => u.disabled);
-
-  if (!list.length) {
-    document.getElementById('usersTable').innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No users match filters.</div>';
-    return;
+    if (!list.length) {
+      document.getElementById('usersTable').innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No users match filters.</div>';
+      return;
+    }
+    const rows = list.map(u => {
+      const dl = u.expiresAt ? Math.ceil((new Date(u.expiresAt) - Date.now()) / 86400000) : Infinity;
+      let daysText, color;
+      if (u.role === 'admin') { daysText = '—'; color = 'var(--text-muted)'; }
+      else if (u.disabled)    { daysText = 'Disabled'; color = 'var(--text-muted)'; }
+      else if (dl <= 0)       { daysText = 'Expired'; color = 'var(--text-muted)'; }
+      else if (dl <= 7)       { daysText = `${dl} days`; color = 'var(--danger)'; }
+      else if (dl <= 30)      { daysText = `${dl} days`; color = 'var(--warning)'; }
+      else                    { daysText = `${dl} days`; color = 'var(--success)'; }
+      const isAdmin = u.role === 'admin';
+      return `<tr class="${u.disabled ? 'row-disabled' : ''}">
+        <td><strong>${u.name}</strong>${u.mobile ? `<br><span style="font-size:11px;color:var(--text-muted)">📱 ${u.mobile}</span>` : ''}</td>
+        <td>${u.username}</td>
+        <td>${u.plan || '—'}</td>
+        <td>${u.expiresAt ? String(u.expiresAt).slice(0,10) : '—'}</td>
+        <td style="color:${color};font-weight:600">${daysText}</td>
+        <td class="actions-cell">
+          ${isAdmin ? '<span style="color:var(--text-muted);font-size:11px">—</span>' : `
+            <button class="btn btn-outline btn-sm" onclick="impersonate('${u.username}')">👁️ View</button>
+            <button class="btn btn-primary btn-sm" onclick="renewUser('${u.username}')">Renew</button>
+            <button class="btn btn-warn btn-sm" onclick="resetPassword('${u.username}')">🔑</button>
+            <button class="btn btn-outline btn-sm" onclick="toggleDisable('${u.username}')">${u.disabled ? '✅' : '⏸️'}</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.username}')">🗑️</button>`}
+        </td></tr>`;
+    }).join('');
+    document.getElementById('usersTable').innerHTML = `
+      <table class="table-modern">
+        <thead><tr><th>Name</th><th>Username</th><th>Plan</th><th>Expires</th><th>Days Left</th><th>Actions</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  } catch (e) {
+    document.getElementById('usersTable').innerHTML = `<div style="color:var(--danger)">${e.message}</div>`;
   }
-
-  const rows = list.map(u => {
-    const dl = daysLeft(u.expiresAt);
-    let daysText, color;
-    if (u.role === 'admin')       { daysText = '—'; color = 'var(--text-muted)'; }
-    else if (u.disabled)          { daysText = 'Disabled'; color = 'var(--text-muted)'; }
-    else if (dl <= 0)             { daysText = 'Expired'; color = 'var(--text-muted)'; }
-    else if (dl <= 7)             { daysText = `${dl} days`; color = 'var(--danger)'; }
-    else if (dl <= 30)            { daysText = `${dl} days`; color = 'var(--warning)'; }
-    else                          { daysText = `${dl} days`; color = 'var(--success)'; }
-
-    const isAdmin = u.role === 'admin';
-    return `<tr class="${u.disabled ? 'row-disabled' : ''}">
-      <td><strong>${u.name}</strong>${u.mobile ? `<br><span style="font-size:11px;color:var(--text-muted)">📱 ${u.mobile}</span>` : ''}</td>
-      <td>${u.username}</td>
-      <td>${u.plan || '—'}</td>
-      <td>${u.expiresAt || '—'}</td>
-      <td style="color:${color};font-weight:600">${daysText}</td>
-      <td class="actions-cell">
-        ${isAdmin ? '<span style="color:var(--text-muted);font-size:11px">—</span>' : `
-          <button class="btn btn-outline btn-sm" onclick="impersonate('${u.username}')" title="Login as this user">👁️ View</button>
-          <button class="btn btn-primary btn-sm" onclick="renewUser('${u.username}')">Renew</button>
-          <button class="btn btn-warn btn-sm" onclick="resetPassword('${u.username}')" title="Reset password + 2FA">🔑</button>
-          <button class="btn btn-outline btn-sm" onclick="toggleDisable('${u.username}')">${u.disabled ? '✅' : '⏸️'}</button>
-          <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.username}')">🗑️</button>
-        `}
-      </td>
-    </tr>`;
-  }).join('');
-
-  document.getElementById('usersTable').innerHTML = `
-    <table class="table-modern">
-      <thead><tr><th>Name</th><th>Username</th><th>Plan</th><th>Expires</th><th>Days Left</th><th>Actions</th></tr></thead>
-      <tbody>${rows}</tbody>
-    </table>`;
 }
 
 async function addUser() {
   const name = document.getElementById('newName').value.trim();
   const username = document.getElementById('newUsername').value.trim().toLowerCase();
-  const mobileRaw = document.getElementById('newMobile').value.trim();
-  const mobile = mobileRaw.replace(/\D/g, '');
+  const mobile = document.getElementById('newMobile').value.replace(/\D/g, '') || null;
   const password = document.getElementById('newPassword').value;
   const plan = document.getElementById('newPlan').value;
   const durKey = document.getElementById('newDuration').value;
-
   if (!name || !username || !password) { showToast('⚠️ Missing Fields','Name, username, password required'); return; }
-  const users = await ensureHashes(loadUsers());
-  if (users[username]) { showToast('⚠️ Username Taken', `"${username}" exists`); return; }
-  if (mobile && Object.values(users).some(u => u.mobile === mobile)) {
-    showToast('⚠️ Mobile Taken', 'This mobile is already registered'); return;
-  }
 
-  const salt = makeSalt();
-  const passwordHash = await hashPassword(password, salt);
-  const expiresAt = calcExpiry(null, DURATIONS[durKey].days);
-  users[username] = { name, username, mobile: mobile || null, passwordHash, salt, role: 'user', plan, expiresAt, disabled: false };
-  saveUsers(users);
+  const days = DURATIONS[durKey].days;
+  const d = new Date(); d.setDate(d.getDate() + days);
+  const expiresAt = d.toISOString().split('T')[0];
 
-  document.getElementById('newName').value = '';
-  document.getElementById('newUsername').value = '';
-  document.getElementById('newMobile').value = '';
-  document.getElementById('newPassword').value = '';
-
-  renderUsers();
-  renderKPIs();
-  auditLog('USER_CREATED', `${name} (@${username}) · ${plan} · ${DURATIONS[durKey].label}`, 'success');
-  showToast('✅ User Created', `${name} · password: ${password}`);
+  try {
+    await api('/api/users', { method: 'POST', body: JSON.stringify({ name, username, mobile, password, plan, expiresAt }) });
+    document.getElementById('newName').value = '';
+    document.getElementById('newUsername').value = '';
+    document.getElementById('newMobile').value = '';
+    document.getElementById('newPassword').value = '';
+    renderUsers(); renderKPIs();
+    showToast('✅ User Created', `${name} · password: ${password}`);
+  } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
-function renewUser(username) {
-  const choice = prompt(
-    `Renew "${username}" for:\n1. 5 days\n2. 7 days\n3. 1 month\n4. 2 months\n5. 3 months\n6. 6 months\n7. 1 year\n\nEnter number (1-7):`
-  );
+async function renewUser(username) {
+  const choice = prompt(`Renew "${username}":\n1. 5 days\n2. 7 days\n3. 1 month\n4. 2 months\n5. 3 months\n6. 6 months\n7. 1 year\n\nEnter 1-7:`);
   if (!choice) return;
-  const map = { '1':'5d', '2':'7d', '3':'1m', '4':'2m', '5':'3m', '6':'6m', '7':'1y' };
-  const key = map[choice.trim()];
-  if (!key) { showToast('⚠️ Invalid', 'Enter a number 1-7'); return; }
-
-  const users = loadUsers();
-  const u = users[username];
-  if (!u) return;
-  u.expiresAt = calcExpiry(u.expiresAt, DURATIONS[key].days);
-  saveUsers(users);
-  renderUsers();
-  renderKPIs();
-  auditLog('USER_RENEWED', `${u.name} (@${username}) + ${DURATIONS[key].label} → ${u.expiresAt}`, 'success');
-  showToast('✅ Renewed', `${u.name} extended by ${DURATIONS[key].label}`);
+  const map = { '1':5, '2':7, '3':30, '4':60, '5':90, '6':180, '7':365 };
+  const days = map[choice.trim()];
+  if (!days) { showToast('⚠️ Invalid', 'Enter 1-7'); return; }
+  try {
+    await api(`/api/users/${username}/renew`, { method: 'POST', body: JSON.stringify({ days }) });
+    renderUsers(); renderKPIs();
+    showToast('✅ Renewed', `+${days} days`);
+  } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
-function deleteUser(username) {
-  const users = loadUsers();
-  const u = users[username];
-  if (!u) return;
-  if (!confirm(`Delete user "${u.name}" (@${username})?`)) return;
-  delete users[username];
-  saveUsers(users);
-  renderUsers();
-  renderKPIs();
-  auditLog('USER_DELETED', `${u.name} (@${username})`, 'danger');
-  showToast('🗑️ Deleted', `"${u.name}" removed`);
+async function deleteUser(username) {
+  if (!confirm(`Delete user "${username}"?`)) return;
+  try { await api(`/api/users/${username}`, { method: 'DELETE' }); renderUsers(); renderKPIs(); showToast('🗑️ Deleted', username); }
+  catch (e) { showToast('⚠️ Error', e.message); }
 }
 
-function toggleDisable(username) {
-  const users = loadUsers();
-  const u = users[username];
-  if (!u) return;
-  u.disabled = !u.disabled;
-  saveUsers(users);
-  renderUsers();
-  auditLog(u.disabled ? 'USER_DISABLED' : 'USER_ENABLED', `${u.name} (@${username})`, u.disabled ? 'warn' : 'success');
-  showToast(u.disabled ? '⏸️ Disabled' : '✅ Enabled', `${u.name} ${u.disabled ? 'disabled' : 'enabled'}`);
+async function toggleDisable(username) {
+  try { await api(`/api/users/${username}/disable`, { method: 'POST' }); renderUsers(); showToast('✅ Done', 'Status updated'); }
+  catch (e) { showToast('⚠️ Error', e.message); }
 }
 
 async function resetPassword(username) {
-  const users = loadUsers();
-  const u = users[username];
-  if (!u) return;
-  if (!confirm(`Reset password + 2FA for "${u.name}"?\nUser will set up 2FA again on next login.`)) return;
-
-  const temp = 'Tmp' + Math.random().toString(36).slice(2, 8);
-  u.salt = makeSalt();
-  u.passwordHash = await hashPassword(temp, u.salt);
-  delete u.totpSecret;
-  u.sessionId = crypto.randomUUID();
-  saveUsers(users);
-  auditLog('PASSWORD_RESET', `${u.name} (@${username}) + 2FA cleared`, 'warn');
-  showToast('🔑 Temp Password', `${u.name}: ${temp} — 2FA reset too`);
+  if (!confirm(`Reset password + 2FA for "${username}"?`)) return;
+  try {
+    const r = await api(`/api/users/${username}/reset`, { method: 'POST' });
+    showToast('🔑 Temp Password', `${username}: ${r.temp}`);
+  } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
-/* ============================================================
-   IMPERSONATE
-   ============================================================ */
-function impersonate(username) {
-  const users = loadUsers();
-  const u = users[username];
-  if (!u) return;
-  if (!confirm(`Login as "${u.name}" (@${username})?`)) return;
-
-  localStorage.setItem('ta_admin_session', JSON.stringify({
-    username: currentUser.username,
-    sessionId: currentUser.sessionId,
-    expiresAt: Date.now() + 7 * 60 * 60 * 1000
-  }));
-
+/* ============ IMPERSONATE ============ */
+async function impersonate(username) {
+  if (!confirm(`View as "${username}"?`)) return;
+  impersonateBackup = { user: currentUser, token: getToken() };
   impersonating = true;
-  currentUser = { ...u, username };
-  saveSession(username, u.sessionId);
-  auditLog('IMPERSONATE_START', `Admin viewing as ${u.name} (@${username})`, 'warn');
+  const all = await api('/api/users');
+  const u = all.find(x => x.username === username);
+  if (!u) return;
+  currentUser = { ...currentUser, name: u.name, username: u.username, role: u.role };
   showApp();
-  showToast('👁️ Impersonating', `Now viewing as ${u.name}`);
+  showToast('👁️ Viewing', `As ${u.name}`);
 }
 
 function exitImpersonate() {
-  const adminSess = JSON.parse(localStorage.getItem('ta_admin_session') || 'null');
-  if (!adminSess) { logout(); return; }
-
-  const users = loadUsers();
-  const admin = users[adminSess.username];
-  if (!admin) { logout(); return; }
-
-  auditLog('IMPERSONATE_END', `Stopped viewing as ${currentUser.name}`, 'info');
-
+  if (!impersonateBackup) { logout(); return; }
   impersonating = false;
-  currentUser = { ...admin, username: adminSess.username };
-  localStorage.setItem('ta_session', JSON.stringify(adminSess));
-  localStorage.removeItem('ta_admin_session');
+  currentUser = impersonateBackup.user;
+  impersonateBackup = null;
   showApp();
-  showToast('✅ Exited', 'Back to admin account');
+  showToast('✅ Exited', 'Back to admin');
 }
 
-/* ============================================================
-   BULK IMPORT
-   ============================================================ */
+/* ============ BULK IMPORT ============ */
 function loadSampleCSV() {
   document.getElementById('csvInput').value =
 `Ravi Kumar,ravi,pass123,Basic,1m,9876543210
@@ -1456,72 +1244,54 @@ Rahul Verma,rahul,demo123,Demo,5d`;
 
 async function bulkImport() {
   const raw = document.getElementById('csvInput').value.trim();
-  if (!raw) { showToast('⚠️ Empty', 'Paste CSV data first'); return; }
-
-  const users = await ensureHashes(loadUsers());
+  if (!raw) { showToast('⚠️ Empty', 'Paste CSV first'); return; }
   const lines = raw.split('\n').filter(l => l.trim());
-  let ok = 0, fail = 0;
-  const errors = [];
-
+  let ok = 0, fail = 0; const errors = [];
   for (const line of lines) {
-    const parts = line.split(',').map(p => p.trim());
-    if (parts.length < 5) { fail++; errors.push(`Bad format: ${line}`); continue; }
-    const [name, username, password, plan, durCode, mobileRaw] = parts;
-    const mobile = (mobileRaw || '').replace(/\D/g, '');
+    const p = line.split(',').map(s => s.trim());
+    if (p.length < 5) { fail++; errors.push(`Bad format: ${line}`); continue; }
+    const [name, username, password, plan, durCode, mobileRaw] = p;
     const dur = DURATIONS[durCode];
-    if (!name || !username || !password || !dur) { fail++; errors.push(`Missing fields: ${line}`); continue; }
-    const uname = username.toLowerCase();
-    if (users[uname]) { fail++; errors.push(`Duplicate: ${uname}`); continue; }
-    if (mobile && Object.values(users).some(u => u.mobile === mobile)) {
-      fail++; errors.push(`Mobile exists: ${mobile}`); continue;
-    }
-
-    const salt = makeSalt();
-    const passwordHash = await hashPassword(password, salt);
-    users[uname] = {
-      name, username: uname, mobile: mobile || null, passwordHash, salt,
-      role: 'user', plan, expiresAt: calcExpiry(null, dur.days), disabled: false
-    };
-    ok++;
+    if (!name || !username || !password || !dur) { fail++; errors.push(`Missing: ${line}`); continue; }
+    const d = new Date(); d.setDate(d.getDate() + dur.days);
+    const expiresAt = d.toISOString().split('T')[0];
+    try {
+      await api('/api/users', { method: 'POST', body: JSON.stringify({
+        name, username: username.toLowerCase(), password, plan, expiresAt,
+        mobile: (mobileRaw || '').replace(/\D/g, '') || null
+      })});
+      ok++;
+    } catch (e) { fail++; errors.push(`${username}: ${e.message}`); }
   }
-  saveUsers(users);
-  renderUsers();
-  renderKPIs();
-  auditLog('BULK_IMPORT', `${ok} created, ${fail} failed`, fail ? 'warn' : 'success');
-
+  renderUsers(); renderKPIs();
   document.getElementById('importResult').innerHTML = `
     <div style="padding:14px 18px;background:${ok?'rgba(0,184,148,0.1)':'rgba(225,112,85,0.1)'};border-radius:10px">
-      <strong>✅ ${ok} users created</strong>${fail ? ` · <strong style="color:var(--danger)">${fail} failed</strong>` : ''}
-      ${errors.length ? `<div style="margin-top:10px;font-size:12px;color:var(--text-muted)">${errors.map(e => `• ${e}`).join('<br>')}</div>` : ''}
+      <strong>✅ ${ok} created</strong>${fail ? ` · <strong style="color:var(--danger)">${fail} failed</strong>` : ''}
+      ${errors.length ? `<div style="margin-top:10px;font-size:12px;color:var(--text-muted)">${errors.slice(0,5).map(e => `• ${e}`).join('<br>')}</div>` : ''}
     </div>`;
   if (ok) document.getElementById('csvInput').value = '';
-  showToast('📥 Import Done', `${ok} users created${fail ? `, ${fail} failed` : ''}`);
+  showToast('📥 Import Done', `${ok} created, ${fail} failed`);
 }
 
-/* ============================================================
-   EXPORT CSV
-   ============================================================ */
-function exportUsersCSV() {
-  const users = Object.values(loadUsers());
-  const header = 'Name,Username,Mobile,Role,Plan,Expires,DaysLeft,Status\n';
-  const rows = users.map(u => {
-    const dl = daysLeft(u.expiresAt);
-    const status = u.disabled ? 'Disabled' : (dl <= 0 ? 'Expired' : 'Active');
-    return [u.name, u.username, u.mobile || '-', u.role, u.plan || '-', u.expiresAt || '-', dl === Infinity ? '-' : dl, status].join(',');
-  }).join('\n');
-  const blob = new Blob([header + rows], { type: 'text/csv' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `users_${new Date().toISOString().slice(0,10)}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
-  showToast('📥 Exported', `${users.length} users exported`);
+/* ============ EXPORT CSV ============ */
+async function exportUsersCSV() {
+  try {
+    const users = await api('/api/users');
+    const header = 'Name,Username,Mobile,Role,Plan,Expires,Status\n';
+    const rows = users.map(u => {
+      const status = u.disabled ? 'Disabled' : (u.expiresAt && new Date(u.expiresAt) < new Date() ? 'Expired' : 'Active');
+      return [u.name, u.username, u.mobile || '-', u.role, u.plan || '-', u.expiresAt ? String(u.expiresAt).slice(0,10) : '-', status].join(',');
+    }).join('\n');
+    const blob = new Blob([header + rows], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url;
+    a.download = `users_${new Date().toISOString().slice(0,10)}.csv`;
+    a.click(); URL.revokeObjectURL(url);
+    showToast('📥 Exported', `${users.length} users`);
+  } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
-/* ============================================================
-   AVATAR MENU + CHANGE PASSWORD
-   ============================================================ */
+/* ============ AVATAR MENU ============ */
 function toggleAvatarMenu(e) {
   e.stopPropagation();
   document.getElementById('avatarMenu').classList.toggle('open');
@@ -1530,51 +1300,21 @@ document.addEventListener('click', () => document.getElementById('avatarMenu')?.
 
 function openChangePassword() {
   document.getElementById('avatarMenu').classList.remove('open');
-  document.getElementById('pwdCurrent').value = '';
-  document.getElementById('pwdNew').value = '';
-  document.getElementById('pwdConfirm').value = '';
-  document.getElementById('pwdError').textContent = '';
+  document.getElementById('pwdError').textContent = 'Contact admin to reset your password.';
   document.getElementById('pwdModal').classList.add('open');
 }
-function closeChangePassword() {
-  document.getElementById('pwdModal').classList.remove('open');
-}
-async function savePassword() {
-  const cur = document.getElementById('pwdCurrent').value;
-  const nw = document.getElementById('pwdNew').value;
-  const cf = document.getElementById('pwdConfirm').value;
-  const err = document.getElementById('pwdError');
-
-  if (!cur || !nw || !cf) { err.textContent = 'All fields required'; return; }
-  if (nw.length < 4) { err.textContent = 'New password must be 4+ characters'; return; }
-  if (nw !== cf) { err.textContent = 'New passwords do not match'; return; }
-
-  const users = await ensureHashes(loadUsers());
-  const u = users[currentUser.username];
-  if (u.passwordHash !== await hashPassword(cur, u.salt)) { err.textContent = 'Current password is incorrect'; return; }
-
-  u.salt = makeSalt();
-  u.passwordHash = await hashPassword(nw, u.salt);
-  u.sessionId = crypto.randomUUID();
-  currentUser.sessionId = u.sessionId;
-  saveUsers(users);
-  saveSession(currentUser.username, u.sessionId);
-  auditLog('PASSWORD_CHANGED', `User: ${currentUser.username}`, 'success');
-  closeChangePassword();
-  showToast('✅ Updated', 'Password changed. Other devices logged out.');
+function closeChangePassword() { document.getElementById('pwdModal').classList.remove('open'); }
+function savePassword() {
+  document.getElementById('pwdError').textContent = 'Contact admin to reset your password.';
 }
 
-/* ============================================================
-   NAVIGATION
-   ============================================================ */
+/* ============ NAVIGATION ============ */
 function navigateTo(pageId) {
   DOM.navLinks.forEach(a => a.classList.toggle('active', a.dataset.page === pageId));
   DOM.pages.forEach(p => p.classList.toggle('active', p.id === 'page-' + pageId));
   if (pageId === 'portfolio') loadPortfolio();
   if (pageId === 'users' && currentUser?.role === 'admin' && !impersonating) {
-    renderKPIs();
-    renderUsers();
-    renderAudit();
+    renderKPIs(); renderUsers(); renderAudit();
   }
 }
 DOM.navLinks.forEach(link => link.addEventListener('click', e => {
@@ -1583,9 +1323,7 @@ DOM.navLinks.forEach(link => link.addEventListener('click', e => {
   if (p) navigateTo(p);
 }));
 
-/* ============================================================
-   PORTFOLIO
-   ============================================================ */
+/* ============ PORTFOLIO ============ */
 function loadPortfolio() {
   const holdings = [
     { symbol: 'RELIANCE', qty: 10, avg: 2810, current: 2856 },
@@ -1597,14 +1335,11 @@ function loadPortfolio() {
   const invested   = holdings.reduce((s, h) => s + h.avg * h.qty, 0);
   const totalPnl   = totalValue - invested;
   const pct        = Math.round(totalPnl / invested * 100);
-
   document.getElementById('portfolioStats').innerHTML = `
     <div class="stat-box"><div class="label">💰 Total Value</div><div class="value">₹${totalValue.toLocaleString()}</div><div class="sub ${totalPnl>=0?'green':'red'}">${totalPnl>=0?'↑':'↓'} ₹${Math.abs(totalPnl).toLocaleString()}</div></div>
     <div class="stat-box"><div class="label">📊 Invested</div><div class="value">₹${invested.toLocaleString()}</div><div class="sub" style="color:var(--text-muted)">${Math.round(invested/totalValue*100)}% allocated</div></div>
     <div class="stat-box"><div class="label">💵 Available Cash</div><div class="value">₹${Math.round(totalValue*0.32).toLocaleString()}</div><div class="sub" style="color:var(--text-muted)">32% free</div></div>
-    <div class="stat-box"><div class="label">📈 Total P&L</div><div class="value" style="color:${totalPnl>=0?GREEN:RED}">${totalPnl>=0?'+':''}₹${totalPnl.toLocaleString()}</div><div class="sub ${totalPnl>=0?'green':'red'}">${totalPnl>=0?'↑':'↓'} ${Math.abs(pct)}%</div></div>
-  `;
-
+    <div class="stat-box"><div class="label">📈 Total P&L</div><div class="value" style="color:${totalPnl>=0?GREEN:RED}">${totalPnl>=0?'+':''}₹${totalPnl.toLocaleString()}</div><div class="sub ${totalPnl>=0?'green':'red'}">${totalPnl>=0?'↑':'↓'} ${Math.abs(pct)}%</div></div>`;
   document.getElementById('holdingsTable').innerHTML = `
     <table class="table-modern">
       <thead><tr><th>Symbol</th><th>Qty</th><th>Avg Price</th><th>Current</th><th>P&L</th><th>Action</th></tr></thead>
@@ -1618,30 +1353,22 @@ function loadPortfolio() {
           <td style="color:${pnl>=0?GREEN:RED};font-weight:600">${pnl>=0?'+':''}₹${pnl}</td>
           <td><button class="btn btn-danger btn-sm" onclick="showToast('📤 Sold','${h.symbol} sold')">Sell</button></td>
         </tr>`;
-      }).join('')}</tbody>
-    </table>`;
+      }).join('')}</tbody></table>`;
 }
 
-/* ============================================================
-   SCREENER
-   ============================================================ */
+/* ============ SCREENER ============ */
 function onStrategyChange() {
   const s = STRATEGIES[document.getElementById('strategySelect').value];
   if (!s) return;
   document.getElementById('infoStrategy').textContent = s.icon + ' ' + s.name;
   document.getElementById('infoRule').textContent = s.entryRule;
   document.getElementById('infoRisk').textContent = s.risk;
-
-  document.getElementById('screenerHead').innerHTML =
-    `<tr>${[...s.columns, 'Action'].map(c => `<th>${c}</th>`).join('')}</tr>`;
-
+  document.getElementById('screenerHead').innerHTML = `<tr>${[...s.columns, 'Action'].map(c => `<th>${c}</th>`).join('')}</tr>`;
   const tbody = document.getElementById('screenerBody');
   if (!s.rows.length) {
     tbody.innerHTML = `<tr><td colspan="${s.columns.length + 1}" style="text-align:center;padding:40px;color:var(--text-muted)">No stocks found.</td></tr>`;
   } else {
-    tbody.innerHTML = s.rows.map(r =>
-      `<tr>${r.map(c => `<td>${c}</td>`).join('')}<td><button class="btn-place-order btn-sm" onclick="placeOrder('${r[0]}')" ${autoBuyEnabled ? 'disabled' : ''}>Place Order</button></td></tr>`
-    ).join('');
+    tbody.innerHTML = s.rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}<td><button class="btn-place-order btn-sm" onclick="placeOrder('${r[0]}')" ${autoBuyEnabled ? 'disabled' : ''}>Place Order</button></td></tr>`).join('');
   }
   document.getElementById('screenerCount').textContent = `Showing ${s.rows.length} stocks`;
 }
@@ -1651,14 +1378,13 @@ function toggleAutoBuyMode() {
   const status = document.getElementById('toggleStatus');
   status.textContent = autoBuyEnabled ? 'ON' : 'OFF';
   status.classList.toggle('active', autoBuyEnabled);
-
   if (autoBuyEnabled) {
     showToast('🤖 Auto Buy ON', 'Auto-buy enabled for current strategy');
     const s = STRATEGIES[document.getElementById('strategySelect').value];
     const symbols = s.rows.map(r => r[0]);
-    showToast('🚀 Auto-Buy All', `Buying ${symbols.length} stocks: ${symbols.join(', ')}`);
+    showToast('🚀 Auto-Buy All', `Buying ${symbols.length} stocks`);
   } else {
-    showToast('👤 Manual Mode ON', 'Click Place Order to buy stocks');
+    showToast('👤 Manual Mode ON', 'Click Place Order to buy');
   }
   onStrategyChange();
 }
@@ -1681,9 +1407,7 @@ function placeOrder(symbol) {
   showToast('📝 Order Placed', `Order placed for ${symbol}`);
 }
 
-/* ============================================================
-   TOAST
-   ============================================================ */
+/* ============ TOAST ============ */
 let toastTimeout = null;
 function showToast(title, message) {
   DOM.toastTitle.textContent = title || '✅ Success';
@@ -1692,55 +1416,26 @@ function showToast(title, message) {
   clearTimeout(toastTimeout);
   toastTimeout = setTimeout(() => DOM.toast.classList.remove('show'), 4000);
 }
-function hideToast() {
-  DOM.toast.classList.remove('show');
-  clearTimeout(toastTimeout);
-}
+function hideToast() { DOM.toast.classList.remove('show'); clearTimeout(toastTimeout); }
 
-/* ============================================================
-   SETTINGS
-   ============================================================ */
+/* ============ SETTINGS ============ */
 function toggleBrokerFields() {
   const b = document.getElementById('brokerSelect').value;
   document.getElementById('dhanFields').style.display = b === 'dhan' ? 'grid' : 'none';
   document.getElementById('otherBrokerFields').style.display = (b && b !== 'dhan') ? 'block' : 'none';
 }
 
-/* ============================================================
-   INIT
-   ============================================================ */
+/* ============ INIT ============ */
 (async function init() {
-  const users = await ensureHashes(loadUsers());
-
-  const adminSess = JSON.parse(localStorage.getItem('ta_admin_session') || 'null');
-  const sess = loadSession();
-
-  if (sess && !sess.sessionId) { localStorage.removeItem('ta_session'); showLogin(); return; }
-
-  if (sess && users[sess.username]) {
-    const u = users[sess.username];
-    if (adminSess && users[adminSess.username]) {
-      impersonating = true;
-      currentUser = { ...u, username: sess.username };
+  const token = getToken();
+  const u = getUser();
+  if (token && u) {
+    try {
+      await api('/api/session-check');
+      currentUser = u;
       showApp();
       return;
-    }
-    if (u.disabled) { showLogin(); return; }
-    if (u.role !== 'admin' && daysLeft(u.expiresAt) <= 0) { showExpired(u); return; }
-    if (!u.totpSecret) { showLogin(); return; }
-    if (u.sessionId && u.sessionId !== sess.sessionId) {
-      localStorage.removeItem('ta_session');
-      showLogin();
-      return;
-    }
-
-    currentUser = { ...u, username: sess.username };
-    showApp();
-    if (u.role !== 'admin') {
-      const dl = daysLeft(u.expiresAt);
-      if (dl <= 7) setTimeout(() => showToast('⚠️ Expiring Soon', `Expires in ${dl} day${dl===1?'':'s'}`), 500);
-    }
-    return;
+    } catch { clearSession(); }
   }
   showLogin();
 })();

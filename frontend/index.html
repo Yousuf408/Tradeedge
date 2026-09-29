@@ -1,0 +1,1752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TradeAlgo Pro</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<style>
+:root {
+  --gradient-brand: linear-gradient(135deg, #6C5CE7 0%, #A29BFE 100%);
+  --bg-primary: #f4f6fc;
+  --bg-secondary: #ffffff;
+  --bg-glass: rgba(255, 255, 255, 0.65);
+  --text-primary: #0b1a33;
+  --text-secondary: #3a4b60;
+  --text-muted: #7e8fa3;
+  --success: #00b894;
+  --danger: #e17055;
+  --warning: #f39c12;
+  --shadow-sm: 0 4px 12px rgba(108, 92, 231, 0.08);
+  --shadow-md: 0 8px 28px rgba(108, 92, 231, 0.12);
+  --shadow-lg: 0 18px 50px rgba(108, 92, 231, 0.15);
+  --r-sm: 10px; --r-md: 16px; --r-lg: 24px;
+  --t: all 0.25s cubic-bezier(0.2, 0, 0, 1);
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: 'Inter', -apple-system, sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  min-height: 100vh;
+  background-image:
+    radial-gradient(ellipse at 10% 20%, rgba(108,92,231,0.04), transparent 60%),
+    radial-gradient(ellipse at 90% 80%, rgba(162,155,254,0.04), transparent 60%);
+}
+body.logged-out .navbar, body.logged-out .container { display: none; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: var(--gradient-brand); border-radius: 12px; }
+
+.auth-screen {
+  position: fixed; inset: 0;
+  background: var(--bg-primary);
+  background-image: radial-gradient(ellipse at 50% 0%, rgba(108,92,231,0.15), transparent 70%);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 2000; padding: 20px;
+}
+.auth-card {
+  background: var(--bg-secondary); border-radius: var(--r-lg);
+  padding: 40px; width: 100%; max-width: 420px;
+  box-shadow: var(--shadow-lg); text-align: center;
+}
+.auth-logo { font-size: 24px; font-weight: 800; margin-bottom: 6px;
+  background: var(--gradient-brand); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.auth-sub { color: var(--text-muted); font-size: 14px; margin-bottom: 24px; }
+.auth-field { text-align: left; margin-bottom: 14px; }
+.auth-field label { display: block; font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
+.auth-field input {
+  width: 100%; padding: 12px 14px; border: 2px solid rgba(0,0,0,0.06);
+  border-radius: var(--r-sm); font-size: 14px; background: var(--bg-primary);
+  color: var(--text-primary); transition: var(--t); font-family: inherit;
+}
+.auth-field input:focus { outline: none; border-color: #6C5CE7; box-shadow: 0 0 0 4px rgba(108,92,231,0.10); }
+.auth-btn { width: 100%; margin-top: 10px; justify-content: center; }
+.auth-error { color: var(--danger); font-size: 13px; min-height: 18px; margin-bottom: 4px; }
+.qr-box { text-align: center; margin: 14px 0; }
+.qr-box img { width: 180px; height: 180px; border-radius: 12px; border: 1px solid #eee; background: #fff; padding: 6px; }
+
+.impersonate-banner {
+  position: fixed; top: 0; left: 0; right: 0;
+  background: linear-gradient(135deg, #f39c12, #e67e22);
+  color: #fff; padding: 10px 20px;
+  display: flex; align-items: center; justify-content: center; gap: 12px;
+  font-size: 13px; font-weight: 600; z-index: 500;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+}
+body.impersonating .navbar { top: 42px; }
+body.impersonating .container { padding-top: 70px; }
+.impersonate-banner button {
+  background: rgba(255,255,255,0.25); color: #fff;
+  border: 1px solid rgba(255,255,255,0.4);
+  padding: 4px 12px; border-radius: 6px; font-size: 12px;
+  font-weight: 600; cursor: pointer; transition: var(--t);
+}
+.impersonate-banner button:hover { background: rgba(255,255,255,0.4); }
+
+.navbar {
+  background: var(--bg-glass);
+  backdrop-filter: blur(18px);
+  border-bottom: 1px solid rgba(255,255,255,0.4);
+  padding: 0 32px; height: 72px;
+  display: flex; align-items: center; justify-content: space-between;
+  position: sticky; top: 0; z-index: 100;
+  box-shadow: var(--shadow-sm); flex-wrap: wrap; gap: 8px;
+}
+.logo {
+  font-size: 22px; font-weight: 800;
+  background: var(--gradient-brand);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  display: flex; align-items: center; gap: 10px;
+}
+.logo span { -webkit-text-fill-color: var(--text-primary); }
+.nav-links { display: flex; gap: 4px; list-style: none; flex-wrap: wrap; }
+.nav-links a {
+  color: var(--text-secondary); text-decoration: none;
+  padding: 8px 18px; border-radius: var(--r-sm);
+  font-size: 14px; font-weight: 500; transition: var(--t); cursor: pointer;
+}
+.nav-links a:hover { background: rgba(108,92,231,0.08); color: #6C5CE7; transform: translateY(-1px); }
+.nav-links a.active { background: var(--gradient-brand); color: #fff; box-shadow: 0 4px 16px rgba(108,92,231,0.30); }
+.nav-right { display: flex; align-items: center; gap: 20px; }
+.status { font-size: 13px; color: var(--success); display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.status .dot { width: 10px; height: 10px; background: var(--success); border-radius: 50%; animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.3); opacity: 0.7; } }
+.balance { font-size: 15px; font-weight: 700; background: rgba(108,92,231,0.08); padding: 6px 16px; border-radius: var(--r-sm); }
+
+.avatar-wrap { position: relative; }
+.avatar {
+  width: 40px; height: 40px; border-radius: 50%;
+  background: var(--gradient-brand);
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; color: #fff; font-size: 15px;
+  box-shadow: 0 4px 14px rgba(108,92,231,0.3);
+  cursor: pointer; transition: var(--t);
+}
+.avatar:hover { transform: scale(1.05) rotate(-4deg); }
+.avatar-menu {
+  position: absolute; top: 52px; right: 0;
+  background: var(--bg-secondary); border-radius: var(--r-sm);
+  box-shadow: var(--shadow-lg); min-width: 200px;
+  padding: 6px; display: none; z-index: 300;
+}
+.avatar-menu.open { display: block; }
+.avatar-menu-header {
+  padding: 10px 14px; border-bottom: 1px solid rgba(0,0,0,0.05);
+  margin-bottom: 6px;
+}
+.avatar-menu-header .name { font-weight: 700; font-size: 14px; }
+.avatar-menu-header .role { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+.avatar-menu-item {
+  padding: 9px 14px; border-radius: 8px; font-size: 13px;
+  cursor: pointer; display: flex; align-items: center; gap: 10px;
+  transition: var(--t); color: var(--text-secondary);
+}
+.avatar-menu-item:hover { background: rgba(108,92,231,0.08); color: #6C5CE7; }
+.avatar-menu-item.danger:hover { background: rgba(225,112,85,0.1); color: var(--danger); }
+
+.container { max-width: 1440px; margin: 0 auto; padding: 28px 32px; }
+.page { display: none; animation: fadeSlide 0.35s cubic-bezier(0.2,0,0,1); }
+.page.active { display: block; }
+@keyframes fadeSlide { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+.section-title { font-size: 20px; font-weight: 700; margin-bottom: 16px; }
+
+.stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.stat-box {
+  background: var(--bg-secondary); border-radius: var(--r-md);
+  padding: 18px 20px; box-shadow: var(--shadow-sm);
+  border: 1px solid rgba(255,255,255,0.6);
+  transition: var(--t); position: relative; overflow: hidden;
+}
+.stat-box::before {
+  content: ''; position: absolute; top: 0; left: 0; right: 0; height: 4px;
+  background: var(--gradient-brand); opacity: 0; transition: var(--t);
+}
+.stat-box:hover { transform: translateY(-4px); box-shadow: var(--shadow-md); }
+.stat-box:hover::before { opacity: 1; }
+.stat-box .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.8px; font-weight: 600; }
+.stat-box .value { font-size: 26px; font-weight: 800; margin-top: 4px; }
+.stat-box .sub { font-size: 12px; font-weight: 500; color: var(--text-muted); }
+.sub.green, .pos { color: var(--success); }
+.sub.red, .neg { color: var(--danger); }
+.sub.warn { color: var(--warning); }
+
+.panel-glass {
+  background: var(--bg-glass); backdrop-filter: blur(12px);
+  border-radius: var(--r-lg); border: 1px solid rgba(255,255,255,0.5);
+  box-shadow: var(--shadow-sm); overflow: hidden;
+  margin-bottom: 24px; transition: var(--t);
+}
+.panel-glass:hover { box-shadow: var(--shadow-md); transform: translateY(-2px); }
+.panel-head {
+  padding: 18px 24px; border-bottom: 1px solid rgba(0,0,0,0.04);
+  display: flex; justify-content: space-between; align-items: center;
+  flex-wrap: wrap; gap: 12px;
+}
+.panel-head h3 { font-size: 16px; font-weight: 700; }
+.panel-body { padding: 20px 24px; }
+.panel-footer {
+  padding: 14px 24px; border-top: 1px solid rgba(0,0,0,0.04);
+  display: flex; justify-content: space-between; align-items: center;
+  flex-wrap: wrap; gap: 10px; color: var(--text-muted); font-size: 13px;
+}
+
+.btn {
+  padding: 10px 22px; border: none; border-radius: var(--r-sm);
+  font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: var(--t); display: inline-flex; align-items: center; gap: 8px;
+  font-family: inherit;
+}
+.btn:hover { transform: translateY(-2px); }
+.btn:active { transform: scale(0.95); }
+.btn-primary { background: var(--gradient-brand); color: #fff; box-shadow: 0 4px 14px rgba(108,92,231,0.3); }
+.btn-primary:hover { box-shadow: 0 8px 28px rgba(108,92,231,0.4); }
+.btn-success { background: linear-gradient(135deg, #00b894, #00cec9); color: #fff; }
+.btn-danger { background: linear-gradient(135deg, #e17055, #d63031); color: #fff; }
+.btn-warn { background: linear-gradient(135deg, #f39c12, #e67e22); color: #fff; }
+.btn-outline { background: transparent; color: var(--text-secondary); border: 2px solid rgba(0,0,0,0.06); }
+.btn-outline:hover { border-color: #6C5CE7; color: #6C5CE7; }
+.btn-sm { padding: 5px 12px; font-size: 11px; }
+.btn-place-order {
+  background: var(--gradient-brand); color: #fff;
+  padding: 6px 16px; border: none; border-radius: var(--r-sm);
+  font-size: 12px; font-weight: 600; cursor: pointer;
+  transition: var(--t); box-shadow: 0 2px 12px rgba(108,92,231,0.25);
+}
+.btn-place-order:hover:not(:disabled) { transform: translateY(-2px) scale(1.02); }
+.btn-place-order:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.toggle-wrapper { display: flex; align-items: center; gap: 10px; }
+.toggle-label { font-size: 13px; font-weight: 600; color: var(--text-secondary); user-select: none; }
+.toggle-switch { position: relative; width: 46px; height: 26px; flex-shrink: 0; cursor: pointer; }
+.toggle-switch input { opacity: 0; width: 0; height: 0; }
+.toggle-slider { position: absolute; inset: 0; background: #ccc; transition: var(--t); border-radius: 26px; }
+.toggle-slider::before {
+  content: ""; position: absolute; height: 18px; width: 18px;
+  left: 4px; bottom: 4px; background: #fff;
+  transition: var(--t); border-radius: 50%;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+}
+.toggle-switch input:checked + .toggle-slider { background: var(--gradient-brand); }
+.toggle-switch input:checked + .toggle-slider::before { transform: translateX(20px); }
+.toggle-status { font-size: 12px; font-weight: 600; color: var(--text-muted); min-width: 32px; }
+.toggle-status.active { color: var(--success); }
+
+.table-wrap { overflow-x: auto; }
+.table-modern { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 14px; }
+.table-modern th {
+  text-align: left; padding: 12px 16px; color: var(--text-muted); font-weight: 600;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px;
+  border-bottom: 2px solid rgba(0,0,0,0.04); white-space: nowrap;
+}
+.table-modern td { padding: 12px 16px; border-bottom: 1px solid rgba(0,0,0,0.04); }
+.table-modern tr:hover td { background: rgba(108,92,231,0.04); }
+.table-modern tr:last-child td { border-bottom: none; }
+.row-disabled td { opacity: 0.45; }
+.actions-cell { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.screener-controls { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+.screener-controls select, .screener-controls input,
+.settings-group input, .settings-group select, .broker-fields input, .form-input {
+  background: var(--bg-secondary); border: 2px solid rgba(0,0,0,0.06);
+  color: var(--text-primary); padding: 10px 16px;
+  border-radius: var(--r-sm); font-size: 13px; font-weight: 500;
+  transition: var(--t); width: 100%; font-family: inherit;
+}
+.screener-controls select, .screener-controls input { width: auto; min-width: 180px; }
+.screener-controls select:focus, .screener-controls input:focus,
+.settings-group input:focus, .settings-group select:focus,
+.broker-fields input:focus, .form-input:focus {
+  outline: none; border-color: #6C5CE7; box-shadow: 0 0 0 4px rgba(108,92,231,0.10);
+}
+
+.info-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+.info-label { color: var(--text-muted); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+.info-value { font-weight: 700; font-size: 16px; margin-top: 2px; }
+
+.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.settings-group { margin-bottom: 4px; }
+.settings-group label, .broker-fields label {
+  display: block; color: var(--text-secondary);
+  font-size: 13px; font-weight: 600; margin-bottom: 6px;
+}
+.broker-fields {
+  margin-top: 16px; padding: 20px 22px;
+  background: rgba(108,92,231,0.04); border-radius: var(--r-md);
+  border: 1px solid rgba(108,92,231,0.10);
+  display: grid; grid-template-columns: 1fr 1fr; gap: 18px;
+}
+.broker-fields .field-group { display: flex; flex-direction: column; }
+.broker-fields .field-full { grid-column: 1 / -1; }
+#otherBrokerFields {
+  margin-top: 16px; padding: 20px 22px;
+  background: rgba(108,92,231,0.04); border-radius: var(--r-md);
+  border: 1px solid rgba(108,92,231,0.10); display: none;
+}
+#otherBrokerFields p { color: var(--text-muted); font-size: 14px; }
+
+.user-form { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+.user-form .settings-group { margin-bottom: 0; }
+
+.tabs { display: flex; gap: 6px; margin-bottom: 18px; flex-wrap: wrap; }
+.tab-btn {
+  padding: 9px 18px; border-radius: var(--r-sm); border: none;
+  background: rgba(108,92,231,0.06); color: var(--text-secondary);
+  font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: var(--t); font-family: inherit;
+}
+.tab-btn:hover { background: rgba(108,92,231,0.12); }
+.tab-btn.active { background: var(--gradient-brand); color: #fff; box-shadow: 0 4px 14px rgba(108,92,231,0.25); }
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+.search-bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+.search-bar input, .search-bar select {
+  background: var(--bg-secondary); border: 2px solid rgba(0,0,0,0.06);
+  color: var(--text-primary); padding: 9px 14px;
+  border-radius: var(--r-sm); font-size: 13px;
+  font-family: inherit; transition: var(--t);
+}
+.search-bar input { flex: 1; min-width: 180px; }
+.search-bar input:focus, .search-bar select:focus { outline: none; border-color: #6C5CE7; box-shadow: 0 0 0 4px rgba(108,92,231,0.10); }
+
+.audit-row { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid rgba(0,0,0,0.04); align-items: flex-start; }
+.audit-row:last-child { border-bottom: none; }
+.audit-time { font-size: 11px; color: var(--text-muted); min-width: 120px; font-weight: 600; }
+.audit-actor { font-size: 12px; font-weight: 700; min-width: 90px; }
+.audit-action { font-size: 12px; font-weight: 600; }
+.audit-details { font-size: 12px; color: var(--text-muted); flex: 1; }
+.audit-badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+.badge-success { background: rgba(0,184,148,0.12); color: var(--success); }
+.badge-danger { background: rgba(225,112,85,0.12); color: var(--danger); }
+.badge-info { background: rgba(108,92,231,0.12); color: #6C5CE7; }
+.badge-warn { background: rgba(243,156,18,0.12); color: var(--warning); }
+
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(11, 26, 51, 0.5);
+  display: none; align-items: center; justify-content: center;
+  z-index: 2500; padding: 20px; backdrop-filter: blur(4px);
+}
+.modal-overlay.open { display: flex; }
+.modal-box {
+  background: var(--bg-secondary); border-radius: var(--r-lg);
+  padding: 32px; width: 100%; max-width: 420px;
+  box-shadow: var(--shadow-lg);
+}
+.modal-box h3 { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
+.modal-box .modal-sub { font-size: 13px; color: var(--text-muted); margin-bottom: 20px; }
+.modal-box .auth-field { margin-bottom: 14px; }
+.modal-box .auth-field label { display: block; font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
+.modal-box .auth-field input {
+  width: 100%; padding: 12px 14px; border: 2px solid rgba(0,0,0,0.06);
+  border-radius: var(--r-sm); font-size: 14px;
+  background: var(--bg-primary); color: var(--text-primary);
+  transition: var(--t); font-family: inherit;
+}
+.modal-box .auth-field input:focus { outline: none; border-color: #6C5CE7; box-shadow: 0 0 0 4px rgba(108,92,231,0.10); }
+.modal-actions { display: flex; gap: 10px; margin-top: 20px; justify-content: flex-end; }
+.modal-error { color: var(--danger); font-size: 13px; min-height: 18px; margin-bottom: 8px; }
+
+.toast {
+  position: fixed; bottom: 30px; right: 30px;
+  background: var(--bg-secondary); border-radius: var(--r-md);
+  padding: 18px 26px; box-shadow: var(--shadow-lg);
+  border-left: 5px solid var(--success);
+  transform: translateY(100px); opacity: 0;
+  transition: var(--t); z-index: 3000;
+  min-width: 300px; max-width: 90%;
+}
+.toast.show { transform: translateY(0); opacity: 1; }
+.toast-title { font-weight: 700; font-size: 15px; margin-bottom: 4px; }
+.toast-close {
+  position: absolute; top: 10px; right: 14px;
+  background: none; border: none; color: var(--text-muted);
+  font-size: 20px; cursor: pointer;
+}
+.toast-close:hover { color: var(--text-primary); transform: rotate(90deg); }
+
+.spinner {
+  display: inline-block; width: 20px; height: 20px;
+  border: 3px solid rgba(108,92,231,0.15);
+  border-top-color: #6C5CE7; border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 1024px) {
+  .settings-grid { grid-template-columns: 1fr; }
+  .info-grid { grid-template-columns: 1fr 1fr; }
+  .broker-fields { grid-template-columns: 1fr; }
+  .user-form { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 768px) {
+  .navbar { height: auto; padding: 14px 18px; }
+  .container { padding: 16px; }
+  .stats-row { grid-template-columns: 1fr 1fr; }
+  .screener-controls { flex-direction: column; align-items: stretch; }
+  .screener-controls select, .screener-controls input { width: 100%; min-width: auto; }
+  .table-modern { font-size: 12px; }
+  .info-grid { grid-template-columns: 1fr; }
+  .toast { left: 16px; right: 16px; min-width: auto; }
+  .user-form { grid-template-columns: 1fr; }
+  .audit-row { flex-direction: column; gap: 4px; }
+  .audit-time, .audit-actor { min-width: auto; }
+}
+</style>
+</head>
+<body class="logged-out">
+
+<div id="authScreen" class="auth-screen">
+  <div class="auth-card">
+
+    <div id="loginStep1">
+      <div class="auth-logo">📊 TradeAlgo Pro</div>
+      <div class="auth-sub">Sign in to continue</div>
+      <div class="auth-field">
+        <label>Username or Mobile</label>
+        <input id="authUser" type="text" placeholder="Enter username or mobile" autocomplete="username" />
+      </div>
+      <div class="auth-field">
+        <label>Password</label>
+        <input id="authPass" type="password" placeholder="Enter password" autocomplete="current-password"
+               onkeydown="if(event.key==='Enter') doLogin()" />
+      </div>
+      <div class="auth-error" id="authError"></div>
+      <button class="btn btn-primary auth-btn" onclick="doLogin()">Continue</button>
+    </div>
+
+    <div id="loginStep2Verify" style="display:none">
+      <div class="auth-logo">🔐 Two-Factor Auth</div>
+      <div class="auth-sub">Enter the 6-digit code from your authenticator app</div>
+      <div class="auth-field">
+        <label>6-digit code</label>
+        <input id="authTotp" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
+               style="letter-spacing:8px;text-align:center;font-size:22px;font-weight:700"
+               onkeydown="if(event.key==='Enter') verifyLoginTotp()" />
+      </div>
+      <div class="auth-error" id="authTotpError"></div>
+      <button class="btn btn-primary auth-btn" onclick="verifyLoginTotp()">Verify</button>
+      <button class="btn btn-outline auth-btn" style="margin-top:8px" onclick="cancelTotp()">Back</button>
+    </div>
+
+    <div id="loginStep2Setup" style="display:none">
+      <div class="auth-logo">🔐 Set Up 2FA</div>
+      <div class="auth-sub">Scan this QR with Google Authenticator or Authy</div>
+      <div class="qr-box"><img id="setupQR" alt="QR Code" /></div>
+      <div class="auth-field">
+        <label>Or type this key manually</label>
+        <input id="setupSecret" type="text" readonly style="font-family:monospace;font-size:12px;text-align:center" />
+      </div>
+      <div class="auth-field">
+        <label>Enter the 6-digit code from your app</label>
+        <input id="setupCode" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
+               style="text-align:center;letter-spacing:6px;font-size:18px;font-weight:700"
+               onkeydown="if(event.key==='Enter') confirmSetup()" />
+      </div>
+      <div class="auth-error" id="setupError"></div>
+      <button class="btn btn-primary auth-btn" onclick="confirmSetup()">Activate & Login</button>
+      <button class="btn btn-outline auth-btn" style="margin-top:8px" onclick="cancelTotp()">Back</button>
+    </div>
+
+  </div>
+</div>
+
+<div id="expiredScreen" class="auth-screen" style="display:none">
+  <div class="auth-card">
+    <div class="auth-logo">⛔ Subscription Expired</div>
+    <div class="auth-sub" id="expiredMsg">Your subscription has ended.</div>
+    <button class="btn btn-primary auth-btn" onclick="showLogin()">Back to Login</button>
+  </div>
+</div>
+
+<div id="impersonateBanner" class="impersonate-banner" style="display:none">
+  ⚠️ Viewing as <strong id="impersonateName">—</strong>
+  <button onclick="exitImpersonate()">Exit Impersonation</button>
+</div>
+
+<nav class="navbar">
+  <div class="logo">📊 <span>TradeAlgo</span>Pro</div>
+  <ul class="nav-links">
+    <li><a class="active" data-page="screener">🔍 Screener</a></li>
+    <li><a data-page="portfolio">💰 Portfolio</a></li>
+    <li class="admin-only" style="display:none"><a data-page="users">👥 Users</a></li>
+    <li><a data-page="settings">⚙️ Settings</a></li>
+  </ul>
+  <div class="nav-right">
+    <span class="status"><span class="dot"></span> Live</span>
+    <span class="balance">₹1,24,500</span>
+    <div class="avatar-wrap">
+      <div class="avatar" id="avatarEl" onclick="toggleAvatarMenu(event)">--</div>
+      <div class="avatar-menu" id="avatarMenu">
+        <div class="avatar-menu-header">
+          <div class="name" id="avatarName">—</div>
+          <div class="role" id="avatarRole">—</div>
+        </div>
+        <div class="avatar-menu-item" onclick="openChangePassword()">🔒 Change Password</div>
+        <div class="avatar-menu-item danger" onclick="logout()">🚪 Logout</div>
+      </div>
+    </div>
+  </div>
+</nav>
+
+<div class="container">
+
+  <div id="page-screener" class="page active">
+    <div class="panel-glass">
+      <div class="panel-head">
+        <h3>🔍 Stock Screener</h3>
+        <div class="screener-controls">
+          <label>Strategy:</label>
+          <select id="strategySelect" onchange="onStrategyChange()">
+            <option value="advanceorb">📈 Advance ORB</option>
+            <option value="smartmoney">💰 SmartMoney</option>
+            <option value="bigplayers">🏢 Big Players</option>
+          </select>
+          <button class="btn btn-primary" onclick="runScreener(event)">🔄 Run Screener</button>
+          <div class="toggle-wrapper">
+            <span class="toggle-label">Auto Buy</span>
+            <label class="toggle-switch">
+              <input type="checkbox" id="autoBuyToggle" onchange="toggleAutoBuyMode()" />
+              <span class="toggle-slider"></span>
+            </label>
+            <span class="toggle-status" id="toggleStatus">OFF</span>
+          </div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="table-modern">
+          <thead id="screenerHead"></thead>
+          <tbody id="screenerBody"></tbody>
+        </table>
+      </div>
+      <div class="panel-footer">
+        <span id="screenerCount">Showing 0 stocks</span>
+        <button class="btn btn-outline btn-sm">📥 Export</button>
+      </div>
+    </div>
+    <div class="panel-glass">
+      <div class="panel-head"><h3>📋 Strategy Details</h3></div>
+      <div class="panel-body info-grid">
+        <div><div class="info-label">Strategy</div><div class="info-value" id="infoStrategy">—</div></div>
+        <div><div class="info-label">Entry Rule</div><div class="info-value" id="infoRule">—</div></div>
+        <div><div class="info-label">Risk Per Trade</div><div class="info-value pos" id="infoRisk">—</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="page-portfolio" class="page">
+    <h2 class="section-title">💰 Portfolio</h2>
+    <div class="stats-row" id="portfolioStats"></div>
+    <div class="panel-glass">
+      <div class="panel-head"><h3>📊 Holdings</h3></div>
+      <div class="panel-body table-wrap" id="holdingsTable"></div>
+    </div>
+  </div>
+
+  <div id="page-users" class="page">
+    <h2 class="section-title">👥 Admin Panel</h2>
+
+    <div class="stats-row" id="adminKPIs"></div>
+
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('users', event)">👥 Users</button>
+      <button class="tab-btn" onclick="switchTab('import', event)">📥 Bulk Import</button>
+      <button class="tab-btn" onclick="switchTab('audit', event)">📜 Audit Log</button>
+      <button class="tab-btn" onclick="switchTab('prices', event)">💵 Plans & Pricing</button>
+    </div>
+
+    <div id="tab-users" class="tab-content active">
+      <div class="panel-glass">
+        <div class="panel-head"><h3>➕ Add New User</h3></div>
+        <div class="panel-body">
+          <div class="user-form">
+            <div class="settings-group"><label>Full Name</label><input id="newName" type="text" placeholder="e.g. Ravi Kumar" /></div>
+            <div class="settings-group"><label>Username</label><input id="newUsername" type="text" placeholder="e.g. ravi" /></div>
+            <div class="settings-group"><label>Mobile (optional)</label><input id="newMobile" type="text" placeholder="e.g. 9876543210" /></div>
+            <div class="settings-group">
+              <label>Password</label>
+              <div style="display:flex;gap:6px">
+                <input id="newPassword" type="text" placeholder="Set a password" style="flex:1" />
+                <button class="btn btn-outline btn-sm" onclick="fillRandomPassword()" type="button" title="Generate strong password">🎲</button>
+              </div>
+            </div>
+            <div class="settings-group">
+              <label>Plan</label>
+              <select id="newPlan"><option>Demo</option><option selected>Basic</option><option>Pro</option></select>
+            </div>
+            <div class="settings-group">
+              <label>Duration</label>
+              <select id="newDuration">
+                <option value="5d">5 days</option>
+                <option value="7d">7 days</option>
+                <option value="1m" selected>1 month</option>
+                <option value="2m">2 months</option>
+                <option value="3m">3 months</option>
+                <option value="6m">6 months</option>
+                <option value="1y">1 year</option>
+              </select>
+            </div>
+          </div>
+          <button class="btn btn-primary" onclick="addUser()">Create User</button>
+        </div>
+      </div>
+
+      <div class="panel-glass">
+        <div class="panel-head">
+          <h3>📋 All Users</h3>
+          <button class="btn btn-outline btn-sm" onclick="exportUsersCSV()">📥 Export CSV</button>
+        </div>
+        <div class="panel-body">
+          <div class="search-bar">
+            <input id="userSearch" type="text" placeholder="🔎 Search by name, username or mobile..." oninput="renderUsers()" />
+            <select id="userFilter" onchange="renderUsers()">
+              <option value="all">All</option>
+              <option value="active">Active</option>
+              <option value="expiring">Expiring Soon (7d)</option>
+              <option value="expired">Expired</option>
+              <option value="disabled">Disabled</option>
+            </select>
+          </div>
+          <div class="table-wrap" id="usersTable"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-import" class="tab-content">
+      <div class="panel-glass">
+        <div class="panel-head"><h3>📥 Bulk Import Users (CSV)</h3></div>
+        <div class="panel-body">
+          <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px">
+            Format: <code>name,username,password,plan,duration,mobile(optional)</code><br>
+            Duration codes: <strong>5d, 7d, 1m, 2m, 3m, 6m, 1y</strong>
+          </p>
+          <textarea id="csvInput" class="form-input" rows="8" style="font-family:monospace;font-size:12px" placeholder="Ravi Kumar,ravi,pass123,Basic,1m,9876543210
+Priya Sharma,priya,pass456,Pro,3m
+Rahul,demo_user,demo123,Demo,5d"></textarea>
+          <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+            <button class="btn btn-primary" onclick="bulkImport()">📥 Import Users</button>
+            <button class="btn btn-outline" onclick="loadSampleCSV()">📄 Load Sample</button>
+          </div>
+          <div id="importResult" style="margin-top:16px"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-audit" class="tab-content">
+      <div class="panel-glass">
+        <div class="panel-head">
+          <h3>📜 Audit Log (last 200 events)</h3>
+          <button class="btn btn-outline btn-sm" onclick="clearAudit()">🗑️ Clear Log</button>
+        </div>
+        <div class="panel-body" id="auditLog"></div>
+      </div>
+    </div>
+
+    <div id="tab-prices" class="tab-content">
+      <div class="panel-glass">
+        <div class="panel-head"><h3>💵 Plan Pricing (₹ / month)</h3></div>
+        <div class="panel-body settings-grid">
+          <div class="settings-group"><label>Demo Price</label><input id="priceDemo" type="number" value="0" /></div>
+          <div class="settings-group"><label>Basic Price</label><input id="priceBasic" type="number" value="999" /></div>
+          <div class="settings-group"><label>Pro Price</label><input id="pricePro" type="number" value="2999" /></div>
+        </div>
+        <div style="padding:0 24px 24px">
+          <button class="btn btn-primary" onclick="savePrices()">💾 Save Prices</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="page-settings" class="page">
+    <h2 class="section-title">⚙️ Settings</h2>
+    <div class="panel-glass">
+      <div class="panel-head"><h3>🔌 Broker Connection</h3></div>
+      <div class="panel-body">
+        <div class="settings-group">
+          <label>Select Broker</label>
+          <select id="brokerSelect" onchange="toggleBrokerFields()">
+            <option value="">— Choose —</option>
+            <option value="dhan" selected>Dhan</option>
+            <option value="zerodha">Zerodha</option>
+            <option value="fyers">Fyers</option>
+            <option value="upstox">Upstox</option>
+          </select>
+        </div>
+        <div id="dhanFields" class="broker-fields">
+          <div class="field-group field-full"><label>Client ID</label><input type="text" placeholder="Your Dhan Client ID" /></div>
+          <div class="field-group"><label>TOTP</label><input type="text" placeholder="TOTP secret" /></div>
+          <div class="field-group"><label>PIN</label><input type="password" placeholder="Trading PIN" /></div>
+          <div class="field-group field-full"><label>Secret Key</label><input type="password" placeholder="API Secret Key" /></div>
+        </div>
+        <div id="otherBrokerFields"><p>🔑 Enter credentials for your selected broker.</p></div>
+      </div>
+    </div>
+    <div class="panel-glass">
+      <div class="panel-head"><h3>⚡ Risk Management</h3></div>
+      <div class="panel-body settings-grid">
+        <div class="settings-group"><label>Max Risk Per Trade (%)</label><input type="number" value="2" /></div>
+        <div class="settings-group"><label>Max Daily Loss (%)</label><input type="number" value="5" /></div>
+        <div class="settings-group"><label>Max Positions</label><input type="number" value="10" /></div>
+        <div class="settings-group"><label>Stop Loss (%)</label><input type="number" value="3" /></div>
+      </div>
+      <div style="padding:0 24px 24px;">
+        <button class="btn btn-primary" onclick="showToast('✅ Saved','Settings saved successfully')">💾 Save Settings</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div id="pwdModal" class="modal-overlay">
+  <div class="modal-box">
+    <h3>🔒 Change Password</h3>
+    <div class="modal-sub">Update your login password. All other devices will be logged out.</div>
+    <div class="auth-field">
+      <label>Current Password</label>
+      <input id="pwdCurrent" type="password" placeholder="Enter current password" />
+    </div>
+    <div class="auth-field">
+      <label>New Password</label>
+      <input id="pwdNew" type="password" placeholder="Enter new password" />
+    </div>
+    <div class="auth-field">
+      <label>Confirm New Password</label>
+      <input id="pwdConfirm" type="password" placeholder="Repeat new password" />
+    </div>
+    <div class="modal-error" id="pwdError"></div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeChangePassword()">Cancel</button>
+      <button class="btn btn-primary" onclick="savePassword()">Update Password</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast">
+  <button class="toast-close" onclick="hideToast()">×</button>
+  <div class="toast-title" id="toastTitle">✅ Success</div>
+  <div id="toastMessage">Action completed</div>
+</div>
+
+<script>
+/* ============================================================
+   STATE
+   ============================================================ */
+const DOM = {
+  pages: document.querySelectorAll('.page'),
+  navLinks: document.querySelectorAll('.nav-links a'),
+  toast: document.getElementById('toast'),
+  toastTitle: document.getElementById('toastTitle'),
+  toastMessage: document.getElementById('toastMessage')
+};
+let autoBuyEnabled = false;
+let currentUser = null;
+let impersonating = false;
+const GREEN = 'var(--success)';
+const RED = 'var(--danger)';
+const chgSpan = c => `<span style="color:${c.includes('+') ? GREEN : RED}">${c}</span>`;
+
+/* ============================================================
+   TOTP
+   ============================================================ */
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function base32Encode(bytes) {
+  let bits = '', out = '';
+  for (const b of bytes) bits += b.toString(2).padStart(8, '0');
+  for (let i = 0; i + 5 <= bits.length; i += 5) out += B32[parseInt(bits.slice(i, i + 5), 2)];
+  return out;
+}
+function base32Decode(str) {
+  str = str.toUpperCase().replace(/=+$/, '');
+  let bits = '';
+  for (const c of str) {
+    const v = B32.indexOf(c);
+    if (v === -1) continue;
+    bits += v.toString(2).padStart(5, '0');
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.slice(i, i + 8), 2));
+  return new Uint8Array(bytes);
+}
+async function totpAt(secret, counter) {
+  const key = base32Decode(secret);
+  const buf = new ArrayBuffer(8);
+  new DataView(buf).setUint32(4, counter, false);
+  const ck = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', ck, buf));
+  const off = sig[sig.length - 1] & 0x0f;
+  const code = ((sig[off] & 0x7f) << 24) | ((sig[off+1] & 0xff) << 16) | ((sig[off+2] & 0xff) << 8) | (sig[off+3] & 0xff);
+  return String(code % 1000000).padStart(6, '0');
+}
+async function verifyTotp(secret, input) {
+  const step = Math.floor(Date.now() / 1000 / 30);
+  for (const c of [step - 1, step, step + 1]) {
+    if (await totpAt(secret, c) === input) return true;
+  }
+  return false;
+}
+function generateSecret() {
+  const bytes = new Uint8Array(20);
+  crypto.getRandomValues(bytes);
+  return base32Encode(bytes);
+}
+
+/* ============================================================
+   SECURITY HELPERS
+   ============================================================ */
+async function hashPassword(password, salt) {
+  const enc = new TextEncoder();
+  const keyMat = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' },
+    keyMat, 256
+  );
+  return Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+const makeSalt = () => crypto.randomUUID();
+
+function saveSession(username, sessionId) {
+  localStorage.setItem('ta_session', JSON.stringify({
+    username, sessionId, expiresAt: Date.now() + 7 * 60 * 60 * 1000
+  }));
+}
+function loadSession() {
+  try {
+    const s = JSON.parse(localStorage.getItem('ta_session') || 'null');
+    if (!s || s.expiresAt <= Date.now()) return null;
+    return s;
+  } catch { return null; }
+}
+
+function generateStrongPassword(len = 12) {
+  const U = 'ABCDEFGHJKMNPQRSTUVWXYZ', L = 'abcdefghjkmnpqrstuvwxyz', D = '23456789', S = '!@#$%&*';
+  const all = U + L + D + S;
+  let p = U[Math.random()*U.length|0] + L[Math.random()*L.length|0] + D[Math.random()*D.length|0] + S[Math.random()*S.length|0];
+  while (p.length < len) p += all[Math.random()*all.length|0];
+  return p.split('').sort(() => Math.random() - 0.5).join('');
+}
+function fillRandomPassword() {
+  document.getElementById('newPassword').value = generateStrongPassword();
+  showToast('🎲 Generated', 'Strong password generated');
+}
+function findUserByLogin(users, input) {
+  const clean = input.trim().toLowerCase();
+  if (users[clean]) return users[clean];
+  const digits = clean.replace(/\D/g, '');
+  if (digits.length >= 10) return Object.values(users).find(u => u.mobile === digits);
+  return null;
+}
+
+/* ============================================================
+   AUDIT LOG
+   ============================================================ */
+function auditLog(action, details = '', level = 'info') {
+  const log = JSON.parse(localStorage.getItem('ta_audit') || '[]');
+  log.unshift({
+    ts: Date.now(),
+    actor: currentUser?.username || 'system',
+    action, details, level
+  });
+  localStorage.setItem('ta_audit', JSON.stringify(log.slice(0, 200)));
+}
+function clearAudit() {
+  if (!confirm('Clear entire audit log?')) return;
+  localStorage.setItem('ta_audit', '[]');
+  renderAudit();
+  showToast('🗑️ Cleared', 'Audit log cleared');
+}
+function renderAudit() {
+  const log = JSON.parse(localStorage.getItem('ta_audit') || '[]');
+  const box = document.getElementById('auditLog');
+  if (!box) return;
+  if (!log.length) {
+    box.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No activity yet.</div>';
+    return;
+  }
+  const badgeFor = lvl => ({ success: 'badge-success', danger: 'badge-danger', warn: 'badge-warn' }[lvl] || 'badge-info');
+  box.innerHTML = log.map(e => `
+    <div class="audit-row">
+      <div class="audit-time">${new Date(e.ts).toLocaleString()}</div>
+      <div class="audit-actor">${e.actor}</div>
+      <div class="audit-action"><span class="audit-badge ${badgeFor(e.level)}">${e.action}</span></div>
+      <div class="audit-details">${e.details}</div>
+    </div>
+  `).join('');
+}
+
+/* ============================================================
+   PRICING
+   ============================================================ */
+function getPrices() {
+  return JSON.parse(localStorage.getItem('ta_prices') || 'null') || { Demo: 0, Basic: 999, Pro: 2999 };
+}
+function savePrices() {
+  const p = {
+    Demo: +document.getElementById('priceDemo').value || 0,
+    Basic: +document.getElementById('priceBasic').value || 0,
+    Pro: +document.getElementById('pricePro').value || 0
+  };
+  localStorage.setItem('ta_prices', JSON.stringify(p));
+  auditLog('PRICES_UPDATED', `Demo:₹${p.Demo} Basic:₹${p.Basic} Pro:₹${p.Pro}`, 'info');
+  renderKPIs();
+  showToast('✅ Saved', 'Plan prices updated');
+}
+
+/* ============================================================
+   DURATIONS
+   ============================================================ */
+const DURATIONS = {
+  '5d':  { label: '5 days',   days: 5 },
+  '7d':  { label: '7 days',   days: 7 },
+  '1m':  { label: '1 month',  days: 30 },
+  '2m':  { label: '2 months', days: 60 },
+  '3m':  { label: '3 months', days: 90 },
+  '6m':  { label: '6 months', days: 180 },
+  '1y':  { label: '1 year',   days: 365 }
+};
+
+/* ============================================================
+   STRATEGIES
+   ============================================================ */
+const STRATEGIES = {
+  advanceorb: {
+    name: 'Advance ORB', icon: '📈', entryRule: 'Opening Range Breakout', risk: '2%',
+    columns: ['Symbol','Price','CHG%','GAP%','Volume','RELVOL','Inside','Breakout','200 EMA','9:15 HIGH','PREV HIGH','MaxQty','Sector'],
+    rows: [
+      ['NEPHROPLUS','67.65','+7.37%','+1.04%','379.0K','1.41x','✗','Waiting','630.82','2,654.10','2,640.25','0','Health Services'],
+      ['PANGJL','2','+7.37%','+1.04%','379.0K','1.41x','✗','Waiting','630.82','2,654.10','2,640.25','0','Health Services'],
+      ['SEDEMAC','63.60','+5.97%','+0.86%','2.5M','4.31x','✗','Waiting','2,695.1','2,739.00','2,748.00','0','Consumer Durability'],
+      ['ELIGIBL','2,775.20','+3.74%','+0.22%','156.0K','1.96x','✗','Waiting','2,695.1','2,739.00','2,748.00','0','Process Industries'],
+      ['APOLLO','40.94','+3.67%','+0.00%','13.7M','1.60x','✗','Waiting','2,695.1','2,739.00','2,748.00','0','Technology Services'],
+      ['SENDOC','39.61','+3.67%','+0.45%','5.5M','1.82x','✗','Waiting','2,695.1','2,739.00','2,748.00','0','Technology Services']
+    ]
+  },
+  smartmoney: {
+    name: 'SmartMoney', icon: '💰', entryRule: 'Breakout + Volume Confirmation', risk: '2.5%',
+    columns: ['Symbol','Max Qty','Price / Chg%','Volume / Rel Vol','Signal Time','POC / Gap','Signal Price / % Chg','Prev High','Candle Status'],
+    rows: [
+      ['CYIENTDLM','179',`698.15<br>${chgSpan('+12.06%')}`,'12.9M<br>N/A','N/A','N/A<br>N/A','N/A','9:45','9:40 9:45 9:50'],
+      ['LOTUSDEV','768',`162.70<br>${chgSpan('+9.81%')}`,'18.4M<br>N/A','N/A','N/A<br>N/A','N/A','9:45','9:40 9:45 9:50'],
+      ['BLUESTONE','161',`776.05<br>${chgSpan('+6.51%')}`,'29.5M<br>N/A','N/A','N/A<br>N/A','N/A','9:45','9:40 9:45 9:50'],
+      ['PNGJLM','196',`636.60<br>${chgSpan('+5.97%')}`,'2.5M<br>N/A','N/A','N/A<br>N/A','N/A','9:45','9:40 9:45 9:50'],
+      ['BAJAJ_AUTO','',`10998.50<br>${chgSpan('+5.72%')}`,'1.4M<br>N/A','N/A','N/A<br>N/A','N/A','9:45','9:40 9:45 9:50']
+    ]
+  },
+  bigplayers: {
+    name: 'Big Players', icon: '🏢', entryRule: 'Support & Resistance', risk: '1.8%',
+    columns: ['Symbol','Price','CHG%','Breakout','Support Price','MaxQty'],
+    rows: [
+      ['RELIANCE','2856.40','+2.1%','Active','2,800.00','100'],
+      ['TCS','3920.00','+0.8%','Waiting','3,850.00','50'],
+      ['INFY','1545.00','+3.4%','Active','1,500.00','75'],
+      ['HDFC','1680.00','-1.2%','Waiting','1,650.00','60'],
+      ['SBIN','785.00','+1.8%','Active','760.00','120'],
+      ['BHARTI','1234.00','+0.3%','Waiting','1,200.00','40']
+    ]
+  }
+};
+
+/* ============================================================
+   USER STORAGE + MIGRATION
+   ============================================================ */
+function loadUsers() {
+  const raw = localStorage.getItem('ta_users');
+  if (raw) return JSON.parse(raw);
+  const seed = {
+    admin: { name: 'Admin', username: 'admin', role: 'admin', plan: '—', expiresAt: null,
+             salt: null, passwordHash: null, _needsSetup: true, disabled: false }
+  };
+  localStorage.setItem('ta_users', JSON.stringify(seed));
+  return seed;
+}
+function saveUsers(u) { localStorage.setItem('ta_users', JSON.stringify(u)); }
+
+async function ensureHashes(users) {
+  let changed = false;
+  for (const u of Object.values(users)) {
+    if (u.password) {
+      u.salt = makeSalt();
+      u.passwordHash = await hashPassword(u.password, u.salt);
+      delete u.password; changed = true;
+    }
+    if (u._needsSetup && u.role === 'admin') {
+      u.salt = makeSalt();
+      u.passwordHash = await hashPassword('admin123', u.salt);
+      delete u._needsSetup; changed = true;
+    }
+    if (u.disabled === undefined) { u.disabled = false; changed = true; }
+  }
+  if (changed) saveUsers(users);
+  return users;
+}
+
+function daysLeft(expiresAt) {
+  if (!expiresAt) return Infinity;
+  return Math.ceil((new Date(expiresAt) - Date.now()) / 86400000);
+}
+function calcExpiry(from, days) {
+  const now = new Date();
+  const base = from && new Date(from) > now ? new Date(from) : now;
+  base.setDate(base.getDate() + days);
+  return base.toISOString().split('T')[0];
+}
+function isActiveToday(u) {
+  if (!u.lastActive) return false;
+  const d = new Date(u.lastActive);
+  const t = new Date();
+  return d.toDateString() === t.toDateString();
+}
+
+/* ============================================================
+   AUTH
+   ============================================================ */
+async function doLogin() {
+  const input = document.getElementById('authUser').value.trim();
+  const password = document.getElementById('authPass').value;
+  const err = document.getElementById('authError');
+
+  const users = await ensureHashes(loadUsers());
+  const u = findUserByLogin(users, input);
+  const lockKey = u?.username || input.toLowerCase();
+
+  const lock = JSON.parse(localStorage.getItem('ta_lock') || '{}');
+  if (lock[lockKey]?.until > Date.now()) {
+    const m = Math.ceil((lock[lockKey].until - Date.now()) / 60000);
+    err.textContent = `Too many attempts. Try again in ${m} min.`;
+    return;
+  }
+
+  const ok = u && u.passwordHash && (u.passwordHash === await hashPassword(password, u.salt));
+
+  if (!ok) {
+    const e = lock[lockKey] || { count: 0 };
+    e.count = (e.count || 0) + 1;
+    if (e.count >= 3) { e.until = Date.now() + 15 * 60000; e.count = 0; }
+    lock[lockKey] = e;
+    localStorage.setItem('ta_lock', JSON.stringify(lock));
+    err.textContent = 'Invalid credentials';
+    auditLog('LOGIN_FAILED', `Input: ${input}`, 'danger');
+    return;
+  }
+  delete lock[lockKey];
+  localStorage.setItem('ta_lock', JSON.stringify(lock));
+
+  if (u.disabled) {
+    err.textContent = 'Account disabled. Contact admin.';
+    auditLog('LOGIN_BLOCKED', `Disabled account: ${u.username}`, 'warn');
+    return;
+  }
+  if (u.role !== 'admin' && daysLeft(u.expiresAt) <= 0) {
+    showExpired(u);
+    auditLog('LOGIN_BLOCKED', `Expired: ${u.username}`, 'warn');
+    return;
+  }
+
+  err.textContent = '';
+  startTotpStep(u, users);
+}
+
+let pendingLoginUser = null;
+
+function showLoginStep(step) {
+  document.getElementById('loginStep1').style.display = step === 1 ? 'block' : 'none';
+  document.getElementById('loginStep2Verify').style.display = step === 'verify' ? 'block' : 'none';
+  document.getElementById('loginStep2Setup').style.display = step === 'setup' ? 'block' : 'none';
+}
+
+async function startTotpStep(user, users) {
+  pendingLoginUser = { user, users };
+
+  if (user.totpSecret) {
+    showLoginStep('verify');
+    document.getElementById('authTotp').value = '';
+    document.getElementById('authTotpError').textContent = '';
+    setTimeout(() => document.getElementById('authTotp').focus(), 100);
+  } else {
+    const secret = generateSecret();
+    pendingLoginUser.newSecret = secret;
+    const uri = `otpauth://totp/TradeAlgo:${user.username}?secret=${secret}&issuer=TradeAlgo`;
+    document.getElementById('setupQR').src =
+      `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(uri)}`;
+    document.getElementById('setupSecret').value = secret;
+    document.getElementById('setupCode').value = '';
+    document.getElementById('setupError').textContent = '';
+    showLoginStep('setup');
+    setTimeout(() => document.getElementById('setupCode').focus(), 100);
+  }
+}
+
+async function verifyLoginTotp() {
+  const code = document.getElementById('authTotp').value.trim();
+  const err = document.getElementById('authTotpError');
+  if (!/^\d{6}$/.test(code)) { err.textContent = 'Enter 6 digits'; return; }
+
+  const { user, users } = pendingLoginUser;
+  if (!await verifyTotp(user.totpSecret, code)) {
+    err.textContent = 'Invalid code. Try again.';
+    auditLog('TOTP_FAILED', `User: ${user.username}`, 'danger');
+    return;
+  }
+  await completeLogin(user, users, '2FA');
+}
+
+async function confirmSetup() {
+  const code = document.getElementById('setupCode').value.trim();
+  const err = document.getElementById('setupError');
+  if (!/^\d{6}$/.test(code)) { err.textContent = 'Enter 6 digits'; return; }
+
+  const { user, users, newSecret } = pendingLoginUser;
+  if (!await verifyTotp(newSecret, code)) {
+    err.textContent = 'Code did not match. Check your app and try again.';
+    return;
+  }
+
+  users[user.username].totpSecret = newSecret;
+  user.totpSecret = newSecret;
+  saveUsers(users);
+  auditLog('TOTP_ENABLED', `User: ${user.username}`, 'success');
+  await completeLogin(user, users, '2FA setup');
+}
+
+async function completeLogin(user, users, reason) {
+  user.lastActive = Date.now();
+  user.sessionId = crypto.randomUUID();
+  users[user.username] = user;
+  saveUsers(users);
+  currentUser = { ...user, username: user.username };
+  saveSession(user.username, user.sessionId);
+  pendingLoginUser = null;
+  showLoginStep(1);
+  showApp();
+  auditLog('LOGIN_SUCCESS', `User: ${user.username} (${reason})`, 'success');
+
+  if (user.role !== 'admin') {
+    const dl = daysLeft(user.expiresAt);
+    if (dl <= 7) setTimeout(() => showToast('⚠️ Expiring Soon', `Expires in ${dl} day${dl===1?'':'s'}`), 500);
+  }
+}
+
+function cancelTotp() {
+  pendingLoginUser = null;
+  showLoginStep(1);
+  document.getElementById('authUser').value = '';
+  document.getElementById('authPass').value = '';
+}
+
+function logout() {
+  if (currentUser) auditLog('LOGOUT', `User: ${currentUser.username}`, 'info');
+  currentUser = null;
+  impersonating = false;
+  localStorage.removeItem('ta_session');
+  localStorage.removeItem('ta_admin_session');
+  document.body.classList.remove('impersonating');
+  document.getElementById('impersonateBanner').style.display = 'none';
+  document.getElementById('authUser').value = '';
+  document.getElementById('authPass').value = '';
+  document.getElementById('authError').textContent = '';
+  showLoginStep(1);
+  navigateTo('screener');
+  showLogin();
+}
+
+function showLogin() {
+  document.body.classList.add('logged-out');
+  document.getElementById('authScreen').style.display = 'flex';
+  document.getElementById('expiredScreen').style.display = 'none';
+}
+function showExpired(user) {
+  document.body.classList.add('logged-out');
+  document.getElementById('authScreen').style.display = 'none';
+  document.getElementById('expiredScreen').style.display = 'flex';
+  document.getElementById('expiredMsg').innerHTML =
+    `Hi <strong>${user.name}</strong>, your subscription expired on <strong>${user.expiresAt}</strong>.<br>Please contact admin to renew.`;
+}
+function showApp() {
+  document.body.classList.remove('logged-out');
+  document.getElementById('authScreen').style.display = 'none';
+  document.getElementById('expiredScreen').style.display = 'none';
+
+  document.querySelectorAll('.admin-only').forEach(el => {
+    el.style.display = (currentUser.role === 'admin' && !impersonating) ? '' : 'none';
+  });
+
+  const initials = currentUser.name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
+  document.getElementById('avatarEl').textContent = initials;
+  document.getElementById('avatarName').textContent = currentUser.name;
+  document.getElementById('avatarRole').textContent = currentUser.role;
+
+  if (impersonating) {
+    document.body.classList.add('impersonating');
+    document.getElementById('impersonateBanner').style.display = 'flex';
+    document.getElementById('impersonateName').textContent = currentUser.name;
+  } else {
+    document.body.classList.remove('impersonating');
+    document.getElementById('impersonateBanner').style.display = 'none';
+  }
+
+  if (currentUser.role === 'admin' && !impersonating) {
+    renderKPIs();
+    renderUsers();
+    loadPrices();
+    renderAudit();
+  }
+  navigateTo('screener');
+
+  if (!window._expiryTimer) {
+    window._expiryTimer = setInterval(() => {
+      if (!currentUser || impersonating) return;
+      const users = loadUsers();
+      const u = users[currentUser.username];
+      if (u && u.sessionId && u.sessionId !== currentUser.sessionId) {
+        showToast('⛔ Session Ended', 'Logged in on another device');
+        setTimeout(logout, 1500);
+        return;
+      }
+      if (currentUser.role !== 'admin' && daysLeft(currentUser.expiresAt) <= 0) {
+        showToast('⛔ Expired', 'Subscription ended');
+        setTimeout(logout, 1500);
+      }
+    }, 30000);
+  }
+}
+
+/* ============================================================
+   TABS
+   ============================================================ */
+function switchTab(name, e) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  e.target.classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+  if (name === 'audit') renderAudit();
+  if (name === 'prices') loadPrices();
+}
+
+/* ============================================================
+   KPIs
+   ============================================================ */
+function renderKPIs() {
+  const users = Object.values(loadUsers()).filter(u => u.role !== 'admin');
+  const prices = getPrices();
+  const total = users.length;
+  const activeToday = users.filter(isActiveToday).length;
+  const expiring = users.filter(u => { const d = daysLeft(u.expiresAt); return d > 0 && d <= 7; }).length;
+  const expired = users.filter(u => daysLeft(u.expiresAt) <= 0).length;
+  const mrr = users.filter(u => daysLeft(u.expiresAt) > 0 && !u.disabled)
+                   .reduce((sum, u) => sum + (prices[u.plan] || 0), 0);
+
+  document.getElementById('adminKPIs').innerHTML = `
+    <div class="stat-box"><div class="label">👥 Total Users</div><div class="value">${total}</div><div class="sub">All registered</div></div>
+    <div class="stat-box"><div class="label">🟢 Active Today</div><div class="value">${activeToday}</div><div class="sub green">Logged in today</div></div>
+    <div class="stat-box"><div class="label">⏰ Expiring (7d)</div><div class="value">${expiring}</div><div class="sub warn">Renew soon</div></div>
+    <div class="stat-box"><div class="label">🔴 Expired</div><div class="value">${expired}</div><div class="sub red">Need renewal</div></div>
+    <div class="stat-box"><div class="label">💰 MRR</div><div class="value">₹${mrr.toLocaleString()}</div><div class="sub green">Monthly revenue</div></div>
+  `;
+}
+
+function loadPrices() {
+  const p = getPrices();
+  document.getElementById('priceDemo').value = p.Demo;
+  document.getElementById('priceBasic').value = p.Basic;
+  document.getElementById('pricePro').value = p.Pro;
+}
+
+/* ============================================================
+   USER MANAGEMENT
+   ============================================================ */
+function renderUsers() {
+  const users = loadUsers();
+  const search = (document.getElementById('userSearch')?.value || '').toLowerCase();
+  const filter = document.getElementById('userFilter')?.value || 'all';
+
+  let list = Object.values(users);
+  if (search) list = list.filter(u =>
+    u.name.toLowerCase().includes(search) ||
+    u.username.includes(search) ||
+    (u.mobile || '').includes(search)
+  );
+  if (filter === 'active')   list = list.filter(u => u.role !== 'admin' && !u.disabled && daysLeft(u.expiresAt) > 0);
+  if (filter === 'expiring') list = list.filter(u => { const d = daysLeft(u.expiresAt); return d > 0 && d <= 7; });
+  if (filter === 'expired')  list = list.filter(u => u.role !== 'admin' && daysLeft(u.expiresAt) <= 0);
+  if (filter === 'disabled') list = list.filter(u => u.disabled);
+
+  if (!list.length) {
+    document.getElementById('usersTable').innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No users match filters.</div>';
+    return;
+  }
+
+  const rows = list.map(u => {
+    const dl = daysLeft(u.expiresAt);
+    let daysText, color;
+    if (u.role === 'admin')       { daysText = '—'; color = 'var(--text-muted)'; }
+    else if (u.disabled)          { daysText = 'Disabled'; color = 'var(--text-muted)'; }
+    else if (dl <= 0)             { daysText = 'Expired'; color = 'var(--text-muted)'; }
+    else if (dl <= 7)             { daysText = `${dl} days`; color = 'var(--danger)'; }
+    else if (dl <= 30)            { daysText = `${dl} days`; color = 'var(--warning)'; }
+    else                          { daysText = `${dl} days`; color = 'var(--success)'; }
+
+    const isAdmin = u.role === 'admin';
+    return `<tr class="${u.disabled ? 'row-disabled' : ''}">
+      <td><strong>${u.name}</strong>${u.mobile ? `<br><span style="font-size:11px;color:var(--text-muted)">📱 ${u.mobile}</span>` : ''}</td>
+      <td>${u.username}</td>
+      <td>${u.plan || '—'}</td>
+      <td>${u.expiresAt || '—'}</td>
+      <td style="color:${color};font-weight:600">${daysText}</td>
+      <td class="actions-cell">
+        ${isAdmin ? '<span style="color:var(--text-muted);font-size:11px">—</span>' : `
+          <button class="btn btn-outline btn-sm" onclick="impersonate('${u.username}')" title="Login as this user">👁️ View</button>
+          <button class="btn btn-primary btn-sm" onclick="renewUser('${u.username}')">Renew</button>
+          <button class="btn btn-warn btn-sm" onclick="resetPassword('${u.username}')" title="Reset password + 2FA">🔑</button>
+          <button class="btn btn-outline btn-sm" onclick="toggleDisable('${u.username}')">${u.disabled ? '✅' : '⏸️'}</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.username}')">🗑️</button>
+        `}
+      </td>
+    </tr>`;
+  }).join('');
+
+  document.getElementById('usersTable').innerHTML = `
+    <table class="table-modern">
+      <thead><tr><th>Name</th><th>Username</th><th>Plan</th><th>Expires</th><th>Days Left</th><th>Actions</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function addUser() {
+  const name = document.getElementById('newName').value.trim();
+  const username = document.getElementById('newUsername').value.trim().toLowerCase();
+  const mobileRaw = document.getElementById('newMobile').value.trim();
+  const mobile = mobileRaw.replace(/\D/g, '');
+  const password = document.getElementById('newPassword').value;
+  const plan = document.getElementById('newPlan').value;
+  const durKey = document.getElementById('newDuration').value;
+
+  if (!name || !username || !password) { showToast('⚠️ Missing Fields','Name, username, password required'); return; }
+  const users = await ensureHashes(loadUsers());
+  if (users[username]) { showToast('⚠️ Username Taken', `"${username}" exists`); return; }
+  if (mobile && Object.values(users).some(u => u.mobile === mobile)) {
+    showToast('⚠️ Mobile Taken', 'This mobile is already registered'); return;
+  }
+
+  const salt = makeSalt();
+  const passwordHash = await hashPassword(password, salt);
+  const expiresAt = calcExpiry(null, DURATIONS[durKey].days);
+  users[username] = { name, username, mobile: mobile || null, passwordHash, salt, role: 'user', plan, expiresAt, disabled: false };
+  saveUsers(users);
+
+  document.getElementById('newName').value = '';
+  document.getElementById('newUsername').value = '';
+  document.getElementById('newMobile').value = '';
+  document.getElementById('newPassword').value = '';
+
+  renderUsers();
+  renderKPIs();
+  auditLog('USER_CREATED', `${name} (@${username}) · ${plan} · ${DURATIONS[durKey].label}`, 'success');
+  showToast('✅ User Created', `${name} · password: ${password}`);
+}
+
+function renewUser(username) {
+  const choice = prompt(
+    `Renew "${username}" for:\n1. 5 days\n2. 7 days\n3. 1 month\n4. 2 months\n5. 3 months\n6. 6 months\n7. 1 year\n\nEnter number (1-7):`
+  );
+  if (!choice) return;
+  const map = { '1':'5d', '2':'7d', '3':'1m', '4':'2m', '5':'3m', '6':'6m', '7':'1y' };
+  const key = map[choice.trim()];
+  if (!key) { showToast('⚠️ Invalid', 'Enter a number 1-7'); return; }
+
+  const users = loadUsers();
+  const u = users[username];
+  if (!u) return;
+  u.expiresAt = calcExpiry(u.expiresAt, DURATIONS[key].days);
+  saveUsers(users);
+  renderUsers();
+  renderKPIs();
+  auditLog('USER_RENEWED', `${u.name} (@${username}) + ${DURATIONS[key].label} → ${u.expiresAt}`, 'success');
+  showToast('✅ Renewed', `${u.name} extended by ${DURATIONS[key].label}`);
+}
+
+function deleteUser(username) {
+  const users = loadUsers();
+  const u = users[username];
+  if (!u) return;
+  if (!confirm(`Delete user "${u.name}" (@${username})?`)) return;
+  delete users[username];
+  saveUsers(users);
+  renderUsers();
+  renderKPIs();
+  auditLog('USER_DELETED', `${u.name} (@${username})`, 'danger');
+  showToast('🗑️ Deleted', `"${u.name}" removed`);
+}
+
+function toggleDisable(username) {
+  const users = loadUsers();
+  const u = users[username];
+  if (!u) return;
+  u.disabled = !u.disabled;
+  saveUsers(users);
+  renderUsers();
+  auditLog(u.disabled ? 'USER_DISABLED' : 'USER_ENABLED', `${u.name} (@${username})`, u.disabled ? 'warn' : 'success');
+  showToast(u.disabled ? '⏸️ Disabled' : '✅ Enabled', `${u.name} ${u.disabled ? 'disabled' : 'enabled'}`);
+}
+
+async function resetPassword(username) {
+  const users = loadUsers();
+  const u = users[username];
+  if (!u) return;
+  if (!confirm(`Reset password + 2FA for "${u.name}"?\nUser will set up 2FA again on next login.`)) return;
+
+  const temp = 'Tmp' + Math.random().toString(36).slice(2, 8);
+  u.salt = makeSalt();
+  u.passwordHash = await hashPassword(temp, u.salt);
+  delete u.totpSecret;
+  u.sessionId = crypto.randomUUID();
+  saveUsers(users);
+  auditLog('PASSWORD_RESET', `${u.name} (@${username}) + 2FA cleared`, 'warn');
+  showToast('🔑 Temp Password', `${u.name}: ${temp} — 2FA reset too`);
+}
+
+/* ============================================================
+   IMPERSONATE
+   ============================================================ */
+function impersonate(username) {
+  const users = loadUsers();
+  const u = users[username];
+  if (!u) return;
+  if (!confirm(`Login as "${u.name}" (@${username})?`)) return;
+
+  localStorage.setItem('ta_admin_session', JSON.stringify({
+    username: currentUser.username,
+    sessionId: currentUser.sessionId,
+    expiresAt: Date.now() + 7 * 60 * 60 * 1000
+  }));
+
+  impersonating = true;
+  currentUser = { ...u, username };
+  saveSession(username, u.sessionId);
+  auditLog('IMPERSONATE_START', `Admin viewing as ${u.name} (@${username})`, 'warn');
+  showApp();
+  showToast('👁️ Impersonating', `Now viewing as ${u.name}`);
+}
+
+function exitImpersonate() {
+  const adminSess = JSON.parse(localStorage.getItem('ta_admin_session') || 'null');
+  if (!adminSess) { logout(); return; }
+
+  const users = loadUsers();
+  const admin = users[adminSess.username];
+  if (!admin) { logout(); return; }
+
+  auditLog('IMPERSONATE_END', `Stopped viewing as ${currentUser.name}`, 'info');
+
+  impersonating = false;
+  currentUser = { ...admin, username: adminSess.username };
+  localStorage.setItem('ta_session', JSON.stringify(adminSess));
+  localStorage.removeItem('ta_admin_session');
+  showApp();
+  showToast('✅ Exited', 'Back to admin account');
+}
+
+/* ============================================================
+   BULK IMPORT
+   ============================================================ */
+function loadSampleCSV() {
+  document.getElementById('csvInput').value =
+`Ravi Kumar,ravi,pass123,Basic,1m,9876543210
+Priya Sharma,priya,pass456,Pro,3m
+Rahul Verma,rahul,demo123,Demo,5d`;
+}
+
+async function bulkImport() {
+  const raw = document.getElementById('csvInput').value.trim();
+  if (!raw) { showToast('⚠️ Empty', 'Paste CSV data first'); return; }
+
+  const users = await ensureHashes(loadUsers());
+  const lines = raw.split('\n').filter(l => l.trim());
+  let ok = 0, fail = 0;
+  const errors = [];
+
+  for (const line of lines) {
+    const parts = line.split(',').map(p => p.trim());
+    if (parts.length < 5) { fail++; errors.push(`Bad format: ${line}`); continue; }
+    const [name, username, password, plan, durCode, mobileRaw] = parts;
+    const mobile = (mobileRaw || '').replace(/\D/g, '');
+    const dur = DURATIONS[durCode];
+    if (!name || !username || !password || !dur) { fail++; errors.push(`Missing fields: ${line}`); continue; }
+    const uname = username.toLowerCase();
+    if (users[uname]) { fail++; errors.push(`Duplicate: ${uname}`); continue; }
+    if (mobile && Object.values(users).some(u => u.mobile === mobile)) {
+      fail++; errors.push(`Mobile exists: ${mobile}`); continue;
+    }
+
+    const salt = makeSalt();
+    const passwordHash = await hashPassword(password, salt);
+    users[uname] = {
+      name, username: uname, mobile: mobile || null, passwordHash, salt,
+      role: 'user', plan, expiresAt: calcExpiry(null, dur.days), disabled: false
+    };
+    ok++;
+  }
+  saveUsers(users);
+  renderUsers();
+  renderKPIs();
+  auditLog('BULK_IMPORT', `${ok} created, ${fail} failed`, fail ? 'warn' : 'success');
+
+  document.getElementById('importResult').innerHTML = `
+    <div style="padding:14px 18px;background:${ok?'rgba(0,184,148,0.1)':'rgba(225,112,85,0.1)'};border-radius:10px">
+      <strong>✅ ${ok} users created</strong>${fail ? ` · <strong style="color:var(--danger)">${fail} failed</strong>` : ''}
+      ${errors.length ? `<div style="margin-top:10px;font-size:12px;color:var(--text-muted)">${errors.map(e => `• ${e}`).join('<br>')}</div>` : ''}
+    </div>`;
+  if (ok) document.getElementById('csvInput').value = '';
+  showToast('📥 Import Done', `${ok} users created${fail ? `, ${fail} failed` : ''}`);
+}
+
+/* ============================================================
+   EXPORT CSV
+   ============================================================ */
+function exportUsersCSV() {
+  const users = Object.values(loadUsers());
+  const header = 'Name,Username,Mobile,Role,Plan,Expires,DaysLeft,Status\n';
+  const rows = users.map(u => {
+    const dl = daysLeft(u.expiresAt);
+    const status = u.disabled ? 'Disabled' : (dl <= 0 ? 'Expired' : 'Active');
+    return [u.name, u.username, u.mobile || '-', u.role, u.plan || '-', u.expiresAt || '-', dl === Infinity ? '-' : dl, status].join(',');
+  }).join('\n');
+  const blob = new Blob([header + rows], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `users_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('📥 Exported', `${users.length} users exported`);
+}
+
+/* ============================================================
+   AVATAR MENU + CHANGE PASSWORD
+   ============================================================ */
+function toggleAvatarMenu(e) {
+  e.stopPropagation();
+  document.getElementById('avatarMenu').classList.toggle('open');
+}
+document.addEventListener('click', () => document.getElementById('avatarMenu')?.classList.remove('open'));
+
+function openChangePassword() {
+  document.getElementById('avatarMenu').classList.remove('open');
+  document.getElementById('pwdCurrent').value = '';
+  document.getElementById('pwdNew').value = '';
+  document.getElementById('pwdConfirm').value = '';
+  document.getElementById('pwdError').textContent = '';
+  document.getElementById('pwdModal').classList.add('open');
+}
+function closeChangePassword() {
+  document.getElementById('pwdModal').classList.remove('open');
+}
+async function savePassword() {
+  const cur = document.getElementById('pwdCurrent').value;
+  const nw = document.getElementById('pwdNew').value;
+  const cf = document.getElementById('pwdConfirm').value;
+  const err = document.getElementById('pwdError');
+
+  if (!cur || !nw || !cf) { err.textContent = 'All fields required'; return; }
+  if (nw.length < 4) { err.textContent = 'New password must be 4+ characters'; return; }
+  if (nw !== cf) { err.textContent = 'New passwords do not match'; return; }
+
+  const users = await ensureHashes(loadUsers());
+  const u = users[currentUser.username];
+  if (u.passwordHash !== await hashPassword(cur, u.salt)) { err.textContent = 'Current password is incorrect'; return; }
+
+  u.salt = makeSalt();
+  u.passwordHash = await hashPassword(nw, u.salt);
+  u.sessionId = crypto.randomUUID();
+  currentUser.sessionId = u.sessionId;
+  saveUsers(users);
+  saveSession(currentUser.username, u.sessionId);
+  auditLog('PASSWORD_CHANGED', `User: ${currentUser.username}`, 'success');
+  closeChangePassword();
+  showToast('✅ Updated', 'Password changed. Other devices logged out.');
+}
+
+/* ============================================================
+   NAVIGATION
+   ============================================================ */
+function navigateTo(pageId) {
+  DOM.navLinks.forEach(a => a.classList.toggle('active', a.dataset.page === pageId));
+  DOM.pages.forEach(p => p.classList.toggle('active', p.id === 'page-' + pageId));
+  if (pageId === 'portfolio') loadPortfolio();
+  if (pageId === 'users' && currentUser?.role === 'admin' && !impersonating) {
+    renderKPIs();
+    renderUsers();
+    renderAudit();
+  }
+}
+DOM.navLinks.forEach(link => link.addEventListener('click', e => {
+  e.preventDefault();
+  const p = link.getAttribute('data-page');
+  if (p) navigateTo(p);
+}));
+
+/* ============================================================
+   PORTFOLIO
+   ============================================================ */
+function loadPortfolio() {
+  const holdings = [
+    { symbol: 'RELIANCE', qty: 10, avg: 2810, current: 2856 },
+    { symbol: 'TCS',      qty: 5,  avg: 3890, current: 3920 },
+    { symbol: 'INFY',     qty: 15, avg: 1520, current: 1545 },
+    { symbol: 'HDFC',     qty: 8,  avg: 1700, current: 1680 }
+  ];
+  const totalValue = holdings.reduce((s, h) => s + h.current * h.qty, 0);
+  const invested   = holdings.reduce((s, h) => s + h.avg * h.qty, 0);
+  const totalPnl   = totalValue - invested;
+  const pct        = Math.round(totalPnl / invested * 100);
+
+  document.getElementById('portfolioStats').innerHTML = `
+    <div class="stat-box"><div class="label">💰 Total Value</div><div class="value">₹${totalValue.toLocaleString()}</div><div class="sub ${totalPnl>=0?'green':'red'}">${totalPnl>=0?'↑':'↓'} ₹${Math.abs(totalPnl).toLocaleString()}</div></div>
+    <div class="stat-box"><div class="label">📊 Invested</div><div class="value">₹${invested.toLocaleString()}</div><div class="sub" style="color:var(--text-muted)">${Math.round(invested/totalValue*100)}% allocated</div></div>
+    <div class="stat-box"><div class="label">💵 Available Cash</div><div class="value">₹${Math.round(totalValue*0.32).toLocaleString()}</div><div class="sub" style="color:var(--text-muted)">32% free</div></div>
+    <div class="stat-box"><div class="label">📈 Total P&L</div><div class="value" style="color:${totalPnl>=0?GREEN:RED}">${totalPnl>=0?'+':''}₹${totalPnl.toLocaleString()}</div><div class="sub ${totalPnl>=0?'green':'red'}">${totalPnl>=0?'↑':'↓'} ${Math.abs(pct)}%</div></div>
+  `;
+
+  document.getElementById('holdingsTable').innerHTML = `
+    <table class="table-modern">
+      <thead><tr><th>Symbol</th><th>Qty</th><th>Avg Price</th><th>Current</th><th>P&L</th><th>Action</th></tr></thead>
+      <tbody>${holdings.map(h => {
+        const pnl = (h.current - h.avg) * h.qty;
+        return `<tr>
+          <td><strong>${h.symbol}</strong></td>
+          <td>${h.qty}</td>
+          <td>₹${h.avg}</td>
+          <td>₹${h.current}</td>
+          <td style="color:${pnl>=0?GREEN:RED};font-weight:600">${pnl>=0?'+':''}₹${pnl}</td>
+          <td><button class="btn btn-danger btn-sm" onclick="showToast('📤 Sold','${h.symbol} sold')">Sell</button></td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table>`;
+}
+
+/* ============================================================
+   SCREENER
+   ============================================================ */
+function onStrategyChange() {
+  const s = STRATEGIES[document.getElementById('strategySelect').value];
+  if (!s) return;
+  document.getElementById('infoStrategy').textContent = s.icon + ' ' + s.name;
+  document.getElementById('infoRule').textContent = s.entryRule;
+  document.getElementById('infoRisk').textContent = s.risk;
+
+  document.getElementById('screenerHead').innerHTML =
+    `<tr>${[...s.columns, 'Action'].map(c => `<th>${c}</th>`).join('')}</tr>`;
+
+  const tbody = document.getElementById('screenerBody');
+  if (!s.rows.length) {
+    tbody.innerHTML = `<tr><td colspan="${s.columns.length + 1}" style="text-align:center;padding:40px;color:var(--text-muted)">No stocks found.</td></tr>`;
+  } else {
+    tbody.innerHTML = s.rows.map(r =>
+      `<tr>${r.map(c => `<td>${c}</td>`).join('')}<td><button class="btn-place-order btn-sm" onclick="placeOrder('${r[0]}')" ${autoBuyEnabled ? 'disabled' : ''}>Place Order</button></td></tr>`
+    ).join('');
+  }
+  document.getElementById('screenerCount').textContent = `Showing ${s.rows.length} stocks`;
+}
+
+function toggleAutoBuyMode() {
+  autoBuyEnabled = document.getElementById('autoBuyToggle').checked;
+  const status = document.getElementById('toggleStatus');
+  status.textContent = autoBuyEnabled ? 'ON' : 'OFF';
+  status.classList.toggle('active', autoBuyEnabled);
+
+  if (autoBuyEnabled) {
+    showToast('🤖 Auto Buy ON', 'Auto-buy enabled for current strategy');
+    const s = STRATEGIES[document.getElementById('strategySelect').value];
+    const symbols = s.rows.map(r => r[0]);
+    showToast('🚀 Auto-Buy All', `Buying ${symbols.length} stocks: ${symbols.join(', ')}`);
+  } else {
+    showToast('👤 Manual Mode ON', 'Click Place Order to buy stocks');
+  }
+  onStrategyChange();
+}
+
+function runScreener(e) {
+  const btn = e?.target;
+  const orig = btn.textContent;
+  btn.innerHTML = '<span class="spinner"></span> Running...';
+  btn.disabled = true;
+  setTimeout(() => {
+    onStrategyChange();
+    showToast('✅ Screener Complete', 'Stocks updated');
+    btn.innerHTML = orig;
+    btn.disabled = false;
+  }, 600);
+}
+
+function placeOrder(symbol) {
+  if (autoBuyEnabled) { showToast('⚠️ Auto Buy ON', 'Disable Auto Buy for manual orders'); return; }
+  showToast('📝 Order Placed', `Order placed for ${symbol}`);
+}
+
+/* ============================================================
+   TOAST
+   ============================================================ */
+let toastTimeout = null;
+function showToast(title, message) {
+  DOM.toastTitle.textContent = title || '✅ Success';
+  DOM.toastMessage.textContent = message || 'Action completed';
+  DOM.toast.classList.add('show');
+  clearTimeout(toastTimeout);
+  toastTimeout = setTimeout(() => DOM.toast.classList.remove('show'), 4000);
+}
+function hideToast() {
+  DOM.toast.classList.remove('show');
+  clearTimeout(toastTimeout);
+}
+
+/* ============================================================
+   SETTINGS
+   ============================================================ */
+function toggleBrokerFields() {
+  const b = document.getElementById('brokerSelect').value;
+  document.getElementById('dhanFields').style.display = b === 'dhan' ? 'grid' : 'none';
+  document.getElementById('otherBrokerFields').style.display = (b && b !== 'dhan') ? 'block' : 'none';
+}
+
+/* ============================================================
+   INIT
+   ============================================================ */
+(async function init() {
+  const users = await ensureHashes(loadUsers());
+
+  const adminSess = JSON.parse(localStorage.getItem('ta_admin_session') || 'null');
+  const sess = loadSession();
+
+  if (sess && !sess.sessionId) { localStorage.removeItem('ta_session'); showLogin(); return; }
+
+  if (sess && users[sess.username]) {
+    const u = users[sess.username];
+    if (adminSess && users[adminSess.username]) {
+      impersonating = true;
+      currentUser = { ...u, username: sess.username };
+      showApp();
+      return;
+    }
+    if (u.disabled) { showLogin(); return; }
+    if (u.role !== 'admin' && daysLeft(u.expiresAt) <= 0) { showExpired(u); return; }
+    if (!u.totpSecret) { showLogin(); return; }
+    if (u.sessionId && u.sessionId !== sess.sessionId) {
+      localStorage.removeItem('ta_session');
+      showLogin();
+      return;
+    }
+
+    currentUser = { ...u, username: sess.username };
+    showApp();
+    if (u.role !== 'admin') {
+      const dl = daysLeft(u.expiresAt);
+      if (dl <= 7) setTimeout(() => showToast('⚠️ Expiring Soon', `Expires in ${dl} day${dl===1?'':'s'}`), 500);
+    }
+    return;
+  }
+  showLogin();
+})();
+
+onStrategyChange();
+toggleBrokerFields();
+</script>
+</body>
+</html>

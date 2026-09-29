@@ -3,9 +3,8 @@ import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import pg from 'pg';
-import dotenv from 'dotenv';
+import crypto from 'crypto';
 
-dotenv.config();
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
@@ -27,6 +26,7 @@ function auth(req, res, next) {
     next();
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 }
+
 function adminOnly(req, res, next) {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   next();
@@ -42,6 +42,8 @@ async function log(actor, action, details = '', level = 'info') {
 }
 
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
+
+/* ============ AUTH ============ */
 
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
@@ -92,7 +94,8 @@ app.post('/api/login', async (req, res) => {
     name: user.name,
     role: user.role,
     hasTotp: !!user.totp_secret,
-    needsSetup: !user.totp_secret
+    needsSetup: !user.totp_secret,
+    totpSecret: user.totp_secret || null
   });
 });
 
@@ -117,8 +120,12 @@ app.post('/api/complete-login', async (req, res) => {
     ok: true,
     token,
     user: {
-      name: user.name, username: user.username, role: user.role,
-      plan: user.plan, expiresAt: user.expires_at, mobile: user.mobile,
+      name: user.name,
+      username: user.username,
+      role: user.role,
+      plan: user.plan,
+      expiresAt: user.expires_at,
+      mobile: user.mobile,
       sessionId
     }
   });
@@ -143,6 +150,8 @@ app.post('/api/logout', auth, async (req, res) => {
   await log(req.user.username, 'LOGOUT', `User: ${req.user.username}`, 'info');
   res.json({ ok: true });
 });
+
+/* ============ USERS (admin) ============ */
 
 app.get('/api/users', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query(
@@ -192,7 +201,10 @@ app.post('/api/users/:username/reset', auth, adminOnly, async (req, res) => {
 });
 
 app.post('/api/users/:username/disable', auth, adminOnly, async (req, res) => {
-  await db.query('UPDATE users SET disabled = NOT disabled, session_id = NULL WHERE username=$1', [req.params.username]);
+  await db.query(
+    'UPDATE users SET disabled = NOT disabled, session_id = NULL WHERE username=$1',
+    [req.params.username]
+  );
   res.json({ ok: true });
 });
 
@@ -202,14 +214,19 @@ app.delete('/api/users/:username', auth, adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
+/* ============ AUDIT ============ */
+
 app.get('/api/audit', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200');
   res.json(rows);
 });
+
 app.delete('/api/audit', auth, adminOnly, async (req, res) => {
   await db.query('DELETE FROM audit_log');
   res.json({ ok: true });
 });
+
+/* ============ PRICES ============ */
 
 app.get('/api/prices', auth, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM prices');
@@ -217,6 +234,7 @@ app.get('/api/prices', auth, async (req, res) => {
   rows.forEach(r => out[r.plan] = r.amount);
   res.json(out);
 });
+
 app.put('/api/prices', auth, adminOnly, async (req, res) => {
   const { Demo, Basic, Pro } = req.body;
   await db.query('UPDATE prices SET amount=$1 WHERE plan=$2', [Demo, 'Demo']);
@@ -224,6 +242,8 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
   await db.query('UPDATE prices SET amount=$1 WHERE plan=$2', [Pro, 'Pro']);
   res.json({ ok: true });
 });
+
+/* ============ START ============ */
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server on port ${PORT}`));

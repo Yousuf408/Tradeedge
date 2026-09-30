@@ -41,6 +41,43 @@ async function log(actor, action, details = '', level = 'info') {
   } catch {}
 }
 
+/* ============ TOTP VERIFY (server-side) ============ */
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function base32Decode(str) {
+  str = str.toUpperCase().replace(/=+$/, '');
+  let bits = '';
+  for (const c of str) {
+    const v = B32.indexOf(c);
+    if (v === -1) continue;
+    bits += v.toString(2).padStart(5, '0');
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.slice(i, i + 8), 2));
+  return Buffer.from(bytes);
+}
+
+function totpAt(secret, counter) {
+  const key = base32Decode(secret);
+  const buf = Buffer.alloc(8);
+  buf.writeUInt32BE(counter, 4);
+  const hmac = crypto.createHmac('sha1', key);
+  hmac.update(buf);
+  const sig = hmac.digest();
+  const off = sig[sig.length - 1] & 0x0f;
+  const code = ((sig[off] & 0x7f) << 24) | ((sig[off+1] & 0xff) << 16)
+             | ((sig[off+2] & 0xff) << 8)  | (sig[off+3] & 0xff);
+  return String(code % 1000000).padStart(6, '0');
+}
+
+function verifyTotpServer(secret, input) {
+  const step = Math.floor(Date.now() / 1000 / 30);
+  for (const c of [step - 1, step, step + 1]) {
+    if (totpAt(secret, c) === input) return true;
+  }
+  return false;
+}
+
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
 
 /* ============ AUTH ============ */
@@ -151,6 +188,56 @@ app.post('/api/logout', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
+/* ============ FORGOT PASSWORD (self-service, TOTP-verified) ============ */
+app.post('/api/forgot-password/check', async (req, res) => {
+  const { input } = req.body;
+  const clean = (input || '').trim().toLowerCase();
+  if (!clean) return res.status(400).json({ error: 'Enter username or mobile' });
+
+  const digits = clean.replace(/\D/g, '');
+  const { rows } = await db.query(
+    "SELECT username, name, totp_secret, disabled FROM users WHERE username=$1 OR (mobile=$2 AND $2 <> '')",
+    [clean, digits.length >= 10 ? digits : '__none__']
+  );
+  const user = rows[0];
+  if (!user) return res.status(404).json({ error: 'No account found' });
+  if (user.disabled) return res.status(403).json({ error: 'Account disabled — contact admin' });
+  if (!user.totp_secret) return res.status(400).json({ error: 'No 2FA set up — contact admin' });
+
+  res.json({ ok: true, username: user.username, name: user.name });
+});
+
+app.post('/api/forgot-password/reset', async (req, res) => {
+  const { input, totpCode, newPassword } = req.body;
+  const clean = (input || '').trim().toLowerCase();
+  if (!clean || !totpCode || !newPassword) return res.status(400).json({ error: 'Missing fields' });
+  if (newPassword.length < 6) return res.status(400).json({ error: 'Password must be 6+ characters' });
+
+  const digits = clean.replace(/\D/g, '');
+  const { rows } = await db.query(
+    "SELECT * FROM users WHERE username=$1 OR (mobile=$2 AND $2 <> '')",
+    [clean, digits.length >= 10 ? digits : '__none__']
+  );
+  const user = rows[0];
+  if (!user) return res.status(404).json({ error: 'No account found' });
+  if (user.disabled) return res.status(403).json({ error: 'Account disabled' });
+  if (!user.totp_secret) return res.status(400).json({ error: 'No 2FA set up — contact admin' });
+
+  if (!verifyTotpServer(user.totp_secret, String(totpCode).trim())) {
+    await log(user.username, 'FORGOT_PASSWORD_FAILED', 'Bad TOTP', 'danger');
+    return res.status(401).json({ error: 'Invalid code' });
+  }
+
+  const hash = await bcrypt.hash(newPassword, 10);
+  await db.query(
+    'UPDATE users SET password_hash=$1, session_id=NULL WHERE username=$2',
+    [hash, user.username]
+  );
+  await log(user.username, 'PASSWORD_RESET_SELF', `User: ${user.username}`, 'warn');
+
+  res.json({ ok: true });
+});
+
 /* ============ CHANGE PASSWORD ============ */
 app.post('/api/change-password', auth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
@@ -179,7 +266,6 @@ app.post('/api/change-password', auth, async (req, res) => {
     [hash, newSessionId, req.user.username]
   );
 
-  // Issue a new token bound to the new sessionId so THIS device stays logged in
   const token = jwt.sign(
     { username: user.username, role: user.role, sessionId: newSessionId },
     SECRET,
@@ -187,7 +273,6 @@ app.post('/api/change-password', auth, async (req, res) => {
   );
 
   await log(req.user.username, 'PASSWORD_CHANGED', `User: ${req.user.username}`, 'success');
-
   res.json({ ok: true, token, sessionId: newSessionId });
 });
 

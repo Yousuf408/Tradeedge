@@ -1,3 +1,5 @@
+import dotenv from 'dotenv';
+dotenv.config();
 import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
@@ -8,8 +10,6 @@ import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { login as angelLogin, getCandles as angelCandles } from './brokers/angelone/Angel_REST.js';
-import dotenv from 'dotenv';
-dotenv.config();
 
 const app = express();
 app.use(express.json());

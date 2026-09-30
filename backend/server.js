@@ -41,6 +41,28 @@ async function log(actor, action, details = '', level = 'info') {
   } catch {}
 }
 
+/* ============ HELPERS: auto-generate username/password ============ */
+async function generateUsername(fullName, mobile) {
+  const first = (fullName || '').trim().split(/\s+/)[0].toLowerCase().replace(/[^a-z0-9]/g, '');
+  const last4 = (mobile || '').replace(/\D/g, '').slice(-4);
+  const base = (first || 'user') + last4;
+  let candidate = base;
+  let i = 1;
+  while (true) {
+    const { rows } = await db.query('SELECT 1 FROM users WHERE username=$1', [candidate]);
+    if (!rows.length) return candidate;
+    candidate = base + i;
+    i++;
+  }
+}
+
+function generatePassword(fullName, mobile) {
+  const first = (fullName || '').trim().split(/\s+/)[0];
+  const cap = first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
+  const last4 = (mobile || '').replace(/\D/g, '').slice(-4);
+  return `${cap}@${last4}!`;
+}
+
 /* ============ TOTP VERIFY (server-side) ============ */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
@@ -188,7 +210,7 @@ app.post('/api/logout', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ============ FORGOT PASSWORD (self-service, TOTP-verified) ============ */
+/* ============ FORGOT PASSWORD ============ */
 app.post('/api/forgot-password/check', async (req, res) => {
   const { input } = req.body;
   const clean = (input || '').trim().toLowerCase();
@@ -276,6 +298,33 @@ app.post('/api/change-password', auth, async (req, res) => {
   res.json({ ok: true, token, sessionId: newSessionId });
 });
 
+/* ============ SELF PROFILE (user updates own name/mobile) ============ */
+app.put('/api/me', auth, async (req, res) => {
+  const { name, mobile } = req.body;
+  if (!name) return res.status(400).json({ error: 'Name required' });
+
+  const cleanMobile = (mobile || '').replace(/\D/g, '') || null;
+
+  try {
+    if (cleanMobile) {
+      const dup = await db.query(
+        'SELECT username FROM users WHERE mobile=$1 AND username<>$2',
+        [cleanMobile, req.user.username]
+      );
+      if (dup.rows.length) return res.status(409).json({ error: 'Mobile already in use' });
+    }
+
+    await db.query(
+      'UPDATE users SET name=$1, mobile=$2 WHERE username=$3',
+      [name.trim(), cleanMobile, req.user.username]
+    );
+    await log(req.user.username, 'PROFILE_UPDATED', `User: ${req.user.username}`, 'success');
+    res.json({ ok: true, name: name.trim(), mobile: cleanMobile });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 /* ============ USERS (admin) ============ */
 
 app.get('/api/users', auth, adminOnly, async (req, res) => {
@@ -287,19 +336,60 @@ app.get('/api/users', auth, adminOnly, async (req, res) => {
   res.json(rows);
 });
 
+/* ---- Create user (auto-generate username + password) ---- */
 app.post('/api/users', auth, adminOnly, async (req, res) => {
-  const { name, username, mobile, password, plan, expiresAt } = req.body;
-  if (!name || !username || !password) return res.status(400).json({ error: 'Missing fields' });
+  let { name, mobile, password, plan, expiresAt } = req.body;
+
+  if (!name || !mobile) return res.status(400).json({ error: 'Name and mobile required' });
+  const cleanMobile = String(mobile).replace(/\D/g, '');
+  if (cleanMobile.length < 10) return res.status(400).json({ error: 'Mobile must be 10 digits' });
+
+  // Auto-generate username + password
+  const username = await generateUsername(name, cleanMobile);
+  if (!password) password = generatePassword(name, cleanMobile);
+
   const hash = await bcrypt.hash(password, 10);
+
   try {
     await db.query(
-      'INSERT INTO users (name, username, mobile, password_hash, plan, expires_at) VALUES ($1,$2,$3,$4,$5,$6)',
-      [name, username.toLowerCase(), mobile || null, hash, plan, expiresAt]
+      `INSERT INTO users (name, username, mobile, password_hash, plan, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [name.trim(), username, cleanMobile, hash, plan || 'Demo', expiresAt]
     );
     await log(req.user.username, 'USER_CREATED', `${name} (@${username})`, 'success');
+    res.json({ ok: true, username, password, mobile: cleanMobile });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'Mobile already registered' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---- Edit user (admin updates name, mobile, plan, role) ---- */
+app.put('/api/users/:username', auth, adminOnly, async (req, res) => {
+  const target = req.params.username;
+  const { name, mobile, plan, role } = req.body;
+
+  const existing = await db.query('SELECT username FROM users WHERE username=$1', [target]);
+  if (!existing.rows.length) return res.status(404).json({ error: 'User not found' });
+
+  const cleanMobile = mobile ? String(mobile).replace(/\D/g, '') : null;
+
+  try {
+    if (cleanMobile) {
+      const dup = await db.query(
+        'SELECT username FROM users WHERE mobile=$1 AND username<>$2',
+        [cleanMobile, target]
+      );
+      if (dup.rows.length) return res.status(409).json({ error: 'Mobile already in use' });
+    }
+
+    await db.query(
+      `UPDATE users SET name=$1, mobile=$2, plan=$3, role=$4 WHERE username=$5`,
+      [name, cleanMobile, plan, role, target]
+    );
+    await log(req.user.username, 'USER_UPDATED', `${target}`, 'success');
     res.json({ ok: true });
   } catch (e) {
-    if (e.code === '23505') return res.status(409).json({ error: 'Username or mobile already exists' });
     res.status(500).json({ error: e.message });
   }
 });
@@ -315,7 +405,11 @@ app.post('/api/users/:username/renew', auth, adminOnly, async (req, res) => {
 });
 
 app.post('/api/users/:username/reset', auth, adminOnly, async (req, res) => {
-  const temp = 'Tmp' + Math.random().toString(36).slice(2, 8);
+  const { rows } = await db.query('SELECT name, mobile FROM users WHERE username=$1', [req.params.username]);
+  const u = rows[0];
+  if (!u) return res.status(404).json({ error: 'User not found' });
+
+  const temp = generatePassword(u.name, u.mobile || '0000');
   const hash = await bcrypt.hash(temp, 10);
   await db.query(
     'UPDATE users SET password_hash=$1, totp_secret=NULL, session_id=NULL WHERE username=$2',
@@ -352,7 +446,6 @@ app.delete('/api/audit', auth, adminOnly, async (req, res) => {
 });
 
 /* ============ PRICES ============ */
-
 app.get('/api/prices', auth, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM prices');
   const out = {};
@@ -361,10 +454,9 @@ app.get('/api/prices', auth, async (req, res) => {
 });
 
 app.put('/api/prices', auth, adminOnly, async (req, res) => {
-  const { Demo, Basic, Pro } = req.body;
-  await db.query('UPDATE prices SET amount=$1 WHERE plan=$2', [Demo, 'Demo']);
-  await db.query('UPDATE prices SET amount=$1 WHERE plan=$2', [Basic, 'Basic']);
-  await db.query('UPDATE prices SET amount=$1 WHERE plan=$2', [Pro, 'Pro']);
+  const { Demo, Pro } = req.body;
+  await db.query('UPDATE prices SET amount=$1 WHERE plan=$2', [Demo || 0, 'Demo']);
+  await db.query('UPDATE prices SET amount=$1 WHERE plan=$2', [Pro || 0, 'Pro']);
   res.json({ ok: true });
 });
 

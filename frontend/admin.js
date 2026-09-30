@@ -186,7 +186,6 @@ function navigateTo(pageId) {
   DOM.navLinks.forEach(a => a.classList.toggle('active', a.dataset.page === pageId));
   DOM.pages.forEach(p => p.classList.toggle('active', p.id === 'page-' + pageId));
 
-  // Page-specific loaders
   if (pageId === 'portfolio' && typeof loadPortfolio === 'function') loadPortfolio();
   if (pageId === 'users' && currentUser?.role === 'admin' && !impersonating) {
     renderKPIs();
@@ -203,8 +202,8 @@ DOM.navLinks.forEach(link => link.addEventListener('click', e => {
 
 
 /* ============================================================
-   SECTION 8 — AVATAR MENU
-   Top-right dropdown (Change password / Logout)
+   SECTION 8 — AVATAR MENU + CHANGE PASSWORD
+   Top-right dropdown. Opens change-password modal.
    ============================================================ */
 function toggleAvatarMenu(e) {
   e.stopPropagation();
@@ -216,14 +215,58 @@ document.addEventListener('click', () =>
 
 function openChangePassword() {
   document.getElementById('avatarMenu').classList.remove('open');
-  document.getElementById('pwdError').textContent = 'Contact admin to reset your password.';
+  document.getElementById('pwdCurrent').value = '';
+  document.getElementById('pwdNew').value = '';
+  document.getElementById('pwdConfirm').value = '';
+  document.getElementById('pwdError').textContent = '';
   document.getElementById('pwdModal').classList.add('open');
+  setTimeout(() => document.getElementById('pwdCurrent').focus(), 100);
 }
+
 function closeChangePassword() {
   document.getElementById('pwdModal').classList.remove('open');
 }
-function savePassword() {
-  document.getElementById('pwdError').textContent = 'Contact admin to reset your password.';
+
+async function savePassword() {
+  const cur = document.getElementById('pwdCurrent').value;
+  const nw  = document.getElementById('pwdNew').value;
+  const cf  = document.getElementById('pwdConfirm').value;
+  const err = document.getElementById('pwdError');
+  err.textContent = '';
+
+  if (!cur || !nw || !cf) { err.textContent = 'All fields required'; return; }
+  if (nw.length < 6)      { err.textContent = 'New password must be 6+ characters'; return; }
+  if (nw !== cf)          { err.textContent = 'New passwords do not match'; return; }
+  if (nw === cur)         { err.textContent = 'New password must differ from current'; return; }
+
+  const btn = document.querySelector('#pwdModal .btn-primary');
+  const orig = btn.textContent;
+  btn.textContent = 'Updating...';
+  btn.disabled = true;
+
+  try {
+    const r = await api('/api/change-password', {
+      method: 'POST',
+      body: JSON.stringify({ currentPassword: cur, newPassword: nw })
+    });
+
+    // Server rotated sessionId → store the new token so THIS device stays logged in
+    if (r.token) {
+      setToken(r.token);
+      try {
+        const u = getUser();
+        if (u) { u.sessionId = r.sessionId; setUser(u); }
+      } catch {}
+    }
+
+    closeChangePassword();
+    showToast('✅ Updated', 'Password changed. Other devices logged out.');
+  } catch (e) {
+    err.textContent = e.message;
+  } finally {
+    btn.textContent = orig;
+    btn.disabled = false;
+  }
 }
 
 
@@ -254,7 +297,6 @@ async function doLogin() {
     pendingLoginUser = r;
 
     if (r.needsSetup) {
-      // First-time user → setup QR
       const secret = generateSecret();
       pendingLoginUser.newSecret = secret;
       const uri = `otpauth://totp/TradeAlgo:${r.username}?secret=${secret}&issuer=TradeAlgo`;
@@ -266,7 +308,6 @@ async function doLogin() {
       showLoginStep('setup');
       setTimeout(() => document.getElementById('setupCode').focus(), 100);
     } else {
-      // Returning user → verify code
       document.getElementById('authTotp').value = '';
       document.getElementById('authTotpError').textContent = '';
       showLoginStep('verify');
@@ -383,19 +424,16 @@ function showApp() {
   document.getElementById('authScreen').style.display = 'none';
   document.getElementById('expiredScreen').style.display = 'none';
 
-  // Show/hide admin-only nav
   document.querySelectorAll('.admin-only').forEach(el => {
     el.style.display = (currentUser.role === 'admin' && !impersonating) ? '' : 'none';
   });
 
-  // Avatar initials
   const initials = (currentUser.name || 'U')
     .split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
   document.getElementById('avatarEl').textContent = initials;
   document.getElementById('avatarName').textContent = currentUser.name;
   document.getElementById('avatarRole').textContent = currentUser.role;
 
-  // Impersonate banner
   if (impersonating) {
     document.body.classList.add('impersonating');
     document.getElementById('impersonateBanner').style.display = 'flex';
@@ -405,7 +443,6 @@ function showApp() {
     document.getElementById('impersonateBanner').style.display = 'none';
   }
 
-  // Preload admin data if admin
   if (currentUser.role === 'admin' && !impersonating) {
     renderKPIs();
     renderUsers();
@@ -415,7 +452,6 @@ function showApp() {
 
   navigateTo('screener');
 
-  // Session heartbeat (every 30s)
   if (!window._expiryTimer) {
     window._expiryTimer = setInterval(async () => {
       if (!currentUser || impersonating) return;
@@ -481,7 +517,6 @@ async function renderKPIs() {
 
 /* ============================================================
    SECTION 13 — ADMIN: USERS TABLE & CRUD
-   Render table, add/renew/delete/disable/reset users
    ============================================================ */
 async function renderUsers() {
   const search = (document.getElementById('userSearch')?.value || '').toLowerCase();
@@ -651,7 +686,6 @@ async function resetPassword(username) {
 
 /* ============================================================
    SECTION 14 — ADMIN: IMPERSONATE
-   View app as another user (with banner + exit)
    ============================================================ */
 async function impersonate(username) {
   if (!confirm(`View as "${username}"?`)) return;
@@ -842,7 +876,6 @@ async function exportUsersCSV() {
 
 /* ============================================================
    SECTION 19 — BOOTSTRAP (auto-runs on page load)
-   Checks for saved session; shows login or app
    ============================================================ */
 (async function initAuth() {
   const token = getToken();

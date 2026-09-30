@@ -63,7 +63,7 @@ function generatePassword(fullName, mobile) {
   return `${cap}@${last4}!`;
 }
 
-/* ============ TOTP VERIFY (server-side) ============ */
+/* ============ TOTP VERIFY ============ */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 function base32Decode(str) {
@@ -263,12 +263,8 @@ app.post('/api/forgot-password/reset', async (req, res) => {
 /* ============ CHANGE PASSWORD ============ */
 app.post('/api/change-password', auth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
-  if (!currentPassword || !newPassword) {
-    return res.status(400).json({ error: 'Missing fields' });
-  }
-  if (newPassword.length < 6) {
-    return res.status(400).json({ error: 'New password must be 6+ characters' });
-  }
+  if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Missing fields' });
+  if (newPassword.length < 6) return res.status(400).json({ error: 'New password must be 6+ characters' });
 
   const { rows } = await db.query('SELECT * FROM users WHERE username=$1', [req.user.username]);
   const user = rows[0];
@@ -298,7 +294,7 @@ app.post('/api/change-password', auth, async (req, res) => {
   res.json({ ok: true, token, sessionId: newSessionId });
 });
 
-/* ============ SELF PROFILE (user updates own name/mobile) ============ */
+/* ============ SELF PROFILE ============ */
 app.put('/api/me', auth, async (req, res) => {
   const { name, mobile } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
@@ -336,7 +332,7 @@ app.get('/api/users', auth, adminOnly, async (req, res) => {
   res.json(rows);
 });
 
-/* ---- Create user (auto-generate username + password) ---- */
+/* Create user (auto-generate username + password) */
 app.post('/api/users', auth, adminOnly, async (req, res) => {
   let { name, mobile, password, plan, expiresAt } = req.body;
 
@@ -344,10 +340,8 @@ app.post('/api/users', auth, adminOnly, async (req, res) => {
   const cleanMobile = String(mobile).replace(/\D/g, '');
   if (cleanMobile.length < 10) return res.status(400).json({ error: 'Mobile must be 10 digits' });
 
-  // Auto-generate username + password
   const username = await generateUsername(name, cleanMobile);
   if (!password) password = generatePassword(name, cleanMobile);
-
   const hash = await bcrypt.hash(password, 10);
 
   try {
@@ -364,7 +358,7 @@ app.post('/api/users', auth, adminOnly, async (req, res) => {
   }
 });
 
-/* ---- Edit user (admin updates name, mobile, plan, role) ---- */
+/* Edit user (admin updates name, mobile, plan, role) */
 app.put('/api/users/:username', auth, adminOnly, async (req, res) => {
   const target = req.params.username;
   const { name, mobile, plan, role } = req.body;
@@ -384,7 +378,7 @@ app.put('/api/users/:username', auth, adminOnly, async (req, res) => {
     }
 
     await db.query(
-      `UPDATE users SET name=$1, mobile=$2, plan=$3, role=$4 WHERE username=$5`,
+      'UPDATE users SET name=$1, mobile=$2, plan=$3, role=$4 WHERE username=$5',
       [name, cleanMobile, plan, role, target]
     );
     await log(req.user.username, 'USER_UPDATED', `${target}`, 'success');
@@ -394,16 +388,30 @@ app.put('/api/users/:username', auth, adminOnly, async (req, res) => {
   }
 });
 
+/* Renew (add days — negative allowed for reducing) */
 app.post('/api/users/:username/renew', auth, adminOnly, async (req, res) => {
   const { days } = req.body;
   await db.query(
     `UPDATE users SET expires_at = GREATEST(COALESCE(expires_at, CURRENT_DATE), CURRENT_DATE) + ($1 || ' days')::interval WHERE username=$2`,
     [days, req.params.username]
   );
-  await log(req.user.username, 'USER_RENEWED', `${req.params.username} +${days}d`, 'success');
+  await log(req.user.username, 'USER_RENEWED', `${req.params.username} ${days > 0 ? '+' : ''}${days}d`, 'success');
   res.json({ ok: true });
 });
 
+/* Set exact expiry date */
+app.post('/api/users/:username/set-expiry', auth, adminOnly, async (req, res) => {
+  const { expiresAt } = req.body;
+  if (!expiresAt) return res.status(400).json({ error: 'expiresAt required' });
+  await db.query(
+    'UPDATE users SET expires_at=$1 WHERE username=$2',
+    [expiresAt, req.params.username]
+  );
+  await log(req.user.username, 'USER_EXPIRY_SET', `${req.params.username} → ${expiresAt}`, 'success');
+  res.json({ ok: true });
+});
+
+/* Reset password + 2FA */
 app.post('/api/users/:username/reset', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT name, mobile FROM users WHERE username=$1', [req.params.username]);
   const u = rows[0];
@@ -419,6 +427,7 @@ app.post('/api/users/:username/reset', auth, adminOnly, async (req, res) => {
   res.json({ ok: true, temp });
 });
 
+/* Toggle disable */
 app.post('/api/users/:username/disable', auth, adminOnly, async (req, res) => {
   await db.query(
     'UPDATE users SET disabled = NOT disabled, session_id = NULL WHERE username=$1',
@@ -427,6 +436,7 @@ app.post('/api/users/:username/disable', auth, adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
+/* Delete */
 app.delete('/api/users/:username', auth, adminOnly, async (req, res) => {
   await db.query('DELETE FROM users WHERE username=$1', [req.params.username]);
   await log(req.user.username, 'USER_DELETED', req.params.username, 'danger');
@@ -434,7 +444,6 @@ app.delete('/api/users/:username', auth, adminOnly, async (req, res) => {
 });
 
 /* ============ AUDIT ============ */
-
 app.get('/api/audit', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200');
   res.json(rows);
@@ -461,6 +470,5 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 });
 
 /* ============ START ============ */
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server on port ${PORT}`));

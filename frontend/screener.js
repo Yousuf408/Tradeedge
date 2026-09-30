@@ -1,206 +1,152 @@
 /* ============================================================
    SCREENER.JS
-   Live 9:15 candle fetcher for Nifty 500 via Angel One
-   Self-contained — injects its own UI into the Screener page
+   Auto-loads 9:15 candles on page visit
+   Polls progress while background fetch runs
    ============================================================ */
 
-let SCREENER_TOKENS = [];        // [{sym, token}, ...]
-let SCREENER_915 = {};           // { token: {open, high, low, close} }
-let SCREENER_LOCKED = false;     // prevent double-click during fetch
+let SCREENER_STOCKS = [];
+let SCREENER_CANDLES = {};
+let SCREENER_INIT_DONE = false;
+let SCREENER_POLL_TIMER = null;
 
 /* ============================================================
-   SECTION 1 — INITIAL SETUP (called from app.js or on load)
+   SECTION 1 — INIT (called by navigateTo)
    ============================================================ */
 async function initScreener() {
-  // Add the fetch button into the existing screener panel
+  if (SCREENER_INIT_DONE) {
+    // Already loaded — just re-render current state
+    renderScreenerTable();
+    return;
+  }
+
   const controls = document.querySelector('.screener-controls');
-  if (!controls || document.getElementById('fetch915Btn')) return;
+  if (controls) {
+    // Hide old strategy dropdown, run button, auto-buy toggle, labels
+    ['#strategySelect', '.toggle-wrapper'].forEach(sel => {
+      const el = controls.querySelector(sel);
+      if (el) el.style.display = 'none';
+    });
+    controls.querySelectorAll('button, label').forEach(el => el.style.display = 'none');
 
-  // Hide the old strategy dropdown + old run button (we replaced the flow)
-  const oldSelect = document.getElementById('strategySelect');
-  const oldRunBtn = controls.querySelector('button.btn-primary');
-  if (oldSelect) oldSelect.style.display = 'none';
-  if (oldRunBtn) oldRunBtn.style.display = 'none';
+    // Add status pill
+    let pill = document.getElementById('screenerStatusPill');
+    if (!pill) {
+      pill = document.createElement('span');
+      pill.id = 'screenerStatusPill';
+      pill.style.cssText = 'font-size:12px;font-weight:600;color:var(--text-muted);padding:6px 14px;background:rgba(108,92,231,0.06);border-radius:20px';
+      pill.textContent = 'Loading...';
+      controls.appendChild(pill);
+    }
+  }
 
-  // Insert the new fetch button
-  const btn = document.createElement('button');
-  btn.id = 'fetch915Btn';
-  btn.className = 'btn btn-primary';
-  btn.textContent = '⚡ Fetch 9:15 Candles';
-  btn.onclick = onFetch915Click;
-  controls.insertBefore(btn, controls.firstChild);
+  await loadStockList();
+  await ensureDataLoaded();
 
-  // Load stock list from backend
+  SCREENER_INIT_DONE = true;
+}
+
+/* ============================================================
+   SECTION 2 — LOAD STOCK LIST
+   ============================================================ */
+async function loadStockList() {
   try {
     const r = await fetch(API + '/api/stocks', {
       headers: { Authorization: 'Bearer ' + getToken() }
     });
-    if (r.ok) SCREENER_TOKENS = await r.json();
-    console.log('Screener: loaded', SCREENER_TOKENS.length, 'stocks');
+    if (r.ok) SCREENER_STOCKS = await r.json();
   } catch (e) {
-    console.error('Screener: failed to load stock list', e);
+    console.error('Failed to load stock list:', e);
   }
-
-  // Clear the old strategy table
-  const body = document.getElementById('screenerBody');
-  if (body) body.innerHTML = `<tr><td colspan="15" style="text-align:center;padding:40px;color:var(--text-muted)">
-    Click <strong>⚡ Fetch 9:15 Candles</strong> to load live data.
-  </td></tr>`;
-  const head = document.getElementById('screenerHead');
-  if (head) head.innerHTML = '';
-  const count = document.getElementById('screenerCount');
-  if (count) count.textContent = `${SCREENER_TOKENS.length} stocks ready`;
 }
 
 /* ============================================================
-   SECTION 2 — BUTTON HANDLER
+   SECTION 3 — ENSURE DATA LOADED (auto-fetch trigger)
    ============================================================ */
-async function onFetch915Click() {
-  if (SCREENER_LOCKED) return;
-  if (!SCREENER_TOKENS.length) { showToast('⚠️ No Data', 'Stock list not loaded'); return; }
-
-  // Check if broker session exists by trying a small test
+async function ensureDataLoaded() {
   try {
-    const probe = await fetch(API + '/api/screener/fetch-915', {
+    const r = await fetch(API + '/api/screener/ensure', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
-      body: JSON.stringify({ tokens: [SCREENER_TOKENS[0].token] })
-    });
-    const d = await probe.json();
-    if (probe.status === 401 || (d.error && d.error.includes('Connect broker'))) {
-      openBrokerLoginModal();
-      return;
-    }
-  } catch {}
-
-  await fetchAllCandles();
-}
-
-/* ============================================================
-   SECTION 3 — ANGEL ONE LOGIN MODAL
-   ============================================================ */
-function openBrokerLoginModal() {
-  let modal = document.getElementById('angelLoginModal');
-  if (!modal) {
-    modal = document.createElement('div');
-    modal.id = 'angelLoginModal';
-    modal.className = 'modal-overlay';
-    modal.innerHTML = `
-      <div class="modal-box">
-        <h3>🔌 Connect Angel One</h3>
-        <div class="modal-sub">Enter your Angel One credentials to fetch live data</div>
-        <div class="auth-field">
-          <label>Client ID</label>
-          <input id="angelClientId" type="text" placeholder="e.g. A12345" />
-        </div>
-        <div class="auth-field">
-          <label>MPIN (4-digit)</label>
-          <input id="angelMpin" type="password" placeholder="••••" maxlength="4" />
-        </div>
-        <div class="auth-field">
-          <label>TOTP (6-digit from Google Authenticator)</label>
-          <input id="angelTotp" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
-                 style="letter-spacing:6px;text-align:center;font-size:18px" />
-        </div>
-        <div class="modal-error" id="angelLoginError"></div>
-        <div class="modal-actions">
-          <button class="btn btn-outline" onclick="closeAllModals()">Cancel</button>
-          <button class="btn btn-primary" id="angelLoginBtn" onclick="submitAngelLogin()">Connect</button>
-        </div>
-      </div>`;
-    document.body.appendChild(modal);
-  }
-  modal.classList.add('open');
-  setTimeout(() => document.getElementById('angelClientId').focus(), 100);
-}
-
-async function submitAngelLogin() {
-  const clientId = document.getElementById('angelClientId').value.trim();
-  const mpin = document.getElementById('angelMpin').value.trim();
-  const totp = document.getElementById('angelTotp').value.trim();
-  const err = document.getElementById('angelLoginError');
-  const btn = document.getElementById('angelLoginBtn');
-  err.textContent = '';
-
-  if (!clientId || !mpin || !totp) { err.textContent = 'All fields required'; return; }
-  if (totp.length !== 6) { err.textContent = 'TOTP must be 6 digits'; return; }
-
-  btn.textContent = 'Connecting...';
-  btn.disabled = true;
-
-  try {
-    const r = await fetch(API + '/api/broker/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
-      body: JSON.stringify({ clientId, mpin, totp })
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
     });
     const d = await r.json();
-    if (!r.ok) { err.textContent = d.error || 'Login failed'; return; }
 
-    closeAllModals();
-    showToast('✅ Connected', 'Angel One session active');
-    await fetchAllCandles();
-  } catch (e) {
-    err.textContent = e.message;
-  } finally {
-    btn.textContent = 'Connect';
-    btn.disabled = false;
-  }
-}
-
-/* ============================================================
-   SECTION 4 — FETCH ALL CANDLES (with progress)
-   ============================================================ */
-async function fetchAllCandles() {
-  if (SCREENER_LOCKED) return;
-  SCREENER_LOCKED = true;
-
-  const btn = document.getElementById('fetch915Btn');
-  const orig = btn.textContent;
-  btn.disabled = true;
-
-  const BATCH = 20;      // process 20 stocks per batch
-  const DELAY = 7000;    // wait 7 seconds between batches (rate limit safety)
-  const total = SCREENER_TOKENS.length;
-
-  SCREENER_915 = {};
-  renderScreenerTable();
-
-  for (let i = 0; i < total; i += BATCH) {
-    const batch = SCREENER_TOKENS.slice(i, i + BATCH);
-    btn.innerHTML = `<span class="spinner"></span> Fetching ${i + 1}–${Math.min(i + BATCH, total)} of ${total}...`;
-
-    try {
-      const r = await fetch(API + '/api/screener/fetch-915', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
-        body: JSON.stringify({ tokens: batch.map(s => s.token) })
-      });
-      const d = await r.json();
-      if (d.results) {
-        for (const item of d.results) {
-          if (item.candle) {
-            const [ts, o, h, l, c, v] = item.candle;
-            SCREENER_915[item.token] = { open: o, high: h, low: l, close: c, volume: v };
-          }
-        }
-        renderScreenerTable();
-      }
-    } catch (e) {
-      console.error('Batch failed', e);
+    if (d.status === 'ready') {
+      setPill('✅ Live — ' + d.date, 'var(--success)');
+      await fetchAndRender();
+      return;
     }
 
-    if (i + BATCH < total) await new Promise(r => setTimeout(r, DELAY));
+    if (d.status === 'fetching') {
+      setPill(`⏳ Fetching 0 / ${d.total}...`, '#f39c12');
+      startProgressPolling();
+      return;
+    }
+  } catch (e) {
+    setPill('⚠️ Error — ' + e.message, 'var(--danger)');
   }
-
-  btn.textContent = orig;
-  btn.disabled = false;
-  SCREENER_LOCKED = false;
-  showToast('✅ Done', `Fetched ${Object.keys(SCREENER_915).length} of ${total}`);
 }
 
 /* ============================================================
-   SECTION 5 — RENDER TABLE
+   SECTION 4 — PROGRESS POLLING
+   ============================================================ */
+function startProgressPolling() {
+  if (SCREENER_POLL_TIMER) clearInterval(SCREENER_POLL_TIMER);
+  SCREENER_POLL_TIMER = setInterval(async () => {
+    try {
+      const r = await fetch(API + '/api/screener/status', {
+        headers: { Authorization: 'Bearer ' + getToken() }
+      });
+      const d = await r.json();
+
+      if (d.status === 'fetching') {
+        setPill(`⏳ Fetching ${d.progress} / ${d.total}...`, '#f39c12');
+      } else if (d.status === 'ready') {
+        clearInterval(SCREENER_POLL_TIMER);
+        SCREENER_POLL_TIMER = null;
+        setPill('✅ Live — ' + d.date, 'var(--success)');
+        await fetchAndRender();
+      } else if (d.status === 'error') {
+        clearInterval(SCREENER_POLL_TIMER);
+        SCREENER_POLL_TIMER = null;
+        setPill('❌ Error — ' + (d.error || 'unknown'), 'var(--danger)');
+      }
+    } catch (e) {
+      console.error('Poll error:', e);
+    }
+  }, 3000);
+}
+
+/* ============================================================
+   SECTION 5 — FETCH ALL CANDLES + RENDER
+   ============================================================ */
+async function fetchAndRender() {
+  try {
+    const r = await fetch(API + '/api/screener/data', {
+      headers: { Authorization: 'Bearer ' + getToken() }
+    });
+    const d = await r.json();
+
+    SCREENer_CANDLES = {};   // reset
+    SCREENER_CANDLES = {};
+    if (d.results) {
+      for (const item of d.results) {
+        const c = item.candle;
+        if (Array.isArray(c) && c.length >= 5) {
+          SCREENER_CANDLES[item.token] = {
+            open: c[1], high: c[2], low: c[3], close: c[4],
+            volume: c[5] || 0
+          };
+        }
+      }
+    }
+    renderScreenerTable();
+  } catch (e) {
+    console.error('Fetch data failed:', e);
+  }
+}
+
+/* ============================================================
+   SECTION 6 — RENDER TABLE
    ============================================================ */
 function renderScreenerTable() {
   const head = document.getElementById('screenerHead');
@@ -218,8 +164,10 @@ function renderScreenerTable() {
     <th>Volume</th>
   </tr>`;
 
-  const rows = SCREENER_TOKENS.map(s => {
-    const c = SCREENER_915[s.token];
+  const loaded = Object.keys(SCREENER_CANDLES).length;
+
+  body.innerHTML = SCREENER_STOCKS.map(s => {
+    const c = SCREENER_CANDLES[s.token];
     if (!c) {
       return `<tr>
         <td><strong>${s.sym}</strong><br><span style="font-size:11px;color:var(--text-muted)">Token: ${s.token}</span></td>
@@ -238,6 +186,15 @@ function renderScreenerTable() {
     </tr>`;
   }).join('');
 
-  body.innerHTML = rows;
-  if (count) count.textContent = `${Object.keys(SCREENER_915).length} / ${SCREENER_TOKENS.length} loaded`;
+  if (count) count.textContent = `${loaded} / ${SCREENER_STOCKS.length} loaded`;
+}
+
+/* ============================================================
+   SECTION 7 — HELPERS
+   ============================================================ */
+function setPill(text, color) {
+  const pill = document.getElementById('screenerStatusPill');
+  if (!pill) return;
+  pill.textContent = text;
+  pill.style.color = color || 'var(--text-muted)';
 }

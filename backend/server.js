@@ -12,8 +12,7 @@ import {
   loginPlatform,
   getCandlesForTokens,
   getLTPForTokens,
-  getSessionStatus,
-  clearCandleCache
+  getSessionStatus
 } from './brokers/angelone/Angel_REST.js';
 
 dotenv.config();
@@ -31,13 +30,103 @@ const db = new pg.Pool({
 
 const SECRET = process.env.JWT_SECRET;
 
-/* ---- Load stock list once ---- */
+/* ---- Load stock list ---- */
 const __dir = dirname(fileURLToPath(import.meta.url));
 const STOCKS = JSON.parse(
   readFileSync(join(__dir, 'brokers/angelone/Angel_nifty500.json'), 'utf8')
 );
 
-/* ---- Auth middleware ---- */
+/* ============================================================
+   SCREENER STATE MACHINE
+   Tracks background fetch of 500 stocks
+   ============================================================ */
+const screenerState = {
+  status: 'idle',       // 'idle' | 'fetching' | 'ready' | 'error'
+  date: null,
+  progress: 0,
+  total: STOCKS.length,
+  startedAt: null,
+  error: null
+};
+
+/* ---- IST time helpers (server may run in UTC) ---- */
+function getIST() {
+  return new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+}
+
+function formatDate(d) {
+  return d.toISOString().split('T')[0];
+}
+
+/* Returns the date whose 9:15 candle we should show right now */
+function getTargetDate() {
+  const ist = getIST();
+  const dow = ist.getUTCDay();  // 0=Sun, 6=Sat
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+
+  if (dow === 0) return formatDate(new Date(ist.getTime() - 2 * 864e5)); // Sun → Fri
+  if (dow === 6) return formatDate(new Date(ist.getTime() - 1 * 864e5)); // Sat → Fri
+  if (mins < 570) {                                                       // Weekday < 9:30
+    if (dow === 1) return formatDate(new Date(ist.getTime() - 3 * 864e5)); // Mon → Fri
+    return formatDate(new Date(ist.getTime() - 1 * 864e5));
+  }
+  return formatDate(ist);
+}
+
+/* Returns true if today's 9:15 candle should be fully formed (post 9:30) */
+function isTodayReadyForFetch(targetDate) {
+  const ist = getIST();
+  const dow = ist.getUTCDay();
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  if (dow === 0 || dow === 6) return true;    // weekend — data is from last Friday, already formed
+  if (mins < 570) return true;                // before market open — data is from previous day
+  return true;                                // after 9:30 — today's candle frozen
+}
+
+/* ---- Background fetch job ---- */
+async function runScreenerFetch(date) {
+  screenerState.status = 'fetching';
+  screenerState.date = date;
+  screenerState.progress = 0;
+  screenerState.startedAt = Date.now();
+  screenerState.error = null;
+
+  const BATCH = 20;
+  const DELAY = 7000;  // 7 sec between batches (rate limit)
+  const tokens = STOCKS.map(s => s.token);
+
+  try {
+    for (let i = 0; i < tokens.length; i += BATCH) {
+      const batch = tokens.slice(i, i + BATCH);
+      await getCandlesForTokens(batch, date);
+      screenerState.progress = Math.min(i + BATCH, tokens.length);
+      if (i + BATCH < tokens.length) await new Promise(r => setTimeout(r, DELAY));
+    }
+    screenerState.status = 'ready';
+    console.log(`✅ Screener fetch complete: ${screenerState.progress} candles for ${date}`);
+  } catch (e) {
+    screenerState.status = 'error';
+    screenerState.error = e.message;
+    console.error('❌ Screener fetch failed:', e.message);
+  }
+}
+
+/* ---- Auto-reset daily at midnight IST ---- */
+let lastResetDate = formatDate(getIST());
+setInterval(() => {
+  const today = formatDate(getIST());
+  if (today !== lastResetDate) {
+    lastResetDate = today;
+    screenerState.status = 'idle';
+    screenerState.date = null;
+    screenerState.progress = 0;
+    console.log('🔄 Screener cache reset for new day');
+  }
+}, 60 * 1000);
+
+/* ============================================================
+   MIDDLEWARE
+   ============================================================ */
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'No token' });
@@ -61,7 +150,7 @@ async function log(actor, action, details = '', level = 'info') {
   } catch {}
 }
 
-/* ---- Auto-generate username/password ---- */
+/* ---- Username/password generation ---- */
 async function generateUsername(fullName, mobile) {
   const first = (fullName || '').trim().split(/\s+/)[0].toLowerCase().replace(/[^a-z0-9]/g, '');
   const last4 = (mobile || '').replace(/\D/g, '').slice(-4);
@@ -83,7 +172,7 @@ function generatePassword(fullName, mobile) {
   return `${cap}@${last4}!`;
 }
 
-/* ---- TOTP server verify (for forgot password) ---- */
+/* ---- TOTP server verify ---- */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 function base32Decode(str) {
@@ -203,12 +292,8 @@ app.post('/api/complete-login', async (req, res) => {
     ok: true,
     token,
     user: {
-      name: user.name,
-      username: user.username,
-      role: user.role,
-      plan: user.plan,
-      expiresAt: user.expires_at,
-      mobile: user.mobile,
+      name: user.name, username: user.username, role: user.role,
+      plan: user.plan, expiresAt: user.expires_at, mobile: user.mobile,
       sessionId
     }
   });
@@ -269,7 +354,7 @@ app.post('/api/forgot-password/reset', async (req, res) => {
   const user = rows[0];
   if (!user) return res.status(404).json({ error: 'No account found' });
   if (user.disabled) return res.status(403).json({ error: 'Account disabled' });
-  if (!user.totp_secret) return res.status(400).json({ error: 'No 2FA set up — contact admin' });
+  if (!user.totp_secret) return res.status(400).json({ error: 'No 2FA set up' });
 
   if (!verifyTotpServer(user.totp_secret, String(totpCode).trim())) {
     await log(user.username, 'FORGOT_PASSWORD_FAILED', 'Bad TOTP', 'danger');
@@ -277,12 +362,8 @@ app.post('/api/forgot-password/reset', async (req, res) => {
   }
 
   const hash = await bcrypt.hash(newPassword, 10);
-  await db.query(
-    'UPDATE users SET password_hash=$1, session_id=NULL WHERE username=$2',
-    [hash, user.username]
-  );
+  await db.query('UPDATE users SET password_hash=$1, session_id=NULL WHERE username=$2', [hash, user.username]);
   await log(user.username, 'PASSWORD_RESET_SELF', `User: ${user.username}`, 'warn');
-
   res.json({ ok: true });
 });
 
@@ -306,7 +387,6 @@ app.post('/api/change-password', auth, async (req, res) => {
 
   const hash = await bcrypt.hash(newPassword, 10);
   const newSessionId = crypto.randomUUID();
-
   await db.query(
     'UPDATE users SET password_hash=$1, session_id=$2 WHERE username=$3',
     [hash, newSessionId, req.user.username]
@@ -314,8 +394,7 @@ app.post('/api/change-password', auth, async (req, res) => {
 
   const token = jwt.sign(
     { username: user.username, role: user.role, sessionId: newSessionId },
-    SECRET,
-    { expiresIn: '7h' }
+    SECRET, { expiresIn: '7h' }
   );
 
   await log(req.user.username, 'PASSWORD_CHANGED', `User: ${req.user.username}`, 'success');
@@ -328,7 +407,6 @@ app.post('/api/change-password', auth, async (req, res) => {
 app.put('/api/me', auth, async (req, res) => {
   const { name, mobile } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
-
   const cleanMobile = (mobile || '').replace(/\D/g, '') || null;
 
   try {
@@ -339,16 +417,13 @@ app.put('/api/me', auth, async (req, res) => {
       );
       if (dup.rows.length) return res.status(409).json({ error: 'Mobile already in use' });
     }
-
     await db.query(
       'UPDATE users SET name=$1, mobile=$2 WHERE username=$3',
       [name.trim(), cleanMobile, req.user.username]
     );
     await log(req.user.username, 'PROFILE_UPDATED', `User: ${req.user.username}`, 'success');
     res.json({ ok: true, name: name.trim(), mobile: cleanMobile });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 /* ============================================================
@@ -365,7 +440,6 @@ app.get('/api/users', auth, adminOnly, async (req, res) => {
 
 app.post('/api/users', auth, adminOnly, async (req, res) => {
   let { name, mobile, password, plan, expiresAt } = req.body;
-
   if (!name || !mobile) return res.status(400).json({ error: 'Name and mobile required' });
   const cleanMobile = String(mobile).replace(/\D/g, '');
   if (cleanMobile.length < 10) return res.status(400).json({ error: 'Mobile must be 10 digits' });
@@ -391,12 +465,10 @@ app.post('/api/users', auth, adminOnly, async (req, res) => {
 app.put('/api/users/:username', auth, adminOnly, async (req, res) => {
   const target = req.params.username;
   const { name, mobile, plan, role } = req.body;
-
   const existing = await db.query('SELECT username FROM users WHERE username=$1', [target]);
   if (!existing.rows.length) return res.status(404).json({ error: 'User not found' });
 
   const cleanMobile = mobile ? String(mobile).replace(/\D/g, '') : null;
-
   try {
     if (cleanMobile) {
       const dup = await db.query(
@@ -405,16 +477,13 @@ app.put('/api/users/:username', auth, adminOnly, async (req, res) => {
       );
       if (dup.rows.length) return res.status(409).json({ error: 'Mobile already in use' });
     }
-
     await db.query(
       'UPDATE users SET name=$1, mobile=$2, plan=$3, role=$4 WHERE username=$5',
       [name, cleanMobile, plan, role, target]
     );
     await log(req.user.username, 'USER_UPDATED', `${target}`, 'success');
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/users/:username/renew', auth, adminOnly, async (req, res) => {
@@ -430,10 +499,7 @@ app.post('/api/users/:username/renew', auth, adminOnly, async (req, res) => {
 app.post('/api/users/:username/set-expiry', auth, adminOnly, async (req, res) => {
   const { expiresAt } = req.body;
   if (!expiresAt) return res.status(400).json({ error: 'expiresAt required' });
-  await db.query(
-    'UPDATE users SET expires_at=$1 WHERE username=$2',
-    [expiresAt, req.params.username]
-  );
+  await db.query('UPDATE users SET expires_at=$1 WHERE username=$2', [expiresAt, req.params.username]);
   await log(req.user.username, 'USER_EXPIRY_SET', `${req.params.username} → ${expiresAt}`, 'success');
   res.json({ ok: true });
 });
@@ -498,26 +564,68 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   STOCK LIST + SCREENER (all logic lives in Angel_REST.js)
+   SCREENER (state machine + data)
    ============================================================ */
-app.get('/api/stocks', auth, (req, res) => {
-  res.json(STOCKS);
+
+/* Stock list */
+app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
+
+/* Broker session status */
+app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
+
+/* Current screener state — client polls this */
+app.get('/api/screener/status', auth, (req, res) => {
+  const targetDate = getTargetDate();
+  res.json({
+    status: screenerState.status,
+    date: screenerState.date,
+    targetDate,
+    progress: screenerState.progress,
+    total: screenerState.total,
+    error: screenerState.error,
+    lastUpdated: screenerState.startedAt
+  });
 });
 
-app.get('/api/broker/status', auth, (req, res) => {
-  res.json(getSessionStatus());
-});
+/* Ensure data is being fetched — starts background job if needed */
+app.post('/api/screener/ensure', auth, async (req, res) => {
+  const targetDate = getTargetDate();
 
-app.post('/api/screener/fetch-915', auth, async (req, res) => {
-  const { tokens } = req.body;
-  if (!Array.isArray(tokens) || !tokens.length) {
-    return res.status(400).json({ error: 'tokens array required' });
+  // Already fetching → return progress
+  if (screenerState.status === 'fetching') {
+    return res.json({ status: 'fetching', progress: screenerState.progress, total: screenerState.total });
   }
-  const today = new Date().toISOString().split('T')[0];
-  const results = await getCandlesForTokens(tokens, today);
-  res.json({ ok: true, count: results.length, results });
+
+  // Ready for the right date → return cached
+  if (screenerState.status === 'ready' && screenerState.date === targetDate) {
+    return res.json({ status: 'ready', date: targetDate });
+  }
+
+  // Otherwise → start fresh fetch
+  screenerState.status = 'idle';
+  screenerState.date = null;
+  runScreenerFetch(targetDate);   // fire-and-forget
+  res.json({ status: 'fetching', progress: 0, total: screenerState.total, date: targetDate });
 });
 
+/* Return all cached candles for the current target date */
+app.get('/api/screener/data', auth, async (req, res) => {
+  const targetDate = getTargetDate();
+  const out = [];
+  for (const s of STOCKS) {
+    out.push({ token: s.token, sym: s.sym });
+  }
+  // Reuse cached candles from Angel_REST (via getCandlesForTokens which is cache-first)
+  const candles = await getCandlesForTokens(STOCKS.map(s => s.token), targetDate);
+  res.json({
+    ok: true,
+    date: targetDate,
+    results: candles,
+    stocks: out
+  });
+});
+
+/* LTP batch */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) {

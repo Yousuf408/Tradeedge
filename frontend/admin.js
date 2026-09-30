@@ -1,15 +1,15 @@
 /* ============================================================
    ADMIN.JS
-   Contains: Config, API client, TOTP, Auth flow, Forgot password,
-             Admin panel, Shared utilities
-   Loaded BEFORE app.js
+   Config, API client, TOTP, Auth flow, Forgot password,
+   Admin panel, Profile, WhatsApp sharing
    ============================================================ */
 
 
 /* ============================================================
-   SECTION 1 — CONFIGURATION & CONSTANTS
+   SECTION 1 — CONFIGURATION
    ============================================================ */
 const API = 'https://tradeedge-a5y0.onrender.com';
+const APP_URL = 'https://yousuf408.github.io/Tradeedge/frontend/';
 
 const GREEN = 'var(--success)';
 const RED = 'var(--danger)';
@@ -33,6 +33,7 @@ let impersonating = false;
 let impersonateBackup = null;
 let pendingLoginUser = null;
 let pendingForgotUser = null;
+let editingUsername = null;
 
 const DOM = {
   pages: document.querySelectorAll('.page'),
@@ -76,7 +77,7 @@ async function api(path, opts = {}) {
 
 
 /* ============================================================
-   SECTION 4 — TOTP (Google Authenticator compatible)
+   SECTION 4 — TOTP
    ============================================================ */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
@@ -132,30 +133,28 @@ function generateSecret() {
 
 
 /* ============================================================
-   SECTION 5 — PASSWORD GENERATOR
+   SECTION 5 — CREDENTIALS CACHE (for WhatsApp sharing)
+   Stores plain password for 24h after create/reset
    ============================================================ */
-function generateStrongPassword(len = 12) {
-  const U = 'ABCDEFGHJKMNPQRSTUVWXYZ';
-  const L = 'abcdefghjkmnpqrstuvwxyz';
-  const D = '23456789';
-  const S = '!@#$%&*';
-  const all = U + L + D + S;
-  let p = U[Math.random() * U.length | 0]
-        + L[Math.random() * L.length | 0]
-        + D[Math.random() * D.length | 0]
-        + S[Math.random() * S.length | 0];
-  while (p.length < len) p += all[Math.random() * all.length | 0];
-  return p.split('').sort(() => Math.random() - 0.5).join('');
+function cacheCredentials(username, password, name, mobile) {
+  let cache = {};
+  try { cache = JSON.parse(localStorage.getItem('ta_cred_cache') || '{}'); } catch {}
+  cache[username] = { password, name, mobile, ts: Date.now() };
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const k in cache) if (cache[k].ts < cutoff) delete cache[k];
+  localStorage.setItem('ta_cred_cache', JSON.stringify(cache));
 }
 
-function fillRandomPassword() {
-  document.getElementById('newPassword').value = generateStrongPassword();
-  showToast('🎲 Generated', 'Strong password generated');
+function getCachedCredentials(username) {
+  try {
+    const cache = JSON.parse(localStorage.getItem('ta_cred_cache') || '{}');
+    return cache[username] || null;
+  } catch { return null; }
 }
 
 
 /* ============================================================
-   SECTION 6 — TOAST NOTIFICATIONS
+   SECTION 6 — TOAST
    ============================================================ */
 let toastTimeout = null;
 
@@ -164,7 +163,7 @@ function showToast(title, message) {
   DOM.toastMessage.textContent = message || 'Action completed';
   DOM.toast.classList.add('show');
   clearTimeout(toastTimeout);
-  toastTimeout = setTimeout(() => DOM.toast.classList.remove('show'), 4000);
+  toastTimeout = setTimeout(() => DOM.toast.classList.remove('show'), 5000);
 }
 
 function hideToast() {
@@ -181,6 +180,7 @@ function navigateTo(pageId) {
   DOM.pages.forEach(p => p.classList.toggle('active', p.id === 'page-' + pageId));
 
   if (pageId === 'portfolio' && typeof loadPortfolio === 'function') loadPortfolio();
+  if (pageId === 'settings') loadProfileForm();
   if (pageId === 'users' && currentUser?.role === 'admin' && !impersonating) {
     renderKPIs();
     renderUsers();
@@ -196,7 +196,7 @@ DOM.navLinks.forEach(link => link.addEventListener('click', e => {
 
 
 /* ============================================================
-   SECTION 8 — AVATAR MENU + CHANGE PASSWORD
+   SECTION 8 — AVATAR / USER PILL MENU
    ============================================================ */
 function toggleAvatarMenu(e) {
   e.stopPropagation();
@@ -206,6 +206,10 @@ document.addEventListener('click', () =>
   document.getElementById('avatarMenu')?.classList.remove('open')
 );
 
+
+/* ============================================================
+   SECTION 9 — CHANGE PASSWORD
+   ============================================================ */
 function openChangePassword() {
   document.getElementById('avatarMenu').classList.remove('open');
   document.getElementById('pwdCurrent').value = '';
@@ -242,15 +246,11 @@ async function savePassword() {
       method: 'POST',
       body: JSON.stringify({ currentPassword: cur, newPassword: nw })
     });
-
     if (r.token) {
       setToken(r.token);
-      try {
-        const u = getUser();
-        if (u) { u.sessionId = r.sessionId; setUser(u); }
-      } catch {}
+      const u = getUser();
+      if (u) { u.sessionId = r.sessionId; setUser(u); }
     }
-
     closeChangePassword();
     showToast('✅ Updated', 'Password changed. Other devices logged out.');
   } catch (e) {
@@ -263,16 +263,63 @@ async function savePassword() {
 
 
 /* ============================================================
-   SECTION 9 — LOGIN FLOW (password + TOTP)
-   Step 1: username + password
-   Step 2A: TOTP verify (returning users)
-   Step 2B: TOTP setup (first-time users)
+   SECTION 10 — MY PROFILE (user edits own name/mobile)
+   ============================================================ */
+function openMyProfile() {
+  document.getElementById('avatarMenu').classList.remove('open');
+  navigateTo('settings');
+  setTimeout(() => document.getElementById('profileName')?.focus(), 200);
+}
+
+function loadProfileForm() {
+  if (!currentUser) return;
+  document.getElementById('profileName').value = currentUser.name || '';
+  document.getElementById('profileMobile').value = currentUser.mobile || '';
+  document.getElementById('profileUsername').value = currentUser.username || '';
+  document.getElementById('profileRole').value = (currentUser.role || '').toUpperCase();
+}
+
+async function saveProfile() {
+  const name = document.getElementById('profileName').value.trim();
+  const mobile = document.getElementById('profileMobile').value.trim();
+
+  if (!name) { showToast('⚠️ Missing', 'Name is required'); return; }
+  if (mobile && mobile.replace(/\D/g, '').length < 10) {
+    showToast('⚠️ Invalid', 'Mobile must be 10 digits'); return;
+  }
+
+  try {
+    const r = await api('/api/me', {
+      method: 'PUT',
+      body: JSON.stringify({ name, mobile })
+    });
+    currentUser.name = r.name;
+    currentUser.mobile = r.mobile;
+    setUser(currentUser);
+    updateUserPill();
+    showToast('✅ Saved', 'Profile updated');
+  } catch (e) {
+    showToast('⚠️ Error', e.message);
+  }
+}
+
+function updateUserPill() {
+  const pill = document.getElementById('userPillName');
+  if (pill) pill.textContent = currentUser?.name || 'User';
+  const an = document.getElementById('avatarName');
+  if (an) an.textContent = currentUser?.name || '—';
+  const ar = document.getElementById('avatarRole');
+  if (ar) ar.textContent = currentUser?.role || '—';
+}
+
+
+/* ============================================================
+   SECTION 11 — LOGIN FLOW
    ============================================================ */
 function showLoginStep(step) {
   document.getElementById('loginStep1').style.display = step === 1 ? 'block' : 'none';
   document.getElementById('loginStep2Verify').style.display = step === 'verify' ? 'block' : 'none';
   document.getElementById('loginStep2Setup').style.display = step === 'setup' ? 'block' : 'none';
-  // Hide forgot-password screens
   document.getElementById('forgotStep1').style.display = 'none';
   document.getElementById('forgotStep2').style.display = 'none';
 }
@@ -376,9 +423,7 @@ function cancelTotp() {
 
 
 /* ============================================================
-   SECTION 10 — FORGOT PASSWORD (TOTP-based self-service)
-   Step 1: enter username/mobile
-   Step 2: TOTP code + new password
+   SECTION 12 — FORGOT PASSWORD
    ============================================================ */
 function showForgotStep(step) {
   document.getElementById('loginStep1').style.display = 'none';
@@ -399,7 +444,6 @@ async function forgotCheck() {
   const input = document.getElementById('forgotInput').value.trim();
   const err = document.getElementById('forgotError');
   err.textContent = '';
-
   if (!input) { err.textContent = 'Enter username or mobile'; return; }
 
   try {
@@ -445,7 +489,6 @@ async function forgotReset() {
         newPassword: nw
       })
     });
-
     pendingForgotUser = null;
     showLoginStep(1);
     document.getElementById('authUser').value = '';
@@ -461,7 +504,7 @@ async function forgotReset() {
 
 
 /* ============================================================
-   SECTION 11 — LOGOUT & SCREEN SWITCHING
+   SECTION 13 — LOGOUT & SCREEN SWITCHING
    ============================================================ */
 function logout() {
   const token = getToken();
@@ -507,11 +550,7 @@ function showApp() {
     el.style.display = (currentUser.role === 'admin' && !impersonating) ? '' : 'none';
   });
 
-  const initials = (currentUser.name || 'U')
-    .split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
-  document.getElementById('avatarEl').textContent = initials;
-  document.getElementById('avatarName').textContent = currentUser.name;
-  document.getElementById('avatarRole').textContent = currentUser.role;
+  updateUserPill();
 
   if (impersonating) {
     document.body.classList.add('impersonating');
@@ -548,7 +587,7 @@ function showApp() {
 
 
 /* ============================================================
-   SECTION 12 — TABS (admin panel)
+   SECTION 14 — TABS (admin panel)
    ============================================================ */
 function switchTab(name, e) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -561,7 +600,7 @@ function switchTab(name, e) {
 
 
 /* ============================================================
-   SECTION 13 — ADMIN: KPIs
+   SECTION 15 — ADMIN: KPIs
    ============================================================ */
 async function renderKPIs() {
   try {
@@ -594,7 +633,7 @@ async function renderKPIs() {
 
 
 /* ============================================================
-   SECTION 14 — ADMIN: USERS TABLE & CRUD
+   SECTION 16 — ADMIN: USERS TABLE
    ============================================================ */
 async function renderUsers() {
   const search = (document.getElementById('userSearch')?.value || '').toLowerCase();
@@ -641,8 +680,14 @@ async function renderUsers() {
       else                    { daysText = `${dl} days`; color = 'var(--success)'; }
 
       const isAdmin = u.role === 'admin';
+      const hasWa = !!getCachedCredentials(u.username);
+
       return `<tr class="${u.disabled ? 'row-disabled' : ''}">
-        <td><strong>${u.name}</strong>${u.mobile ? `<br><span style="font-size:11px;color:var(--text-muted)">📱 ${u.mobile}</span>` : ''}</td>
+        <td>
+          <strong>${u.name}</strong>
+          ${isAdmin ? '<span style="font-size:10px;background:#6C5CE7;color:#fff;padding:2px 6px;border-radius:6px;margin-left:6px">ADMIN</span>' : ''}
+          ${u.mobile ? `<br><span style="font-size:11px;color:var(--text-muted)">📱 ${u.mobile}</span>` : ''}
+        </td>
         <td>${u.username}</td>
         <td>${u.plan || '—'}</td>
         <td>${u.expiresAt ? String(u.expiresAt).slice(0, 10) : '—'}</td>
@@ -650,10 +695,12 @@ async function renderUsers() {
         <td class="actions-cell">
           ${isAdmin ? '<span style="color:var(--text-muted);font-size:11px">—</span>' : `
             <button class="btn btn-outline btn-sm" onclick="impersonate('${u.username}')">👁️ View</button>
-            <button class="btn btn-primary btn-sm" onclick="renewUser('${u.username}')">Renew</button>
-            <button class="btn btn-warn btn-sm" onclick="resetPassword('${u.username}')">🔑</button>
-            <button class="btn btn-outline btn-sm" onclick="toggleDisable('${u.username}')">${u.disabled ? '✅' : '⏸️'}</button>
-            <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.username}')">🗑️</button>`}
+            <button class="btn btn-outline btn-sm" onclick="openEditUser('${u.username}')">✏️ Edit</button>
+            <button class="btn btn-primary btn-sm" onclick="renewUser('${u.username}')">🔄 Renew</button>
+            <button class="btn btn-warn btn-sm" onclick="resetPassword('${u.username}')">🔑 Reset</button>
+            <button class="btn btn-outline btn-sm" onclick="toggleDisable('${u.username}')">${u.disabled ? '✅ Enable' : '⏸️ Disable'}</button>
+            <button class="btn btn-success btn-sm" onclick="openWhatsApp('${u.username}')" title="${hasWa ? 'Send credentials via WhatsApp' : 'Reset password first'}">📱 WhatsApp</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.username}')">🗑️ Delete</button>`}
         </td>
       </tr>`;
     }).join('');
@@ -672,16 +719,22 @@ async function renderUsers() {
   }
 }
 
+
+/* ============================================================
+   SECTION 17 — ADMIN: CREATE USER (auto-credentials)
+   ============================================================ */
 async function addUser() {
   const name = document.getElementById('newName').value.trim();
-  const username = document.getElementById('newUsername').value.trim().toLowerCase();
-  const mobile = document.getElementById('newMobile').value.replace(/\D/g, '') || null;
-  const password = document.getElementById('newPassword').value;
+  const mobile = document.getElementById('newMobile').value.replace(/\D/g, '');
   const plan = document.getElementById('newPlan').value;
   const durKey = document.getElementById('newDuration').value;
 
-  if (!name || !username || !password) {
-    showToast('⚠️ Missing Fields', 'Name, username, password required');
+  if (!name || !mobile) {
+    showToast('⚠️ Missing Fields', 'Name and mobile required');
+    return;
+  }
+  if (mobile.length < 10) {
+    showToast('⚠️ Invalid Mobile', 'Enter 10-digit mobile');
     return;
   }
 
@@ -690,22 +743,116 @@ async function addUser() {
   const expiresAt = d.toISOString().split('T')[0];
 
   try {
-    await api('/api/users', {
+    const r = await api('/api/users', {
       method: 'POST',
-      body: JSON.stringify({ name, username, mobile, password, plan, expiresAt })
+      body: JSON.stringify({ name, mobile, plan, expiresAt })
     });
+
+    cacheCredentials(r.username, r.password, name, mobile);
+
     document.getElementById('newName').value = '';
-    document.getElementById('newUsername').value = '';
     document.getElementById('newMobile').value = '';
-    document.getElementById('newPassword').value = '';
+
     renderUsers();
     renderKPIs();
-    showToast('✅ User Created', `${name} · password: ${password}`);
+
+    // Show credentials in a toast (longer duration)
+    showToast('✅ User Created',
+      `Username: ${r.username}   Password: ${r.password}`);
+
+    // Show a small confirmation panel below the form
+    const box = document.getElementById('tab-users');
+    let banner = document.getElementById('credBanner');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'credBanner';
+      box.querySelector('.panel-glass').after(banner);
+    }
+    banner.innerHTML = `
+      <div style="padding:16px 20px;background:rgba(0,184,148,0.08);border-radius:12px;margin-bottom:20px;border:1px solid rgba(0,184,148,0.2)">
+        <div style="font-weight:700;margin-bottom:8px">✅ Credentials for ${name}</div>
+        <div style="font-size:13px;line-height:1.9">
+          <strong>Username:</strong> <code style="background:#fff;padding:2px 8px;border-radius:6px">${r.username}</code><br>
+          <strong>Password:</strong> <code style="background:#fff;padding:2px 8px;border-radius:6px">${r.password}</code>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-success btn-sm" onclick="openWhatsApp('${r.username}')">📱 Send via WhatsApp</button>
+          <button class="btn btn-outline btn-sm" onclick="document.getElementById('credBanner').remove()">✕ Close</button>
+        </div>
+      </div>`;
   } catch (e) {
     showToast('⚠️ Error', e.message);
   }
 }
 
+
+/* ============================================================
+   SECTION 18 — ADMIN: EDIT USER
+   ============================================================ */
+async function openEditUser(username) {
+  try {
+    const all = await api('/api/users');
+    const u = all.find(x => x.username === username);
+    if (!u) return;
+
+    editingUsername = username;
+    document.getElementById('editUserSub').textContent = `Editing ${u.username}`;
+    document.getElementById('editName').value = u.name || '';
+    document.getElementById('editMobile').value = u.mobile || '';
+    document.getElementById('editPlan').value = u.plan || 'Demo';
+    document.getElementById('editRole').value = u.role || 'user';
+    document.getElementById('editError').textContent = '';
+    document.getElementById('editUserModal').classList.add('open');
+  } catch (e) {
+    showToast('⚠️ Error', e.message);
+  }
+}
+
+function closeEditUser() {
+  document.getElementById('editUserModal').classList.remove('open');
+  editingUsername = null;
+}
+
+async function saveEditUser() {
+  if (!editingUsername) return;
+  const name = document.getElementById('editName').value.trim();
+  const mobile = document.getElementById('editMobile').value.trim();
+  const plan = document.getElementById('editPlan').value;
+  const role = document.getElementById('editRole').value;
+  const err = document.getElementById('editError');
+  err.textContent = '';
+
+  if (!name) { err.textContent = 'Name is required'; return; }
+  if (mobile && mobile.replace(/\D/g, '').length < 10) {
+    err.textContent = 'Mobile must be 10 digits'; return;
+  }
+
+  const btn = document.querySelector('#editUserModal .btn-primary');
+  const orig = btn.textContent;
+  btn.textContent = 'Saving...';
+  btn.disabled = true;
+
+  try {
+    await api(`/api/users/${editingUsername}`, {
+      method: 'PUT',
+      body: JSON.stringify({ name, mobile, plan, role })
+    });
+    closeEditUser();
+    renderUsers();
+    renderKPIs();
+    showToast('✅ Saved', 'User updated');
+  } catch (e) {
+    err.textContent = e.message;
+  } finally {
+    btn.textContent = orig;
+    btn.disabled = false;
+  }
+}
+
+
+/* ============================================================
+   SECTION 19 — ADMIN: RENEW / DELETE / DISABLE / RESET
+   ============================================================ */
 async function renewUser(username) {
   const choice = prompt(
     `Renew "${username}":\n1. 5 days\n2. 7 days\n3. 1 month\n4. 2 months\n` +
@@ -752,10 +899,15 @@ async function toggleDisable(username) {
 }
 
 async function resetPassword(username) {
-  if (!confirm(`Reset password + 2FA for "${username}"?`)) return;
+  if (!confirm(`Reset password + 2FA for "${username}"?\nThe new password will follow the standard format.`)) return;
   try {
     const r = await api(`/api/users/${username}/reset`, { method: 'POST' });
-    showToast('🔑 Temp Password', `${username}: ${r.temp}`);
+    const cred = getCachedCredentials(username);
+    const name = cred?.name || username;
+    const mobile = cred?.mobile || '';
+    cacheCredentials(username, r.temp, name, mobile);
+    renderUsers();
+    showToast('🔑 New Password', `${username}: ${r.temp}`);
   } catch (e) {
     showToast('⚠️ Error', e.message);
   }
@@ -763,7 +915,36 @@ async function resetPassword(username) {
 
 
 /* ============================================================
-   SECTION 15 — ADMIN: IMPERSONATE
+   SECTION 20 — WHATSAPP SHARING
+   ============================================================ */
+function openWhatsApp(username) {
+  const cred = getCachedCredentials(username);
+  if (!cred || !cred.password) {
+    showToast('⚠️ No Password', 'Reset password first, then share');
+    return;
+  }
+  const mobile = (cred.mobile || '').replace(/\D/g, '');
+  if (mobile.length < 10) {
+    showToast('⚠️ No Mobile', 'User has no mobile number');
+    return;
+  }
+
+  const msg =
+`Hi ${cred.name}, your TradeAlgo Pro account is ready!
+
+Login: ${APP_URL}
+Username: ${username}
+Password: ${cred.password}
+
+Please change your password after your first login.`;
+
+  const url = `https://wa.me/91${mobile}?text=${encodeURIComponent(msg)}`;
+  window.open(url, '_blank');
+}
+
+
+/* ============================================================
+   SECTION 21 — ADMIN: IMPERSONATE
    ============================================================ */
 async function impersonate(username) {
   if (!confirm(`View as "${username}"?`)) return;
@@ -774,7 +955,7 @@ async function impersonate(username) {
   const u = all.find(x => x.username === username);
   if (!u) return;
 
-  currentUser = { ...currentUser, name: u.name, username: u.username, role: u.role };
+  currentUser = { ...currentUser, name: u.name, username: u.username, role: u.role, mobile: u.mobile };
   showApp();
   showToast('👁️ Viewing', `As ${u.name}`);
 }
@@ -790,13 +971,14 @@ function exitImpersonate() {
 
 
 /* ============================================================
-   SECTION 16 — ADMIN: BULK IMPORT
+   SECTION 22 — ADMIN: BULK IMPORT (new format)
+   name, mobile, duration
    ============================================================ */
 function loadSampleCSV() {
   document.getElementById('csvInput').value =
-`Ravi Kumar,ravi,pass123,Basic,1m,9876543210
-Priya Sharma,priya,pass456,Pro,3m
-Rahul Verma,rahul,demo123,Demo,5d`;
+`Ravi Kumar,9876543210,1m
+Priya Sharma,9876543211,3m
+Rahul Verma,9876543212,5d`;
 }
 
 async function bulkImport() {
@@ -804,56 +986,80 @@ async function bulkImport() {
   if (!raw) { showToast('⚠️ Empty', 'Paste CSV first'); return; }
 
   const lines = raw.split('\n').filter(l => l.trim());
-  let ok = 0, fail = 0;
+  const created = [];
+  let fail = 0;
   const errors = [];
 
   for (const line of lines) {
     const p = line.split(',').map(s => s.trim());
-    if (p.length < 5) { fail++; errors.push(`Bad format: ${line}`); continue; }
+    if (p.length < 3) { fail++; errors.push(`Bad format: ${line}`); continue; }
 
-    const [name, username, password, plan, durCode, mobileRaw] = p;
+    const [name, mobileRaw, durCode] = p;
+    const mobile = (mobileRaw || '').replace(/\D/g, '');
     const dur = DURATIONS[durCode];
-    if (!name || !username || !password || !dur) {
-      fail++; errors.push(`Missing: ${line}`); continue;
+    if (!name || mobile.length < 10 || !dur) {
+      fail++; errors.push(`Invalid: ${line}`); continue;
     }
 
     const d = new Date(); d.setDate(d.getDate() + dur.days);
     const expiresAt = d.toISOString().split('T')[0];
 
     try {
-      await api('/api/users', {
+      const r = await api('/api/users', {
         method: 'POST',
-        body: JSON.stringify({
-          name,
-          username: username.toLowerCase(),
-          password,
-          plan,
-          expiresAt,
-          mobile: (mobileRaw || '').replace(/\D/g, '') || null
-        })
+        body: JSON.stringify({ name, mobile, plan: 'Pro', expiresAt })
       });
-      ok++;
+      cacheCredentials(r.username, r.password, name, mobile);
+      created.push({ name, mobile, username: r.username, password: r.password });
     } catch (e) {
       fail++;
-      errors.push(`${username}: ${e.message}`);
+      errors.push(`${name}: ${e.message}`);
     }
   }
 
   renderUsers();
   renderKPIs();
 
-  document.getElementById('importResult').innerHTML = `
-    <div style="padding:14px 18px;background:${ok ? 'rgba(0,184,148,0.1)' : 'rgba(225,112,85,0.1)'};border-radius:10px">
-      <strong>✅ ${ok} created</strong>${fail ? ` · <strong style="color:var(--danger)">${fail} failed</strong>` : ''}
+  const resultBox = document.getElementById('importResult');
+  resultBox.innerHTML = `
+    <div style="padding:16px 20px;background:${created.length ? 'rgba(0,184,148,0.08)' : 'rgba(225,112,85,0.08)'};border-radius:12px;border:1px solid ${created.length ? 'rgba(0,184,148,0.2)' : 'rgba(225,112,85,0.2)'}">
+      <strong>✅ ${created.length} created</strong>${fail ? ` · <strong style="color:var(--danger)">${fail} failed</strong>` : ''}
       ${errors.length ? `<div style="margin-top:10px;font-size:12px;color:var(--text-muted)">${errors.slice(0, 5).map(e => `• ${e}`).join('<br>')}</div>` : ''}
+      ${created.length ? `
+        <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-primary btn-sm" onclick="downloadCredentials()">📥 Download Credentials CSV</button>
+        </div>` : ''}
     </div>`;
-  if (ok) document.getElementById('csvInput').value = '';
-  showToast('📥 Import Done', `${ok} created, ${fail} failed`);
+
+  if (created.length) {
+    window._lastImportCreds = created;
+    document.getElementById('csvInput').value = '';
+  }
+  showToast('📥 Import Done', `${created.length} created, ${fail} failed`);
+}
+
+function downloadCredentials() {
+  const creds = window._lastImportCreds || [];
+  if (!creds.length) return;
+
+  const header = 'Name,Mobile,Username,Password\n';
+  const rows = creds.map(c =>
+    [c.name, c.mobile, c.username, c.password].join(',')
+  ).join('\n');
+
+  const blob = new Blob([header + rows], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `credentials_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('📥 Downloaded', `${creds.length} credentials`);
 }
 
 
 /* ============================================================
-   SECTION 17 — ADMIN: AUDIT LOG
+   SECTION 23 — ADMIN: AUDIT LOG
    ============================================================ */
 async function renderAudit() {
   const box = document.getElementById('auditLog');
@@ -892,13 +1098,12 @@ async function clearAudit() {
 
 
 /* ============================================================
-   SECTION 18 — ADMIN: PRICING
+   SECTION 24 — ADMIN: PRICING (Demo + Pro only)
    ============================================================ */
 async function loadPrices() {
   try {
     const p = await api('/api/prices');
     document.getElementById('priceDemo').value = p.Demo || 0;
-    document.getElementById('priceBasic').value = p.Basic || 0;
     document.getElementById('pricePro').value = p.Pro || 0;
   } catch {}
 }
@@ -906,7 +1111,6 @@ async function loadPrices() {
 async function savePrices() {
   const p = {
     Demo: +document.getElementById('priceDemo').value || 0,
-    Basic: +document.getElementById('priceBasic').value || 0,
     Pro: +document.getElementById('pricePro').value || 0
   };
   try {
@@ -920,7 +1124,7 @@ async function savePrices() {
 
 
 /* ============================================================
-   SECTION 19 — ADMIN: EXPORT USERS AS CSV
+   SECTION 25 — ADMIN: EXPORT USERS CSV
    ============================================================ */
 async function exportUsersCSV() {
   try {
@@ -953,7 +1157,7 @@ async function exportUsersCSV() {
 
 
 /* ============================================================
-   SECTION 20 — BOOTSTRAP (auto-runs on page load)
+   SECTION 26 — BOOTSTRAP
    ============================================================ */
 (async function initAuth() {
   const token = getToken();

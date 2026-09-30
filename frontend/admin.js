@@ -177,14 +177,12 @@ document.querySelectorAll('.modal-overlay').forEach(overlay => {
 });
 
 
-/* ============================================================
-   SECTION 8 — NAVIGATION
-   ============================================================ */
 function navigateTo(pageId) {
   DOM.navLinks.forEach(a => a.classList.toggle('active', a.dataset.page === pageId));
   DOM.pages.forEach(p => p.classList.toggle('active', p.id === 'page-' + pageId));
 
   if (pageId === 'portfolio' && typeof loadPortfolio === 'function') loadPortfolio();
+  if (pageId === 'screener' && typeof initScreener === 'function') initScreener();  // ← ADD THIS
   if (pageId === 'settings') loadProfileForm();
   if (pageId === 'users' && currentUser?.role === 'admin' && !impersonating) {
     renderKPIs();

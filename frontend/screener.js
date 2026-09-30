@@ -100,6 +100,7 @@ function startProgressPolling() {
 
       if (d.status === 'fetching') {
         setPill(`⏳ Fetching ${d.progress} / ${d.total}...`, '#f39c12');
+        await fetchAndRender();
       } else if (d.status === 'ready') {
         clearInterval(SCREENER_POLL_TIMER);
         SCREENER_POLL_TIMER = null;

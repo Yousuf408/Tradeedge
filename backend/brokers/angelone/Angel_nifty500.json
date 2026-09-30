@@ -1,4 +1,4 @@
-const stockMaster = [
+[
   {"sym":"360ONE","token":"13061"},
   {"sym":"3MINDIA","token":"474"},
   {"sym":"AADHARHFC","token":"23729"},

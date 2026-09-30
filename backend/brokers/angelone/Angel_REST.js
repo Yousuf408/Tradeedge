@@ -169,6 +169,14 @@ export async function getCandlesForTokens(tokens, date) {
   return results;
 }
 
+/* Return all cached candles for a date instantly (no API calls) */
+export function getCachedCandles(tokens, date) {
+  return tokens.map(t => ({
+    token: String(t),
+    candle: candleCache.get(`${t}_${date}`) || null
+  }));
+}
+
 /* ============================================================
    LTP (batch, 50 tokens per call, 10s cache)
    ============================================================ */

@@ -21,6 +21,9 @@ const db = new pg.Pool({
 });
 
 const SECRET = process.env.JWT_SECRET;
+const __dir = dirname(fileURLToPath(import.meta.url));
+const STOCKS = JSON.parse(readFileSync(join(__dir, 'brokers/angelone/Angel_nifty500.json'), 'utf8'));
+const platformTokens = {};  // { username: jwtToken } — in-memory, clears on restart
 
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
@@ -471,6 +474,69 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
   await db.query('UPDATE prices SET amount=$1 WHERE plan=$2', [Demo || 0, 'Demo']);
   await db.query('UPDATE prices SET amount=$1 WHERE plan=$2', [Pro || 0, 'Pro']);
   res.json({ ok: true });
+});
+
+/* ============ STOCK LIST ============ */
+app.get('/api/stocks', auth, (req, res) => {
+  res.json(STOCKS);
+});
+
+/* ============ BROKER: PLATFORM LOGIN ============ */
+app.post('/api/broker/login', auth, async (req, res) => {
+  const { clientId, mpin, totp } = req.body;
+  const apiKey = process.env.ANGEL_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'Platform API key not set' });
+  if (!clientId || !mpin || !totp) return res.status(400).json({ error: 'Missing fields' });
+
+  try {
+    const r = await angelLogin({ apiKey, clientId, mpin, totp });
+    if (!r.status || !r.data?.jwtToken) {
+      return res.status(401).json({ error: r.message || 'Login failed' });
+    }
+    platformTokens[req.user.username] = r.data.jwtToken;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ============ SCREENER: 9:15 CANDLES ============ */
+app.post('/api/screener/fetch-915', auth, async (req, res) => {
+  const jwtToken = platformTokens[req.user.username];
+  if (!jwtToken) return res.status(401).json({ error: 'Connect broker first' });
+
+  const apiKey = process.env.ANGEL_API_KEY;
+  const { tokens } = req.body;
+  if (!Array.isArray(tokens) || !tokens.length) {
+    return res.status(400).json({ error: 'tokens array required' });
+  }
+
+  const today = new Date().toISOString().split('T')[0];
+  const from = `${today} 09:15`;
+  const to = `${today} 09:16`;   // 9:16 workaround for Angel One 9:15 bug
+
+  const results = [];
+  for (const token of tokens) {
+    try {
+      const r = await angelCandles({
+        apiKey, jwtToken,
+        exchange: 'NSE',
+        token: String(token),
+        interval: 'FIFTEEN_MINUTE',
+        from, to
+      });
+      if (r.status && r.data?.length) {
+        results.push({ token: String(token), candle: r.data[0] });
+      } else {
+        results.push({ token: String(token), error: 'no data' });
+      }
+    } catch (e) {
+      results.push({ token: String(token), error: e.message });
+    }
+    await new Promise(r => setTimeout(r, 400));  // 3 req/sec rate limit
+  }
+
+  res.json({ ok: true, count: results.length, results });
 });
 
 /* ============ START ============ */

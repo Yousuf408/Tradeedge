@@ -151,6 +151,46 @@ app.post('/api/logout', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
+/* ============ CHANGE PASSWORD ============ */
+app.post('/api/change-password', auth, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: 'Missing fields' });
+  }
+  if (newPassword.length < 6) {
+    return res.status(400).json({ error: 'New password must be 6+ characters' });
+  }
+
+  const { rows } = await db.query('SELECT * FROM users WHERE username=$1', [req.user.username]);
+  const user = rows[0];
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const ok = await bcrypt.compare(currentPassword, user.password_hash);
+  if (!ok) {
+    await log(req.user.username, 'PASSWORD_CHANGE_FAILED', 'Wrong current password', 'danger');
+    return res.status(401).json({ error: 'Current password is incorrect' });
+  }
+
+  const hash = await bcrypt.hash(newPassword, 10);
+  const newSessionId = crypto.randomUUID();
+
+  await db.query(
+    'UPDATE users SET password_hash=$1, session_id=$2 WHERE username=$3',
+    [hash, newSessionId, req.user.username]
+  );
+
+  // Issue a new token bound to the new sessionId so THIS device stays logged in
+  const token = jwt.sign(
+    { username: user.username, role: user.role, sessionId: newSessionId },
+    SECRET,
+    { expiresIn: '7h' }
+  );
+
+  await log(req.user.username, 'PASSWORD_CHANGED', `User: ${req.user.username}`, 'success');
+
+  res.json({ ok: true, token, sessionId: newSessionId });
+});
+
 /* ============ USERS (admin) ============ */
 
 app.get('/api/users', auth, adminOnly, async (req, res) => {

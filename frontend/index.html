@@ -490,6 +490,57 @@ Rahul Verma,9876543212,5d"></textarea>
   </div>
 </div>
 
+     <!-- 6.3 — Renew / Adjust Expiry Modal -->
+<div id="renewModal" class="modal-overlay">
+  <div class="modal-box">
+    <h3>🔄 Renew or Adjust</h3>
+    <div class="modal-sub" id="renewSub">Update subscription period</div>
+
+    <div class="expiry-info">
+      <span>Current expiry</span>
+      <strong id="renewCurrent">—</strong>
+    </div>
+
+    <label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">
+      ➕ Add days
+    </label>
+    <div class="chip-group" id="renewAddChips">
+      <button class="chip" data-days="5">+5 days</button>
+      <button class="chip" data-days="7">+7 days</button>
+      <button class="chip" data-days="30">+1 month</button>
+      <button class="chip" data-days="60">+2 months</button>
+      <button class="chip" data-days="90">+3 months</button>
+      <button class="chip" data-days="180">+6 months</button>
+      <button class="chip" data-days="365">+1 year</button>
+    </div>
+
+    <label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">
+      ➖ Reduce days
+    </label>
+    <div class="chip-group" id="renewSubChips">
+      <button class="chip danger" data-days="5">-5 days</button>
+      <button class="chip danger" data-days="7">-7 days</button>
+      <button class="chip danger" data-days="30">-1 month</button>
+      <button class="chip danger" data-days="90">-3 months</button>
+    </div>
+
+    <div class="auth-field" style="margin-top:16px">
+      <label>Or set exact date</label>
+      <input id="renewCustomDate" type="date" />
+    </div>
+
+    <div class="expiry-info" style="background:rgba(0,184,148,0.08)">
+      <span>New expiry</span>
+      <strong id="renewPreview" style="color:var(--success)">—</strong>
+    </div>
+
+    <div class="modal-error" id="renewError"></div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeRenew()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveRenew()">Save Changes</button>
+    </div>
+  </div>
+</div>
 
 <!-- ============================================================
      SECTION 7 — TOAST

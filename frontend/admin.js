@@ -1,14 +1,13 @@
 /* ============================================================
    ADMIN.JS
-   Contains: Config, API client, TOTP, Auth flow, Admin panel,
-             Shared utilities (toast, navigation, avatar menu)
+   Contains: Config, API client, TOTP, Auth flow, Forgot password,
+             Admin panel, Shared utilities
    Loaded BEFORE app.js
    ============================================================ */
 
 
 /* ============================================================
    SECTION 1 — CONFIGURATION & CONSTANTS
-   API URL, durations, color palette
    ============================================================ */
 const API = 'https://tradeedge-a5y0.onrender.com';
 
@@ -28,12 +27,12 @@ const DURATIONS = {
 
 /* ============================================================
    SECTION 2 — GLOBAL STATE
-   Tracks current user, impersonation, DOM refs
    ============================================================ */
 let currentUser = null;
 let impersonating = false;
 let impersonateBackup = null;
 let pendingLoginUser = null;
+let pendingForgotUser = null;
 
 const DOM = {
   pages: document.querySelectorAll('.page'),
@@ -46,7 +45,6 @@ const DOM = {
 
 /* ============================================================
    SECTION 3 — API CLIENT
-   Fetch wrapper with JWT auth header + error handling
    ============================================================ */
 function getToken() { return localStorage.getItem('ta_token'); }
 function setToken(t) { localStorage.setItem('ta_token', t); }
@@ -79,7 +77,6 @@ async function api(path, opts = {}) {
 
 /* ============================================================
    SECTION 4 — TOTP (Google Authenticator compatible)
-   Pure Web Crypto, no external libraries
    ============================================================ */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
@@ -136,7 +133,6 @@ function generateSecret() {
 
 /* ============================================================
    SECTION 5 — PASSWORD GENERATOR
-   Random strong password for new users
    ============================================================ */
 function generateStrongPassword(len = 12) {
   const U = 'ABCDEFGHJKMNPQRSTUVWXYZ';
@@ -160,7 +156,6 @@ function fillRandomPassword() {
 
 /* ============================================================
    SECTION 6 — TOAST NOTIFICATIONS
-   Small popup at bottom-right
    ============================================================ */
 let toastTimeout = null;
 
@@ -180,7 +175,6 @@ function hideToast() {
 
 /* ============================================================
    SECTION 7 — NAVIGATION
-   Switch between pages (Screener / Portfolio / Users / Settings)
    ============================================================ */
 function navigateTo(pageId) {
   DOM.navLinks.forEach(a => a.classList.toggle('active', a.dataset.page === pageId));
@@ -203,7 +197,6 @@ DOM.navLinks.forEach(link => link.addEventListener('click', e => {
 
 /* ============================================================
    SECTION 8 — AVATAR MENU + CHANGE PASSWORD
-   Top-right dropdown. Opens change-password modal.
    ============================================================ */
 function toggleAvatarMenu(e) {
   e.stopPropagation();
@@ -250,7 +243,6 @@ async function savePassword() {
       body: JSON.stringify({ currentPassword: cur, newPassword: nw })
     });
 
-    // Server rotated sessionId → store the new token so THIS device stays logged in
     if (r.token) {
       setToken(r.token);
       try {
@@ -280,6 +272,9 @@ function showLoginStep(step) {
   document.getElementById('loginStep1').style.display = step === 1 ? 'block' : 'none';
   document.getElementById('loginStep2Verify').style.display = step === 'verify' ? 'block' : 'none';
   document.getElementById('loginStep2Setup').style.display = step === 'setup' ? 'block' : 'none';
+  // Hide forgot-password screens
+  document.getElementById('forgotStep1').style.display = 'none';
+  document.getElementById('forgotStep2').style.display = 'none';
 }
 
 async function doLogin() {
@@ -381,8 +376,92 @@ function cancelTotp() {
 
 
 /* ============================================================
-   SECTION 10 — LOGOUT & SCREEN SWITCHING
-   showLogin / showExpired / showApp
+   SECTION 10 — FORGOT PASSWORD (TOTP-based self-service)
+   Step 1: enter username/mobile
+   Step 2: TOTP code + new password
+   ============================================================ */
+function showForgotStep(step) {
+  document.getElementById('loginStep1').style.display = 'none';
+  document.getElementById('loginStep2Verify').style.display = 'none';
+  document.getElementById('loginStep2Setup').style.display = 'none';
+  document.getElementById('forgotStep1').style.display = step === 1 ? 'block' : 'none';
+  document.getElementById('forgotStep2').style.display = step === 2 ? 'block' : 'none';
+
+  if (step === 1) {
+    document.getElementById('forgotError').textContent = '';
+    setTimeout(() => document.getElementById('forgotInput').focus(), 100);
+  } else {
+    document.getElementById('forgotError2').textContent = '';
+  }
+}
+
+async function forgotCheck() {
+  const input = document.getElementById('forgotInput').value.trim();
+  const err = document.getElementById('forgotError');
+  err.textContent = '';
+
+  if (!input) { err.textContent = 'Enter username or mobile'; return; }
+
+  try {
+    const r = await api('/api/forgot-password/check', {
+      method: 'POST',
+      body: JSON.stringify({ input })
+    });
+    pendingForgotUser = { input, username: r.username, name: r.name };
+    document.getElementById('forgotUserLabel').textContent =
+      `Reset password for ${r.name} (${r.username})`;
+    document.getElementById('forgotTotp').value = '';
+    document.getElementById('forgotNew').value = '';
+    document.getElementById('forgotConfirm').value = '';
+    showForgotStep(2);
+  } catch (e) {
+    err.textContent = e.message;
+  }
+}
+
+async function forgotReset() {
+  const totp = document.getElementById('forgotTotp').value.trim();
+  const nw   = document.getElementById('forgotNew').value;
+  const cf   = document.getElementById('forgotConfirm').value;
+  const err  = document.getElementById('forgotError2');
+  err.textContent = '';
+
+  if (!/^\d{6}$/.test(totp)) { err.textContent = 'Enter 6-digit code'; return; }
+  if (nw.length < 6)         { err.textContent = 'Password must be 6+ characters'; return; }
+  if (nw !== cf)             { err.textContent = 'Passwords do not match'; return; }
+  if (!pendingForgotUser)    { err.textContent = 'Session lost, please retry'; return; }
+
+  const btn = document.querySelector('#forgotStep2 .btn-primary');
+  const orig = btn.textContent;
+  btn.textContent = 'Resetting...';
+  btn.disabled = true;
+
+  try {
+    await api('/api/forgot-password/reset', {
+      method: 'POST',
+      body: JSON.stringify({
+        input: pendingForgotUser.input,
+        totpCode: totp,
+        newPassword: nw
+      })
+    });
+
+    pendingForgotUser = null;
+    showLoginStep(1);
+    document.getElementById('authUser').value = '';
+    document.getElementById('authPass').value = '';
+    showToast('✅ Password Reset', 'Login with your new password');
+  } catch (e) {
+    err.textContent = e.message;
+  } finally {
+    btn.textContent = orig;
+    btn.disabled = false;
+  }
+}
+
+
+/* ============================================================
+   SECTION 11 — LOGOUT & SCREEN SWITCHING
    ============================================================ */
 function logout() {
   const token = getToken();
@@ -469,8 +548,7 @@ function showApp() {
 
 
 /* ============================================================
-   SECTION 11 — TABS (admin panel tabs)
-   Users / Bulk Import / Audit / Prices
+   SECTION 12 — TABS (admin panel)
    ============================================================ */
 function switchTab(name, e) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -483,7 +561,7 @@ function switchTab(name, e) {
 
 
 /* ============================================================
-   SECTION 12 — ADMIN: KPIs (dashboard stat boxes)
+   SECTION 13 — ADMIN: KPIs
    ============================================================ */
 async function renderKPIs() {
   try {
@@ -516,7 +594,7 @@ async function renderKPIs() {
 
 
 /* ============================================================
-   SECTION 13 — ADMIN: USERS TABLE & CRUD
+   SECTION 14 — ADMIN: USERS TABLE & CRUD
    ============================================================ */
 async function renderUsers() {
   const search = (document.getElementById('userSearch')?.value || '').toLowerCase();
@@ -685,7 +763,7 @@ async function resetPassword(username) {
 
 
 /* ============================================================
-   SECTION 14 — ADMIN: IMPERSONATE
+   SECTION 15 — ADMIN: IMPERSONATE
    ============================================================ */
 async function impersonate(username) {
   if (!confirm(`View as "${username}"?`)) return;
@@ -712,7 +790,7 @@ function exitImpersonate() {
 
 
 /* ============================================================
-   SECTION 15 — ADMIN: BULK IMPORT (CSV)
+   SECTION 16 — ADMIN: BULK IMPORT
    ============================================================ */
 function loadSampleCSV() {
   document.getElementById('csvInput').value =
@@ -775,7 +853,7 @@ async function bulkImport() {
 
 
 /* ============================================================
-   SECTION 16 — ADMIN: AUDIT LOG
+   SECTION 17 — ADMIN: AUDIT LOG
    ============================================================ */
 async function renderAudit() {
   const box = document.getElementById('auditLog');
@@ -814,7 +892,7 @@ async function clearAudit() {
 
 
 /* ============================================================
-   SECTION 17 — ADMIN: PRICING
+   SECTION 18 — ADMIN: PRICING
    ============================================================ */
 async function loadPrices() {
   try {
@@ -842,7 +920,7 @@ async function savePrices() {
 
 
 /* ============================================================
-   SECTION 18 — ADMIN: EXPORT USERS AS CSV
+   SECTION 19 — ADMIN: EXPORT USERS AS CSV
    ============================================================ */
 async function exportUsersCSV() {
   try {
@@ -875,7 +953,7 @@ async function exportUsersCSV() {
 
 
 /* ============================================================
-   SECTION 19 — BOOTSTRAP (auto-runs on page load)
+   SECTION 20 — BOOTSTRAP (auto-runs on page load)
    ============================================================ */
 (async function initAuth() {
   const token = getToken();

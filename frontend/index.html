@@ -9,9 +9,13 @@
 </head>
 <body class="logged-out">
 
+<!-- ============================================================
+     SECTION 1 — AUTH SCREEN (LOGIN + 2FA + FORGOT PASSWORD)
+     ============================================================ -->
 <div id="authScreen" class="auth-screen">
   <div class="auth-card">
 
+    <!-- 1.1 — Login (username/mobile + password) -->
     <div id="loginStep1">
       <div class="auth-logo">📊 TradeAlgo Pro</div>
       <div class="auth-sub">Sign in to continue</div>
@@ -26,8 +30,12 @@
       </div>
       <div class="auth-error" id="authError"></div>
       <button class="btn btn-primary auth-btn" onclick="doLogin()">Continue</button>
+      <div style="margin-top:14px;font-size:13px">
+        <a onclick="showForgotStep(1)" style="color:#6C5CE7;cursor:pointer;font-weight:600">Forgot password?</a>
+      </div>
     </div>
 
+    <!-- 1.2 — TOTP Verify (returning user) -->
     <div id="loginStep2Verify" style="display:none">
       <div class="auth-logo">🔐 Two-Factor Auth</div>
       <div class="auth-sub">Enter the 6-digit code from your authenticator app</div>
@@ -42,6 +50,7 @@
       <button class="btn btn-outline auth-btn" style="margin-top:8px" onclick="cancelTotp()">Back</button>
     </div>
 
+    <!-- 1.3 — TOTP Setup (first-time user) -->
     <div id="loginStep2Setup" style="display:none">
       <div class="auth-logo">🔐 Set Up 2FA</div>
       <div class="auth-sub">Scan this QR with Google Authenticator or Authy</div>
@@ -61,9 +70,53 @@
       <button class="btn btn-outline auth-btn" style="margin-top:8px" onclick="cancelTotp()">Back</button>
     </div>
 
+    <!-- 1.4 — Forgot Password: Step 1 (enter username/mobile) -->
+    <div id="forgotStep1" style="display:none">
+      <div class="auth-logo">🔓 Reset Password</div>
+      <div class="auth-sub">Enter your username or mobile to continue</div>
+      <div class="auth-field">
+        <label>Username or Mobile</label>
+        <input id="forgotInput" type="text" placeholder="Enter username or mobile"
+               onkeydown="if(event.key==='Enter') forgotCheck()" />
+      </div>
+      <div class="auth-error" id="forgotError"></div>
+      <button class="btn btn-primary auth-btn" onclick="forgotCheck()">Continue</button>
+      <button class="btn btn-outline auth-btn" style="margin-top:8px" onclick="showLoginStep(1)">Back to Login</button>
+      <div style="margin-top:16px;font-size:12px;color:#7e8fa3">
+        Lost your phone too? Contact admin to reset manually.
+      </div>
+    </div>
+
+    <!-- 1.5 — Forgot Password: Step 2 (TOTP code + new password) -->
+    <div id="forgotStep2" style="display:none">
+      <div class="auth-logo">🔓 Reset Password</div>
+      <div class="auth-sub" id="forgotUserLabel">Verify your identity</div>
+      <div class="auth-field">
+        <label>6-digit code from your authenticator app</label>
+        <input id="forgotTotp" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
+               style="letter-spacing:8px;text-align:center;font-size:20px;font-weight:700" />
+      </div>
+      <div class="auth-field">
+        <label>New Password</label>
+        <input id="forgotNew" type="password" placeholder="At least 6 characters" />
+      </div>
+      <div class="auth-field">
+        <label>Confirm New Password</label>
+        <input id="forgotConfirm" type="password" placeholder="Repeat new password"
+               onkeydown="if(event.key==='Enter') forgotReset()" />
+      </div>
+      <div class="auth-error" id="forgotError2"></div>
+      <button class="btn btn-primary auth-btn" onclick="forgotReset()">Reset Password</button>
+      <button class="btn btn-outline auth-btn" style="margin-top:8px" onclick="showForgotStep(1)">Back</button>
+    </div>
+
   </div>
 </div>
 
+
+<!-- ============================================================
+     SECTION 2 — EXPIRED SCREEN (subscription ended)
+     ============================================================ -->
 <div id="expiredScreen" class="auth-screen" style="display:none">
   <div class="auth-card">
     <div class="auth-logo">⛔ Subscription Expired</div>
@@ -72,19 +125,31 @@
   </div>
 </div>
 
+
+<!-- ============================================================
+     SECTION 3 — IMPERSONATE BANNER (admin viewing as user)
+     ============================================================ -->
 <div id="impersonateBanner" class="impersonate-banner" style="display:none">
   ⚠️ Viewing as <strong id="impersonateName">—</strong>
   <button onclick="exitImpersonate()">Exit Impersonation</button>
 </div>
 
+
+<!-- ============================================================
+     SECTION 4 — NAVBAR (logo, links, avatar)
+     ============================================================ -->
 <nav class="navbar">
   <div class="logo">📊 <span>TradeAlgo</span>Pro</div>
+
+  <!-- 4.1 — Nav links (Users link shown only for admin) -->
   <ul class="nav-links">
     <li><a class="active" data-page="screener">🔍 Screener</a></li>
     <li><a data-page="portfolio">💰 Portfolio</a></li>
     <li class="admin-only" style="display:none"><a data-page="users">👥 Users</a></li>
     <li><a data-page="settings">⚙️ Settings</a></li>
   </ul>
+
+  <!-- 4.2 — Right side: status, balance, avatar dropdown -->
   <div class="nav-right">
     <span class="status"><span class="dot"></span> Live</span>
     <span class="balance">₹1,24,500</span>
@@ -102,8 +167,13 @@
   </div>
 </nav>
 
+
+<!-- ============================================================
+     SECTION 5 — MAIN CONTAINER (all pages)
+     ============================================================ -->
 <div class="container">
 
+  <!-- 5.1 — SCREENER PAGE -->
   <div id="page-screener" class="page active">
     <div class="panel-glass">
       <div class="panel-head">
@@ -137,6 +207,7 @@
         <button class="btn btn-outline btn-sm">📥 Export</button>
       </div>
     </div>
+
     <div class="panel-glass">
       <div class="panel-head"><h3>📋 Strategy Details</h3></div>
       <div class="panel-body info-grid">
@@ -147,6 +218,7 @@
     </div>
   </div>
 
+  <!-- 5.2 — PORTFOLIO PAGE -->
   <div id="page-portfolio" class="page">
     <h2 class="section-title">💰 Portfolio</h2>
     <div class="stats-row" id="portfolioStats"></div>
@@ -156,11 +228,14 @@
     </div>
   </div>
 
+  <!-- 5.3 — USERS PAGE (admin only) -->
   <div id="page-users" class="page">
     <h2 class="section-title">👥 Admin Panel</h2>
 
+    <!-- 5.3.1 — KPI cards -->
     <div class="stats-row" id="adminKPIs"></div>
 
+    <!-- 5.3.2 — Tabs -->
     <div class="tabs">
       <button class="tab-btn active" onclick="switchTab('users', event)">👥 Users</button>
       <button class="tab-btn" onclick="switchTab('import', event)">📥 Bulk Import</button>
@@ -168,6 +243,7 @@
       <button class="tab-btn" onclick="switchTab('prices', event)">💵 Plans & Pricing</button>
     </div>
 
+    <!-- 5.3.3 — TAB: Users (add form + search + table) -->
     <div id="tab-users" class="tab-content active">
       <div class="panel-glass">
         <div class="panel-head"><h3>➕ Add New User</h3></div>
@@ -225,6 +301,7 @@
       </div>
     </div>
 
+    <!-- 5.3.4 — TAB: Bulk Import (CSV) -->
     <div id="tab-import" class="tab-content">
       <div class="panel-glass">
         <div class="panel-head"><h3>📥 Bulk Import Users (CSV)</h3></div>
@@ -233,7 +310,8 @@
             Format: <code>name,username,password,plan,duration,mobile(optional)</code><br>
             Duration codes: <strong>5d, 7d, 1m, 2m, 3m, 6m, 1y</strong>
           </p>
-          <textarea id="csvInput" class="form-input" rows="8" style="font-family:monospace;font-size:12px" placeholder="Ravi Kumar,ravi,pass123,Basic,1m,9876543210
+          <textarea id="csvInput" class="form-input" rows="8" style="font-family:monospace;font-size:12px"
+            placeholder="Ravi Kumar,ravi,pass123,Basic,1m,9876543210
 Priya Sharma,priya,pass456,Pro,3m
 Rahul,demo_user,demo123,Demo,5d"></textarea>
           <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
@@ -245,6 +323,7 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
       </div>
     </div>
 
+    <!-- 5.3.5 — TAB: Audit Log -->
     <div id="tab-audit" class="tab-content">
       <div class="panel-glass">
         <div class="panel-head">
@@ -255,6 +334,7 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
       </div>
     </div>
 
+    <!-- 5.3.6 — TAB: Plans & Pricing -->
     <div id="tab-prices" class="tab-content">
       <div class="panel-glass">
         <div class="panel-head"><h3>💵 Plan Pricing (₹ / month)</h3></div>
@@ -270,8 +350,11 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
     </div>
   </div>
 
+  <!-- 5.4 — SETTINGS PAGE -->
   <div id="page-settings" class="page">
     <h2 class="section-title">⚙️ Settings</h2>
+
+    <!-- 5.4.1 — Broker Connection -->
     <div class="panel-glass">
       <div class="panel-head"><h3>🔌 Broker Connection</h3></div>
       <div class="panel-body">
@@ -294,6 +377,8 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
         <div id="otherBrokerFields"><p>🔑 Enter credentials for your selected broker.</p></div>
       </div>
     </div>
+
+    <!-- 5.4.2 — Risk Management -->
     <div class="panel-glass">
       <div class="panel-head"><h3>⚡ Risk Management</h3></div>
       <div class="panel-body settings-grid">
@@ -310,6 +395,12 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
 
 </div>
 
+
+<!-- ============================================================
+     SECTION 6 — MODALS
+     ============================================================ -->
+
+<!-- 6.1 — Change Password Modal -->
 <div id="pwdModal" class="modal-overlay">
   <div class="modal-box">
     <h3>🔒 Change Password</h3>
@@ -334,13 +425,22 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
   </div>
 </div>
 
+
+<!-- ============================================================
+     SECTION 7 — TOAST (popup notifications)
+     ============================================================ -->
 <div id="toast" class="toast">
   <button class="toast-close" onclick="hideToast()">×</button>
   <div class="toast-title" id="toastTitle">✅ Success</div>
   <div id="toastMessage">Action completed</div>
 </div>
 
+
+<!-- ============================================================
+     SECTION 8 — SCRIPTS (order matters: admin.js first, then app.js)
+     ============================================================ -->
 <script src="admin.js"></script>
 <script src="app.js"></script>
+
 </body>
 </html>

@@ -15,7 +15,7 @@
 <div id="authScreen" class="auth-screen">
   <div class="auth-card">
 
-    <!-- 1.1 — Login (username/mobile + password) -->
+    <!-- 1.1 — Login -->
     <div id="loginStep1">
       <div class="auth-logo">📊 TradeAlgo Pro</div>
       <div class="auth-sub">Sign in to continue</div>
@@ -35,7 +35,7 @@
       </div>
     </div>
 
-    <!-- 1.2 — TOTP Verify (returning user) -->
+    <!-- 1.2 — TOTP Verify -->
     <div id="loginStep2Verify" style="display:none">
       <div class="auth-logo">🔐 Two-Factor Auth</div>
       <div class="auth-sub">Enter the 6-digit code from your authenticator app</div>
@@ -50,7 +50,7 @@
       <button class="btn btn-outline auth-btn" style="margin-top:8px" onclick="cancelTotp()">Back</button>
     </div>
 
-    <!-- 1.3 — TOTP Setup (first-time user) -->
+    <!-- 1.3 — TOTP Setup -->
     <div id="loginStep2Setup" style="display:none">
       <div class="auth-logo">🔐 Set Up 2FA</div>
       <div class="auth-sub">Scan this QR with Google Authenticator or Authy</div>
@@ -70,7 +70,7 @@
       <button class="btn btn-outline auth-btn" style="margin-top:8px" onclick="cancelTotp()">Back</button>
     </div>
 
-    <!-- 1.4 — Forgot Password: Step 1 (enter username/mobile) -->
+    <!-- 1.4 — Forgot Password: Step 1 -->
     <div id="forgotStep1" style="display:none">
       <div class="auth-logo">🔓 Reset Password</div>
       <div class="auth-sub">Enter your username or mobile to continue</div>
@@ -87,7 +87,7 @@
       </div>
     </div>
 
-    <!-- 1.5 — Forgot Password: Step 2 (TOTP code + new password) -->
+    <!-- 1.5 — Forgot Password: Step 2 -->
     <div id="forgotStep2" style="display:none">
       <div class="auth-logo">🔓 Reset Password</div>
       <div class="auth-sub" id="forgotUserLabel">Verify your identity</div>
@@ -115,7 +115,7 @@
 
 
 <!-- ============================================================
-     SECTION 2 — EXPIRED SCREEN (subscription ended)
+     SECTION 2 — EXPIRED SCREEN
      ============================================================ -->
 <div id="expiredScreen" class="auth-screen" style="display:none">
   <div class="auth-card">
@@ -127,7 +127,7 @@
 
 
 <!-- ============================================================
-     SECTION 3 — IMPERSONATE BANNER (admin viewing as user)
+     SECTION 3 — IMPERSONATE BANNER
      ============================================================ -->
 <div id="impersonateBanner" class="impersonate-banner" style="display:none">
   ⚠️ Viewing as <strong id="impersonateName">—</strong>
@@ -136,12 +136,11 @@
 
 
 <!-- ============================================================
-     SECTION 4 — NAVBAR (logo, links, avatar)
+     SECTION 4 — NAVBAR
      ============================================================ -->
 <nav class="navbar">
   <div class="logo">📊 <span>TradeAlgo</span>Pro</div>
 
-  <!-- 4.1 — Nav links (Users link shown only for admin) -->
   <ul class="nav-links">
     <li><a class="active" data-page="screener">🔍 Screener</a></li>
     <li><a data-page="portfolio">💰 Portfolio</a></li>
@@ -149,17 +148,25 @@
     <li><a data-page="settings">⚙️ Settings</a></li>
   </ul>
 
-  <!-- 4.2 — Right side: status, balance, avatar dropdown -->
   <div class="nav-right">
     <span class="status"><span class="dot"></span> Live</span>
     <span class="balance">₹1,24,500</span>
+
+    <!-- 4.1 — Name pill (replaces avatar circle) + dropdown -->
     <div class="avatar-wrap">
-      <div class="avatar" id="avatarEl" onclick="toggleAvatarMenu(event)">--</div>
+      <button id="userPill" onclick="toggleAvatarMenu(event)"
+              style="background:rgba(108,92,231,0.08);border:none;padding:8px 16px;border-radius:10px;
+                     font-weight:700;font-size:14px;color:var(--text-primary);cursor:pointer;
+                     font-family:inherit;display:flex;align-items:center;gap:8px">
+        <span id="userPillName">Loading...</span>
+        <span style="font-size:10px;color:var(--text-muted)">▼</span>
+      </button>
       <div class="avatar-menu" id="avatarMenu">
         <div class="avatar-menu-header">
           <div class="name" id="avatarName">—</div>
           <div class="role" id="avatarRole">—</div>
         </div>
+        <div class="avatar-menu-item" onclick="openMyProfile()">👤 My Profile</div>
         <div class="avatar-menu-item" onclick="openChangePassword()">🔒 Change Password</div>
         <div class="avatar-menu-item danger" onclick="logout()">🚪 Logout</div>
       </div>
@@ -169,11 +176,11 @@
 
 
 <!-- ============================================================
-     SECTION 5 — MAIN CONTAINER (all pages)
+     SECTION 5 — MAIN CONTAINER
      ============================================================ -->
 <div class="container">
 
-  <!-- 5.1 — SCREENER PAGE -->
+  <!-- 5.1 — SCREENER -->
   <div id="page-screener" class="page active">
     <div class="panel-glass">
       <div class="panel-head">
@@ -218,7 +225,7 @@
     </div>
   </div>
 
-  <!-- 5.2 — PORTFOLIO PAGE -->
+  <!-- 5.2 — PORTFOLIO -->
   <div id="page-portfolio" class="page">
     <h2 class="section-title">💰 Portfolio</h2>
     <div class="stats-row" id="portfolioStats"></div>
@@ -228,14 +235,12 @@
     </div>
   </div>
 
-  <!-- 5.3 — USERS PAGE (admin only) -->
+  <!-- 5.3 — USERS (admin only) -->
   <div id="page-users" class="page">
     <h2 class="section-title">👥 Admin Panel</h2>
 
-    <!-- 5.3.1 — KPI cards -->
     <div class="stats-row" id="adminKPIs"></div>
 
-    <!-- 5.3.2 — Tabs -->
     <div class="tabs">
       <button class="tab-btn active" onclick="switchTab('users', event)">👥 Users</button>
       <button class="tab-btn" onclick="switchTab('import', event)">📥 Bulk Import</button>
@@ -243,25 +248,20 @@
       <button class="tab-btn" onclick="switchTab('prices', event)">💵 Plans & Pricing</button>
     </div>
 
-    <!-- 5.3.3 — TAB: Users (add form + search + table) -->
+    <!-- 5.3.1 — TAB: Users -->
     <div id="tab-users" class="tab-content active">
       <div class="panel-glass">
         <div class="panel-head"><h3>➕ Add New User</h3></div>
         <div class="panel-body">
+          <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px">
+            Just enter name + mobile + plan. Username &amp; password will be auto-generated.
+          </p>
           <div class="user-form">
-            <div class="settings-group"><label>Full Name</label><input id="newName" type="text" placeholder="e.g. Ravi Kumar" /></div>
-            <div class="settings-group"><label>Username</label><input id="newUsername" type="text" placeholder="e.g. ravi" /></div>
-            <div class="settings-group"><label>Mobile (optional)</label><input id="newMobile" type="text" placeholder="e.g. 9876543210" /></div>
-            <div class="settings-group">
-              <label>Password</label>
-              <div style="display:flex;gap:6px">
-                <input id="newPassword" type="text" placeholder="Set a password" style="flex:1" />
-                <button class="btn btn-outline btn-sm" onclick="fillRandomPassword()" type="button" title="Generate strong password">🎲</button>
-              </div>
-            </div>
+            <div class="settings-group"><label>Full Name *</label><input id="newName" type="text" placeholder="e.g. Ravi Kumar" /></div>
+            <div class="settings-group"><label>Mobile * (10 digits)</label><input id="newMobile" type="text" placeholder="e.g. 9876543210" /></div>
             <div class="settings-group">
               <label>Plan</label>
-              <select id="newPlan"><option>Demo</option><option selected>Basic</option><option>Pro</option></select>
+              <select id="newPlan"><option>Demo</option><option selected>Pro</option></select>
             </div>
             <div class="settings-group">
               <label>Duration</label>
@@ -301,19 +301,20 @@
       </div>
     </div>
 
-    <!-- 5.3.4 — TAB: Bulk Import (CSV) -->
+    <!-- 5.3.2 — TAB: Bulk Import -->
     <div id="tab-import" class="tab-content">
       <div class="panel-glass">
         <div class="panel-head"><h3>📥 Bulk Import Users (CSV)</h3></div>
         <div class="panel-body">
           <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px">
-            Format: <code>name,username,password,plan,duration,mobile(optional)</code><br>
-            Duration codes: <strong>5d, 7d, 1m, 2m, 3m, 6m, 1y</strong>
+            Format: <code>Full Name,Mobile,Duration</code><br>
+            Duration codes: <strong>5d, 7d, 1m, 2m, 3m, 6m, 1y</strong><br>
+            Username &amp; password are auto-generated. Plan defaults to <strong>Pro</strong>.
           </p>
           <textarea id="csvInput" class="form-input" rows="8" style="font-family:monospace;font-size:12px"
-            placeholder="Ravi Kumar,ravi,pass123,Basic,1m,9876543210
-Priya Sharma,priya,pass456,Pro,3m
-Rahul,demo_user,demo123,Demo,5d"></textarea>
+            placeholder="Ravi Kumar,9876543210,1m
+Priya Sharma,9876543211,3m
+Rahul Verma,9876543212,5d"></textarea>
           <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
             <button class="btn btn-primary" onclick="bulkImport()">📥 Import Users</button>
             <button class="btn btn-outline" onclick="loadSampleCSV()">📄 Load Sample</button>
@@ -323,7 +324,7 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
       </div>
     </div>
 
-    <!-- 5.3.5 — TAB: Audit Log -->
+    <!-- 5.3.3 — TAB: Audit Log -->
     <div id="tab-audit" class="tab-content">
       <div class="panel-glass">
         <div class="panel-head">
@@ -334,13 +335,12 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
       </div>
     </div>
 
-    <!-- 5.3.6 — TAB: Plans & Pricing -->
+    <!-- 5.3.4 — TAB: Plans & Pricing -->
     <div id="tab-prices" class="tab-content">
       <div class="panel-glass">
         <div class="panel-head"><h3>💵 Plan Pricing (₹ / month)</h3></div>
         <div class="panel-body settings-grid">
           <div class="settings-group"><label>Demo Price</label><input id="priceDemo" type="number" value="0" /></div>
-          <div class="settings-group"><label>Basic Price</label><input id="priceBasic" type="number" value="999" /></div>
           <div class="settings-group"><label>Pro Price</label><input id="pricePro" type="number" value="2999" /></div>
         </div>
         <div style="padding:0 24px 24px">
@@ -350,11 +350,41 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
     </div>
   </div>
 
-  <!-- 5.4 — SETTINGS PAGE -->
+  <!-- 5.4 — SETTINGS -->
   <div id="page-settings" class="page">
     <h2 class="section-title">⚙️ Settings</h2>
 
-    <!-- 5.4.1 — Broker Connection -->
+    <!-- 5.4.1 — My Profile -->
+    <div class="panel-glass" id="profilePanel">
+      <div class="panel-head"><h3>👤 My Profile</h3></div>
+      <div class="panel-body">
+        <div class="settings-grid">
+          <div class="settings-group">
+            <label>Full Name</label>
+            <input id="profileName" type="text" placeholder="Your name" />
+          </div>
+          <div class="settings-group">
+            <label>Mobile Number</label>
+            <input id="profileMobile" type="text" placeholder="10-digit mobile" />
+          </div>
+          <div class="settings-group">
+            <label>Username (cannot change)</label>
+            <input id="profileUsername" type="text" readonly
+                   style="background:#f0f2f8;cursor:not-allowed;color:var(--text-muted)" />
+          </div>
+          <div class="settings-group">
+            <label>Role</label>
+            <input id="profileRole" type="text" readonly
+                   style="background:#f0f2f8;cursor:not-allowed;color:var(--text-muted)" />
+          </div>
+        </div>
+        <div style="margin-top:16px">
+          <button class="btn btn-primary" onclick="saveProfile()">💾 Save Profile</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 5.4.2 — Broker Connection -->
     <div class="panel-glass">
       <div class="panel-head"><h3>🔌 Broker Connection</h3></div>
       <div class="panel-body">
@@ -378,7 +408,7 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
       </div>
     </div>
 
-    <!-- 5.4.2 — Risk Management -->
+    <!-- 5.4.3 — Risk Management -->
     <div class="panel-glass">
       <div class="panel-head"><h3>⚡ Risk Management</h3></div>
       <div class="panel-body settings-grid">
@@ -400,7 +430,7 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
      SECTION 6 — MODALS
      ============================================================ -->
 
-<!-- 6.1 — Change Password Modal -->
+<!-- 6.1 — Change Password -->
 <div id="pwdModal" class="modal-overlay">
   <div class="modal-box">
     <h3>🔒 Change Password</h3>
@@ -425,9 +455,44 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
   </div>
 </div>
 
+<!-- 6.2 — Edit User (admin only) -->
+<div id="editUserModal" class="modal-overlay">
+  <div class="modal-box">
+    <h3>✏️ Edit User</h3>
+    <div class="modal-sub" id="editUserSub">Update user details</div>
+    <div class="auth-field">
+      <label>Full Name</label>
+      <input id="editName" type="text" placeholder="Full name" />
+    </div>
+    <div class="auth-field">
+      <label>Mobile</label>
+      <input id="editMobile" type="text" placeholder="10-digit mobile" />
+    </div>
+    <div class="auth-field">
+      <label>Plan</label>
+      <select id="editPlan">
+        <option>Demo</option>
+        <option>Pro</option>
+      </select>
+    </div>
+    <div class="auth-field">
+      <label>Role</label>
+      <select id="editRole">
+        <option value="user">User</option>
+        <option value="admin">Admin</option>
+      </select>
+    </div>
+    <div class="modal-error" id="editError"></div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeEditUser()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveEditUser()">Save Changes</button>
+    </div>
+  </div>
+</div>
+
 
 <!-- ============================================================
-     SECTION 7 — TOAST (popup notifications)
+     SECTION 7 — TOAST
      ============================================================ -->
 <div id="toast" class="toast">
   <button class="toast-close" onclick="hideToast()">×</button>
@@ -437,7 +502,7 @@ Rahul,demo_user,demo123,Demo,5d"></textarea>
 
 
 <!-- ============================================================
-     SECTION 8 — SCRIPTS (order matters: admin.js first, then app.js)
+     SECTION 8 — SCRIPTS
      ============================================================ -->
 <script src="admin.js"></script>
 <script src="app.js"></script>

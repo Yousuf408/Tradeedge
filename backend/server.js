@@ -1,15 +1,22 @@
-import dotenv from 'dotenv';
-dotenv.config();
 import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import pg from 'pg';
 import crypto from 'crypto';
+import dotenv from 'dotenv';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { login as angelLogin, getCandles as angelCandles } from './brokers/angelone/Angel_REST.js';
+import {
+  loginPlatform,
+  getCandlesForTokens,
+  getLTPForTokens,
+  getSessionStatus,
+  clearCandleCache
+} from './brokers/angelone/Angel_REST.js';
+
+dotenv.config();
 
 const app = express();
 app.use(express.json());
@@ -23,10 +30,14 @@ const db = new pg.Pool({
 });
 
 const SECRET = process.env.JWT_SECRET;
-const __dir = dirname(fileURLToPath(import.meta.url));
-const STOCKS = JSON.parse(readFileSync(join(__dir, 'brokers/angelone/Angel_nifty500.json'), 'utf8'));
-const platformTokens = {};  // { username: jwtToken } — in-memory, clears on restart
 
+/* ---- Load stock list once ---- */
+const __dir = dirname(fileURLToPath(import.meta.url));
+const STOCKS = JSON.parse(
+  readFileSync(join(__dir, 'brokers/angelone/Angel_nifty500.json'), 'utf8')
+);
+
+/* ---- Auth middleware ---- */
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'No token' });
@@ -50,7 +61,7 @@ async function log(actor, action, details = '', level = 'info') {
   } catch {}
 }
 
-/* ============ HELPERS: auto-generate username/password ============ */
+/* ---- Auto-generate username/password ---- */
 async function generateUsername(fullName, mobile) {
   const first = (fullName || '').trim().split(/\s+/)[0].toLowerCase().replace(/[^a-z0-9]/g, '');
   const last4 = (mobile || '').replace(/\D/g, '').slice(-4);
@@ -72,7 +83,7 @@ function generatePassword(fullName, mobile) {
   return `${cap}@${last4}!`;
 }
 
-/* ============ TOTP VERIFY ============ */
+/* ---- TOTP server verify (for forgot password) ---- */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 function base32Decode(str) {
@@ -109,10 +120,14 @@ function verifyTotpServer(secret, input) {
   return false;
 }
 
+/* ============================================================
+   HEALTH
+   ============================================================ */
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
 
-/* ============ AUTH ============ */
-
+/* ============================================================
+   AUTH
+   ============================================================ */
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
   const clean = (input || '').trim().toLowerCase();
@@ -219,7 +234,9 @@ app.post('/api/logout', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ============ FORGOT PASSWORD ============ */
+/* ============================================================
+   FORGOT PASSWORD
+   ============================================================ */
 app.post('/api/forgot-password/check', async (req, res) => {
   const { input } = req.body;
   const clean = (input || '').trim().toLowerCase();
@@ -269,7 +286,9 @@ app.post('/api/forgot-password/reset', async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ============ CHANGE PASSWORD ============ */
+/* ============================================================
+   CHANGE PASSWORD
+   ============================================================ */
 app.post('/api/change-password', auth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Missing fields' });
@@ -303,7 +322,9 @@ app.post('/api/change-password', auth, async (req, res) => {
   res.json({ ok: true, token, sessionId: newSessionId });
 });
 
-/* ============ SELF PROFILE ============ */
+/* ============================================================
+   SELF PROFILE
+   ============================================================ */
 app.put('/api/me', auth, async (req, res) => {
   const { name, mobile } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
@@ -330,8 +351,9 @@ app.put('/api/me', auth, async (req, res) => {
   }
 });
 
-/* ============ USERS (admin) ============ */
-
+/* ============================================================
+   USERS (admin)
+   ============================================================ */
 app.get('/api/users', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query(
     `SELECT id, name, username, mobile, role, plan, expires_at AS "expiresAt",
@@ -341,7 +363,6 @@ app.get('/api/users', auth, adminOnly, async (req, res) => {
   res.json(rows);
 });
 
-/* Create user (auto-generate username + password) */
 app.post('/api/users', auth, adminOnly, async (req, res) => {
   let { name, mobile, password, plan, expiresAt } = req.body;
 
@@ -367,7 +388,6 @@ app.post('/api/users', auth, adminOnly, async (req, res) => {
   }
 });
 
-/* Edit user (admin updates name, mobile, plan, role) */
 app.put('/api/users/:username', auth, adminOnly, async (req, res) => {
   const target = req.params.username;
   const { name, mobile, plan, role } = req.body;
@@ -397,7 +417,6 @@ app.put('/api/users/:username', auth, adminOnly, async (req, res) => {
   }
 });
 
-/* Renew (add days — negative allowed for reducing) */
 app.post('/api/users/:username/renew', auth, adminOnly, async (req, res) => {
   const { days } = req.body;
   await db.query(
@@ -408,7 +427,6 @@ app.post('/api/users/:username/renew', auth, adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* Set exact expiry date */
 app.post('/api/users/:username/set-expiry', auth, adminOnly, async (req, res) => {
   const { expiresAt } = req.body;
   if (!expiresAt) return res.status(400).json({ error: 'expiresAt required' });
@@ -420,7 +438,6 @@ app.post('/api/users/:username/set-expiry', auth, adminOnly, async (req, res) =>
   res.json({ ok: true });
 });
 
-/* Reset password + 2FA */
 app.post('/api/users/:username/reset', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT name, mobile FROM users WHERE username=$1', [req.params.username]);
   const u = rows[0];
@@ -436,7 +453,6 @@ app.post('/api/users/:username/reset', auth, adminOnly, async (req, res) => {
   res.json({ ok: true, temp });
 });
 
-/* Toggle disable */
 app.post('/api/users/:username/disable', auth, adminOnly, async (req, res) => {
   await db.query(
     'UPDATE users SET disabled = NOT disabled, session_id = NULL WHERE username=$1',
@@ -445,14 +461,15 @@ app.post('/api/users/:username/disable', auth, adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* Delete */
 app.delete('/api/users/:username', auth, adminOnly, async (req, res) => {
   await db.query('DELETE FROM users WHERE username=$1', [req.params.username]);
   await log(req.user.username, 'USER_DELETED', req.params.username, 'danger');
   res.json({ ok: true });
 });
 
-/* ============ AUDIT ============ */
+/* ============================================================
+   AUDIT
+   ============================================================ */
 app.get('/api/audit', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200');
   res.json(rows);
@@ -463,7 +480,9 @@ app.delete('/api/audit', auth, adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ============ PRICES ============ */
+/* ============================================================
+   PRICES
+   ============================================================ */
 app.get('/api/prices', auth, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM prices');
   const out = {};
@@ -478,69 +497,46 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ============ STOCK LIST ============ */
+/* ============================================================
+   STOCK LIST + SCREENER (all logic lives in Angel_REST.js)
+   ============================================================ */
 app.get('/api/stocks', auth, (req, res) => {
   res.json(STOCKS);
 });
 
-/* ============ BROKER: PLATFORM LOGIN ============ */
-app.post('/api/broker/login', auth, async (req, res) => {
-  const { clientId, mpin, totp } = req.body;
-  const apiKey = process.env.ANGEL_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'Platform API key not set' });
-  if (!clientId || !mpin || !totp) return res.status(400).json({ error: 'Missing fields' });
-
-  try {
-    const r = await angelLogin({ apiKey, clientId, mpin, totp });
-    if (!r.status || !r.data?.jwtToken) {
-      return res.status(401).json({ error: r.message || 'Login failed' });
-    }
-    platformTokens[req.user.username] = r.data.jwtToken;
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+app.get('/api/broker/status', auth, (req, res) => {
+  res.json(getSessionStatus());
 });
 
-/* ============ SCREENER: 9:15 CANDLES ============ */
 app.post('/api/screener/fetch-915', auth, async (req, res) => {
-  const jwtToken = platformTokens[req.user.username];
-  if (!jwtToken) return res.status(401).json({ error: 'Connect broker first' });
-
-  const apiKey = process.env.ANGEL_API_KEY;
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) {
     return res.status(400).json({ error: 'tokens array required' });
   }
-
   const today = new Date().toISOString().split('T')[0];
-  const from = `${today} 09:15`;
-  const to = `${today} 09:16`;   // 9:16 workaround for Angel One 9:15 bug
-
-  const results = [];
-  for (const token of tokens) {
-    try {
-      const r = await angelCandles({
-        apiKey, jwtToken,
-        exchange: 'NSE',
-        token: String(token),
-        interval: 'FIFTEEN_MINUTE',
-        from, to
-      });
-      if (r.status && r.data?.length) {
-        results.push({ token: String(token), candle: r.data[0] });
-      } else {
-        results.push({ token: String(token), error: 'no data' });
-      }
-    } catch (e) {
-      results.push({ token: String(token), error: e.message });
-    }
-    await new Promise(r => setTimeout(r, 400));  // 3 req/sec rate limit
-  }
-
+  const results = await getCandlesForTokens(tokens, today);
   res.json({ ok: true, count: results.length, results });
 });
 
-/* ============ START ============ */
+app.post('/api/screener/ltp', auth, async (req, res) => {
+  const { tokens } = req.body;
+  if (!Array.isArray(tokens) || !tokens.length) {
+    return res.status(400).json({ error: 'tokens array required' });
+  }
+  const results = await getLTPForTokens(tokens);
+  res.json({ ok: true, count: results.length, results });
+});
+
+/* ============================================================
+   START
+   ============================================================ */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server on port ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`✅ Server on port ${PORT}`);
+  try {
+    await loginPlatform();
+    console.log('✅ Angel One platform session started');
+  } catch (e) {
+    console.error('⚠️ Angel One login failed at startup:', e.message);
+  }
+});

@@ -11,6 +11,7 @@ import { dirname, join } from 'path';
 import {
   loginPlatform,
   getCandlesForTokens,
+  getCachedCandles,
   getLTPForTokens,
   getSessionStatus
 } from './brokers/angelone/Angel_REST.js';
@@ -38,7 +39,6 @@ const STOCKS = JSON.parse(
 
 /* ============================================================
    SCREENER STATE MACHINE
-   Tracks background fetch of 500 stocks
    ============================================================ */
 const screenerState = {
   status: 'idle',       // 'idle' | 'fetching' | 'ready' | 'error'
@@ -49,7 +49,6 @@ const screenerState = {
   error: null
 };
 
-/* ---- IST time helpers (server may run in UTC) ---- */
 function getIST() {
   return new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 }
@@ -58,32 +57,20 @@ function formatDate(d) {
   return d.toISOString().split('T')[0];
 }
 
-/* Returns the date whose 9:15 candle we should show right now */
 function getTargetDate() {
   const ist = getIST();
-  const dow = ist.getUTCDay();  // 0=Sun, 6=Sat
+  const dow = ist.getUTCDay();
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
 
-  if (dow === 0) return formatDate(new Date(ist.getTime() - 2 * 864e5)); // Sun → Fri
-  if (dow === 6) return formatDate(new Date(ist.getTime() - 1 * 864e5)); // Sat → Fri
-  if (mins < 570) {                                                       // Weekday < 9:30
-    if (dow === 1) return formatDate(new Date(ist.getTime() - 3 * 864e5)); // Mon → Fri
+  if (dow === 0) return formatDate(new Date(ist.getTime() - 2 * 864e5));
+  if (dow === 6) return formatDate(new Date(ist.getTime() - 1 * 864e5));
+  if (mins < 570) {
+    if (dow === 1) return formatDate(new Date(ist.getTime() - 3 * 864e5));
     return formatDate(new Date(ist.getTime() - 1 * 864e5));
   }
   return formatDate(ist);
 }
 
-/* Returns true if today's 9:15 candle should be fully formed (post 9:30) */
-function isTodayReadyForFetch(targetDate) {
-  const ist = getIST();
-  const dow = ist.getUTCDay();
-  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  if (dow === 0 || dow === 6) return true;    // weekend — data is from last Friday, already formed
-  if (mins < 570) return true;                // before market open — data is from previous day
-  return true;                                // after 9:30 — today's candle frozen
-}
-
-/* ---- Background fetch job ---- */
 async function runScreenerFetch(date) {
   screenerState.status = 'fetching';
   screenerState.date = date;
@@ -92,7 +79,7 @@ async function runScreenerFetch(date) {
   screenerState.error = null;
 
   const BATCH = 20;
-  const DELAY = 7000;  // 7 sec between batches (rate limit)
+  const DELAY = 7000;
   const tokens = STOCKS.map(s => s.token);
 
   try {
@@ -111,7 +98,6 @@ async function runScreenerFetch(date) {
   }
 }
 
-/* ---- Auto-reset daily at midnight IST ---- */
 let lastResetDate = formatDate(getIST());
 setInterval(() => {
   const today = formatDate(getIST());
@@ -150,7 +136,6 @@ async function log(actor, action, details = '', level = 'info') {
   } catch {}
 }
 
-/* ---- Username/password generation ---- */
 async function generateUsername(fullName, mobile) {
   const first = (fullName || '').trim().split(/\s+/)[0].toLowerCase().replace(/[^a-z0-9]/g, '');
   const last4 = (mobile || '').replace(/\D/g, '').slice(-4);
@@ -564,16 +549,12 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SCREENER (state machine + data)
+   SCREENER
    ============================================================ */
-
-/* Stock list */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
 
-/* Broker session status */
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
 
-/* Current screener state — client polls this */
 app.get('/api/screener/status', auth, (req, res) => {
   const targetDate = getTargetDate();
   res.json({
@@ -587,45 +568,35 @@ app.get('/api/screener/status', auth, (req, res) => {
   });
 });
 
-/* Ensure data is being fetched — starts background job if needed */
 app.post('/api/screener/ensure', auth, async (req, res) => {
   const targetDate = getTargetDate();
 
-  // Already fetching → return progress
   if (screenerState.status === 'fetching') {
     return res.json({ status: 'fetching', progress: screenerState.progress, total: screenerState.total });
   }
 
-  // Ready for the right date → return cached
   if (screenerState.status === 'ready' && screenerState.date === targetDate) {
     return res.json({ status: 'ready', date: targetDate });
   }
 
-  // Otherwise → start fresh fetch
   screenerState.status = 'idle';
   screenerState.date = null;
-  runScreenerFetch(targetDate);   // fire-and-forget
+  runScreenerFetch(targetDate);
   res.json({ status: 'fetching', progress: 0, total: screenerState.total, date: targetDate });
 });
 
-/* Return all cached candles for the current target date */
-app.get('/api/screener/data', auth, async (req, res) => {
+/* Fast — returns cached candles instantly, no API calls */
+app.get('/api/screener/data', auth, (req, res) => {
   const targetDate = getTargetDate();
-  const out = [];
-  for (const s of STOCKS) {
-    out.push({ token: s.token, sym: s.sym });
-  }
-  // Reuse cached candles from Angel_REST (via getCandlesForTokens which is cache-first)
-  const candles = await getCandlesForTokens(STOCKS.map(s => s.token), targetDate);
+  const candles = getCachedCandles(STOCKS.map(s => s.token), targetDate);
   res.json({
     ok: true,
     date: targetDate,
     results: candles,
-    stocks: out
+    stocks: STOCKS
   });
 });
 
-/* LTP batch */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) {

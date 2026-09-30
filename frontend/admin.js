@@ -1,16 +1,13 @@
 /* ============================================================
    ADMIN.JS
-   Config, API client, TOTP, Auth flow, Forgot password,
-   Admin panel, Profile, WhatsApp sharing
+   Config, API, TOTP, Auth, Admin panel, Profile, WhatsApp, Modals
    ============================================================ */
 
-
 /* ============================================================
-   SECTION 1 — CONFIGURATION
+   SECTION 1 — CONFIG
    ============================================================ */
 const API = 'https://tradeedge-a5y0.onrender.com';
 const APP_URL = 'https://yousuf408.github.io/Tradeedge/frontend/';
-
 const GREEN = 'var(--success)';
 const RED = 'var(--danger)';
 
@@ -26,7 +23,7 @@ const DURATIONS = {
 
 
 /* ============================================================
-   SECTION 2 — GLOBAL STATE
+   SECTION 2 — STATE
    ============================================================ */
 let currentUser = null;
 let impersonating = false;
@@ -34,6 +31,8 @@ let impersonateBackup = null;
 let pendingLoginUser = null;
 let pendingForgotUser = null;
 let editingUsername = null;
+let renewingUsername = null;
+let renewDelta = 0;
 
 const DOM = {
   pages: document.querySelectorAll('.page'),
@@ -47,17 +46,11 @@ const DOM = {
 /* ============================================================
    SECTION 3 — API CLIENT
    ============================================================ */
-function getToken() { return localStorage.getItem('ta_token'); }
-function setToken(t) { localStorage.setItem('ta_token', t); }
-function getUser() {
-  try { return JSON.parse(localStorage.getItem('ta_user') || 'null'); }
-  catch { return null; }
-}
-function setUser(u) { localStorage.setItem('ta_user', JSON.stringify(u)); }
-function clearSession() {
-  localStorage.removeItem('ta_token');
-  localStorage.removeItem('ta_user');
-}
+const getToken = () => localStorage.getItem('ta_token');
+const setToken = t => localStorage.setItem('ta_token', t);
+const getUser = () => { try { return JSON.parse(localStorage.getItem('ta_user') || 'null'); } catch { return null; } };
+const setUser = u => localStorage.setItem('ta_user', JSON.stringify(u));
+const clearSession = () => { localStorage.removeItem('ta_token'); localStorage.removeItem('ta_user'); };
 
 async function api(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
@@ -81,14 +74,6 @@ async function api(path, opts = {}) {
    ============================================================ */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
-function base32Encode(bytes) {
-  let bits = '', out = '';
-  for (const b of bytes) bits += b.toString(2).padStart(8, '0');
-  for (let i = 0; i + 5 <= bits.length; i += 5)
-    out += B32[parseInt(bits.slice(i, i + 5), 2)];
-  return out;
-}
-
 function base32Decode(str) {
   str = str.toUpperCase().replace(/=+$/, '');
   let bits = '';
@@ -98,8 +83,7 @@ function base32Decode(str) {
     bits += v.toString(2).padStart(5, '0');
   }
   const bytes = [];
-  for (let i = 0; i + 8 <= bits.length; i += 8)
-    bytes.push(parseInt(bits.slice(i, i + 8), 2));
+  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.slice(i, i + 8), 2));
   return new Uint8Array(bytes);
 }
 
@@ -107,9 +91,7 @@ async function totpAt(secret, counter) {
   const key = base32Decode(secret);
   const buf = new ArrayBuffer(8);
   new DataView(buf).setUint32(4, counter, false);
-  const ck = await crypto.subtle.importKey(
-    'raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']
-  );
+  const ck = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
   const sig = new Uint8Array(await crypto.subtle.sign('HMAC', ck, buf));
   const off = sig[sig.length - 1] & 0x0f;
   const code = ((sig[off] & 0x7f) << 24) | ((sig[off+1] & 0xff) << 16)
@@ -128,13 +110,15 @@ async function verifyTotp(secret, input) {
 function generateSecret() {
   const bytes = new Uint8Array(20);
   crypto.getRandomValues(bytes);
-  return base32Encode(bytes);
+  let bits = '', out = '';
+  for (const b of bytes) bits += b.toString(2).padStart(8, '0');
+  for (let i = 0; i + 5 <= bits.length; i += 5) out += B32[parseInt(bits.slice(i, i + 5), 2)];
+  return out;
 }
 
 
 /* ============================================================
-   SECTION 5 — CREDENTIALS CACHE (for WhatsApp sharing)
-   Stores plain password for 24h after create/reset
+   SECTION 5 — CREDENTIALS CACHE (24h, for WhatsApp sharing)
    ============================================================ */
 function cacheCredentials(username, password, name, mobile) {
   let cache = {};
@@ -173,7 +157,28 @@ function hideToast() {
 
 
 /* ============================================================
-   SECTION 7 — NAVIGATION
+   SECTION 7 — MODAL HELPERS (open/close + Escape key)
+   ============================================================ */
+function closeAllModals() {
+  document.querySelectorAll('.modal-overlay').forEach(m => m.classList.remove('open'));
+  document.getElementById('avatarMenu')?.classList.remove('open');
+}
+
+// ESC closes any open modal
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeAllModals();
+});
+
+// Click outside the modal box closes it
+document.querySelectorAll('.modal-overlay').forEach(overlay => {
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) closeAllModals();
+  });
+});
+
+
+/* ============================================================
+   SECTION 8 — NAVIGATION
    ============================================================ */
 function navigateTo(pageId) {
   DOM.navLinks.forEach(a => a.classList.toggle('active', a.dataset.page === pageId));
@@ -196,7 +201,7 @@ DOM.navLinks.forEach(link => link.addEventListener('click', e => {
 
 
 /* ============================================================
-   SECTION 8 — AVATAR / USER PILL MENU
+   SECTION 9 — AVATAR MENU
    ============================================================ */
 function toggleAvatarMenu(e) {
   e.stopPropagation();
@@ -208,20 +213,16 @@ document.addEventListener('click', () =>
 
 
 /* ============================================================
-   SECTION 9 — CHANGE PASSWORD
+   SECTION 10 — CHANGE PASSWORD
    ============================================================ */
 function openChangePassword() {
-  document.getElementById('avatarMenu').classList.remove('open');
+  closeAllModals();
   document.getElementById('pwdCurrent').value = '';
   document.getElementById('pwdNew').value = '';
   document.getElementById('pwdConfirm').value = '';
   document.getElementById('pwdError').textContent = '';
   document.getElementById('pwdModal').classList.add('open');
   setTimeout(() => document.getElementById('pwdCurrent').focus(), 100);
-}
-
-function closeChangePassword() {
-  document.getElementById('pwdModal').classList.remove('open');
 }
 
 async function savePassword() {
@@ -232,14 +233,9 @@ async function savePassword() {
   err.textContent = '';
 
   if (!cur || !nw || !cf) { err.textContent = 'All fields required'; return; }
-  if (nw.length < 6)      { err.textContent = 'New password must be 6+ characters'; return; }
-  if (nw !== cf)          { err.textContent = 'New passwords do not match'; return; }
-  if (nw === cur)         { err.textContent = 'New password must differ from current'; return; }
-
-  const btn = document.querySelector('#pwdModal .btn-primary');
-  const orig = btn.textContent;
-  btn.textContent = 'Updating...';
-  btn.disabled = true;
+  if (nw.length < 6)      { err.textContent = 'Password must be 6+ characters'; return; }
+  if (nw !== cf)          { err.textContent = 'Passwords do not match'; return; }
+  if (nw === cur)         { err.textContent = 'Must differ from current'; return; }
 
   try {
     const r = await api('/api/change-password', {
@@ -251,22 +247,19 @@ async function savePassword() {
       const u = getUser();
       if (u) { u.sessionId = r.sessionId; setUser(u); }
     }
-    closeChangePassword();
+    closeAllModals();
     showToast('✅ Updated', 'Password changed. Other devices logged out.');
   } catch (e) {
     err.textContent = e.message;
-  } finally {
-    btn.textContent = orig;
-    btn.disabled = false;
   }
 }
 
 
 /* ============================================================
-   SECTION 10 — MY PROFILE (user edits own name/mobile)
+   SECTION 11 — MY PROFILE
    ============================================================ */
 function openMyProfile() {
-  document.getElementById('avatarMenu').classList.remove('open');
+  closeAllModals();
   navigateTo('settings');
   setTimeout(() => document.getElementById('profileName')?.focus(), 200);
 }
@@ -314,7 +307,7 @@ function updateUserPill() {
 
 
 /* ============================================================
-   SECTION 11 — LOGIN FLOW
+   SECTION 12 — LOGIN FLOW
    ============================================================ */
 function showLoginStep(step) {
   document.getElementById('loginStep1').style.display = step === 1 ? 'block' : 'none';
@@ -329,7 +322,7 @@ async function doLogin() {
   const password = document.getElementById('authPass').value;
   const err = document.getElementById('authError');
   err.textContent = '';
-  if (!input || !password) { err.textContent = 'Enter username and password'; return; }
+  if (!input || !password) { err.textContent = 'Enter credentials'; return; }
 
   try {
     const r = await api('/api/login', {
@@ -356,10 +349,7 @@ async function doLogin() {
       setTimeout(() => document.getElementById('authTotp').focus(), 100);
     }
   } catch (e) {
-    if (e.data?.expired) {
-      showExpired({ name: input, expiresAt: e.data.expiresAt });
-      return;
-    }
+    if (e.data?.expired) { showExpired({ name: input, expiresAt: e.data.expiresAt }); return; }
     err.textContent = e.message;
   }
 }
@@ -380,7 +370,7 @@ async function confirmSetup() {
   const err = document.getElementById('setupError');
   if (!/^\d{6}$/.test(code)) { err.textContent = 'Enter 6 digits'; return; }
   if (!await verifyTotp(pendingLoginUser.newSecret, code)) {
-    err.textContent = 'Code did not match. Check your app and try again.';
+    err.textContent = 'Code did not match. Check your app.';
     return;
   }
   await completeLogin({
@@ -405,8 +395,7 @@ async function completeLogin(payload) {
     if (r.user.role !== 'admin' && r.user.expiresAt) {
       const dl = Math.ceil((new Date(r.user.expiresAt) - Date.now()) / 86400000);
       if (dl <= 7) {
-        setTimeout(() =>
-          showToast('⚠️ Expiring Soon', `Expires in ${dl} day${dl === 1 ? '' : 's'}`), 500);
+        setTimeout(() => showToast('⚠️ Expiring Soon', `Expires in ${dl} day${dl === 1 ? '' : 's'}`), 500);
       }
     }
   } catch (e) {
@@ -423,7 +412,7 @@ function cancelTotp() {
 
 
 /* ============================================================
-   SECTION 12 — FORGOT PASSWORD
+   SECTION 13 — FORGOT PASSWORD
    ============================================================ */
 function showForgotStep(step) {
   document.getElementById('loginStep1').style.display = 'none';
@@ -431,7 +420,6 @@ function showForgotStep(step) {
   document.getElementById('loginStep2Setup').style.display = 'none';
   document.getElementById('forgotStep1').style.display = step === 1 ? 'block' : 'none';
   document.getElementById('forgotStep2').style.display = step === 2 ? 'block' : 'none';
-
   if (step === 1) {
     document.getElementById('forgotError').textContent = '';
     setTimeout(() => document.getElementById('forgotInput').focus(), 100);
@@ -452,8 +440,7 @@ async function forgotCheck() {
       body: JSON.stringify({ input })
     });
     pendingForgotUser = { input, username: r.username, name: r.name };
-    document.getElementById('forgotUserLabel').textContent =
-      `Reset password for ${r.name} (${r.username})`;
+    document.getElementById('forgotUserLabel').textContent = `Reset for ${r.name} (${r.username})`;
     document.getElementById('forgotTotp').value = '';
     document.getElementById('forgotNew').value = '';
     document.getElementById('forgotConfirm').value = '';
@@ -473,12 +460,7 @@ async function forgotReset() {
   if (!/^\d{6}$/.test(totp)) { err.textContent = 'Enter 6-digit code'; return; }
   if (nw.length < 6)         { err.textContent = 'Password must be 6+ characters'; return; }
   if (nw !== cf)             { err.textContent = 'Passwords do not match'; return; }
-  if (!pendingForgotUser)    { err.textContent = 'Session lost, please retry'; return; }
-
-  const btn = document.querySelector('#forgotStep2 .btn-primary');
-  const orig = btn.textContent;
-  btn.textContent = 'Resetting...';
-  btn.disabled = true;
+  if (!pendingForgotUser)    { err.textContent = 'Session lost, retry'; return; }
 
   try {
     await api('/api/forgot-password/reset', {
@@ -496,31 +478,25 @@ async function forgotReset() {
     showToast('✅ Password Reset', 'Login with your new password');
   } catch (e) {
     err.textContent = e.message;
-  } finally {
-    btn.textContent = orig;
-    btn.disabled = false;
   }
 }
 
 
 /* ============================================================
-   SECTION 13 — LOGOUT & SCREEN SWITCHING
+   SECTION 14 — LOGOUT & SCREENS
    ============================================================ */
 function logout() {
   const token = getToken();
   if (token) api('/api/logout', { method: 'POST' }).catch(() => {});
-
   currentUser = null;
   impersonating = false;
   impersonateBackup = null;
   clearSession();
-
   document.body.classList.remove('impersonating');
   document.getElementById('impersonateBanner').style.display = 'none';
   document.getElementById('authUser').value = '';
   document.getElementById('authPass').value = '';
   document.getElementById('authError').textContent = '';
-
   showLoginStep(1);
   navigateTo('screener');
   showLogin();
@@ -562,22 +538,17 @@ function showApp() {
   }
 
   if (currentUser.role === 'admin' && !impersonating) {
-    renderKPIs();
-    renderUsers();
-    loadPrices();
-    renderAudit();
+    renderKPIs(); renderUsers(); loadPrices(); renderAudit();
   }
-
   navigateTo('screener');
 
   if (!window._expiryTimer) {
     window._expiryTimer = setInterval(async () => {
       if (!currentUser || impersonating) return;
-      try {
-        await api('/api/session-check');
-      } catch (e) {
+      try { await api('/api/session-check'); }
+      catch (e) {
         if (e.status === 401) {
-          showToast('⛔ Session Ended', e.message || 'Logged in on another device');
+          showToast('⛔ Session Ended', e.message || 'Logged in elsewhere');
           setTimeout(logout, 1500);
         }
       }
@@ -587,7 +558,7 @@ function showApp() {
 
 
 /* ============================================================
-   SECTION 14 — TABS (admin panel)
+   SECTION 15 — TABS
    ============================================================ */
 function switchTab(name, e) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -600,7 +571,7 @@ function switchTab(name, e) {
 
 
 /* ============================================================
-   SECTION 15 — ADMIN: KPIs
+   SECTION 16 — ADMIN: KPIs
    ============================================================ */
 async function renderKPIs() {
   try {
@@ -615,9 +586,7 @@ async function renderKPIs() {
       const d = Math.ceil((new Date(u.expiresAt) - Date.now()) / 86400000);
       return d > 0 && d <= 7;
     }).length;
-    const expired = users.filter(u =>
-      u.expiresAt && new Date(u.expiresAt) < new Date()
-    ).length;
+    const expired = users.filter(u => u.expiresAt && new Date(u.expiresAt) < new Date()).length;
     const mrr = users
       .filter(u => u.expiresAt && new Date(u.expiresAt) > new Date() && !u.disabled)
       .reduce((s, u) => s + (prices[u.plan] || 0), 0);
@@ -633,7 +602,7 @@ async function renderKPIs() {
 
 
 /* ============================================================
-   SECTION 16 — ADMIN: USERS TABLE
+   SECTION 17 — ADMIN: USERS TABLE
    ============================================================ */
 async function renderUsers() {
   const search = (document.getElementById('userSearch')?.value || '').toLowerCase();
@@ -649,17 +618,12 @@ async function renderUsers() {
         (u.mobile || '').includes(search)
       );
     }
-    if (filter === 'active')
-      list = list.filter(u => u.role !== 'admin' && !u.disabled && u.expiresAt && new Date(u.expiresAt) > new Date());
-    if (filter === 'expiring')
-      list = list.filter(u => u.expiresAt && (() => {
-        const d = Math.ceil((new Date(u.expiresAt) - Date.now()) / 86400000);
-        return d > 0 && d <= 7;
-      })());
-    if (filter === 'expired')
-      list = list.filter(u => u.role !== 'admin' && u.expiresAt && new Date(u.expiresAt) < new Date());
-    if (filter === 'disabled')
-      list = list.filter(u => u.disabled);
+    const now = Date.now();
+    const dleft = e => e ? Math.ceil((new Date(e) - now) / 86400000) : Infinity;
+    if (filter === 'active')   list = list.filter(u => u.role !== 'admin' && !u.disabled && dleft(u.expiresAt) > 0);
+    if (filter === 'expiring') list = list.filter(u => { const d = dleft(u.expiresAt); return d > 0 && d <= 7; });
+    if (filter === 'expired')  list = list.filter(u => u.role !== 'admin' && dleft(u.expiresAt) <= 0);
+    if (filter === 'disabled') list = list.filter(u => u.disabled);
 
     if (!list.length) {
       document.getElementById('usersTable').innerHTML =
@@ -668,9 +632,7 @@ async function renderUsers() {
     }
 
     const rows = list.map(u => {
-      const dl = u.expiresAt
-        ? Math.ceil((new Date(u.expiresAt) - Date.now()) / 86400000)
-        : Infinity;
+      const dl = dleft(u.expiresAt);
       let daysText, color;
       if (u.role === 'admin') { daysText = '—';         color = 'var(--text-muted)'; }
       else if (u.disabled)    { daysText = 'Disabled';  color = 'var(--text-muted)'; }
@@ -680,8 +642,6 @@ async function renderUsers() {
       else                    { daysText = `${dl} days`; color = 'var(--success)'; }
 
       const isAdmin = u.role === 'admin';
-      const hasWa = !!getCachedCredentials(u.username);
-
       return `<tr class="${u.disabled ? 'row-disabled' : ''}">
         <td>
           <strong>${u.name}</strong>
@@ -696,10 +656,10 @@ async function renderUsers() {
           ${isAdmin ? '<span style="color:var(--text-muted);font-size:11px">—</span>' : `
             <button class="btn btn-outline btn-sm" onclick="impersonate('${u.username}')">👁️ View</button>
             <button class="btn btn-outline btn-sm" onclick="openEditUser('${u.username}')">✏️ Edit</button>
-            <button class="btn btn-primary btn-sm" onclick="renewUser('${u.username}')">🔄 Renew</button>
+            <button class="btn btn-primary btn-sm" onclick="openRenew('${u.username}')">🔄 Renew</button>
             <button class="btn btn-warn btn-sm" onclick="resetPassword('${u.username}')">🔑 Reset</button>
             <button class="btn btn-outline btn-sm" onclick="toggleDisable('${u.username}')">${u.disabled ? '✅ Enable' : '⏸️ Disable'}</button>
-            <button class="btn btn-success btn-sm" onclick="openWhatsApp('${u.username}')" title="${hasWa ? 'Send credentials via WhatsApp' : 'Reset password first'}">📱 WhatsApp</button>
+            <button class="btn btn-success btn-sm" onclick="openWhatsApp('${u.username}')">📱 WhatsApp</button>
             <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.username}')">🗑️ Delete</button>`}
         </td>
       </tr>`;
@@ -714,14 +674,13 @@ async function renderUsers() {
         <tbody>${rows}</tbody>
       </table>`;
   } catch (e) {
-    document.getElementById('usersTable').innerHTML =
-      `<div style="color:var(--danger)">${e.message}</div>`;
+    document.getElementById('usersTable').innerHTML = `<div style="color:var(--danger)">${e.message}</div>`;
   }
 }
 
 
 /* ============================================================
-   SECTION 17 — ADMIN: CREATE USER (auto-credentials)
+   SECTION 18 — ADMIN: CREATE USER
    ============================================================ */
 async function addUser() {
   const name = document.getElementById('newName').value.trim();
@@ -729,14 +688,8 @@ async function addUser() {
   const plan = document.getElementById('newPlan').value;
   const durKey = document.getElementById('newDuration').value;
 
-  if (!name || !mobile) {
-    showToast('⚠️ Missing Fields', 'Name and mobile required');
-    return;
-  }
-  if (mobile.length < 10) {
-    showToast('⚠️ Invalid Mobile', 'Enter 10-digit mobile');
-    return;
-  }
+  if (!name || !mobile) { showToast('⚠️ Missing Fields', 'Name and mobile required'); return; }
+  if (mobile.length < 10) { showToast('⚠️ Invalid Mobile', 'Enter 10-digit mobile'); return; }
 
   const days = DURATIONS[durKey].days;
   const d = new Date(); d.setDate(d.getDate() + days);
@@ -747,20 +700,12 @@ async function addUser() {
       method: 'POST',
       body: JSON.stringify({ name, mobile, plan, expiresAt })
     });
-
     cacheCredentials(r.username, r.password, name, mobile);
-
     document.getElementById('newName').value = '';
     document.getElementById('newMobile').value = '';
-
     renderUsers();
     renderKPIs();
 
-    // Show credentials in a toast (longer duration)
-    showToast('✅ User Created',
-      `Username: ${r.username}   Password: ${r.password}`);
-
-    // Show a small confirmation panel below the form
     const box = document.getElementById('tab-users');
     let banner = document.getElementById('credBanner');
     if (!banner) {
@@ -787,7 +732,7 @@ async function addUser() {
 
 
 /* ============================================================
-   SECTION 18 — ADMIN: EDIT USER
+   SECTION 19 — ADMIN: EDIT USER
    ============================================================ */
 async function openEditUser(username) {
   try {
@@ -827,11 +772,6 @@ async function saveEditUser() {
     err.textContent = 'Mobile must be 10 digits'; return;
   }
 
-  const btn = document.querySelector('#editUserModal .btn-primary');
-  const orig = btn.textContent;
-  btn.textContent = 'Saving...';
-  btn.disabled = true;
-
   try {
     await api(`/api/users/${editingUsername}`, {
       method: 'PUT',
@@ -843,49 +783,134 @@ async function saveEditUser() {
     showToast('✅ Saved', 'User updated');
   } catch (e) {
     err.textContent = e.message;
-  } finally {
-    btn.textContent = orig;
-    btn.disabled = false;
   }
 }
 
 
 /* ============================================================
-   SECTION 19 — ADMIN: RENEW / DELETE / DISABLE / RESET
+   SECTION 20 — ADMIN: RENEW MODAL (add / reduce / custom date)
    ============================================================ */
-async function renewUser(username) {
-  const choice = prompt(
-    `Renew "${username}":\n1. 5 days\n2. 7 days\n3. 1 month\n4. 2 months\n` +
-    `5. 3 months\n6. 6 months\n7. 1 year\n\nEnter 1-7:`
-  );
-  if (!choice) return;
-  const map = { '1': 5, '2': 7, '3': 30, '4': 60, '5': 90, '6': 180, '7': 365 };
-  const days = map[choice.trim()];
-  if (!days) { showToast('⚠️ Invalid', 'Enter 1-7'); return; }
-
+async function openRenew(username) {
   try {
-    await api(`/api/users/${username}/renew`, {
-      method: 'POST',
-      body: JSON.stringify({ days })
-    });
-    renderUsers();
-    renderKPIs();
-    showToast('✅ Renewed', `+${days} days`);
+    const all = await api('/api/users');
+    const u = all.find(x => x.username === username);
+    if (!u) return;
+
+    renewingUsername = username;
+    renewDelta = 0;
+    document.getElementById('renewSub').textContent = `Adjusting ${u.name} (${u.username})`;
+    document.getElementById('renewCurrent').textContent =
+      u.expiresAt ? String(u.expiresAt).slice(0, 10) : 'No expiry';
+
+    // Reset UI
+    document.querySelectorAll('#renewAddChips .chip, #renewSubChips .chip').forEach(c => c.classList.remove('active'));
+    document.getElementById('renewCustomDate').value = '';
+    document.getElementById('renewError').textContent = '';
+
+    // Base current expiry for preview
+    window._renewBase = u.expiresAt ? new Date(u.expiresAt) : new Date();
+    updateRenewPreview();
+
+    document.getElementById('renewModal').classList.add('open');
   } catch (e) {
     showToast('⚠️ Error', e.message);
   }
 }
 
+function closeRenew() {
+  document.getElementById('renewModal').classList.remove('open');
+  renewingUsername = null;
+  renewDelta = 0;
+}
+
+// Chip clicks
+document.querySelectorAll('#renewAddChips .chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    const days = +chip.dataset.days;
+    renewDelta += days;
+    chip.classList.add('active');
+    document.getElementById('renewCustomDate').value = '';
+    updateRenewPreview();
+  });
+});
+
+document.querySelectorAll('#renewSubChips .chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    const days = +chip.dataset.days;
+    renewDelta -= days;
+    chip.classList.add('active');
+    document.getElementById('renewCustomDate').value = '';
+    updateRenewPreview();
+  });
+});
+
+document.getElementById('renewCustomDate')?.addEventListener('change', () => {
+  document.querySelectorAll('#renewAddChips .chip, #renewSubChips .chip').forEach(c => c.classList.remove('active'));
+  renewDelta = 0;
+  updateRenewPreview();
+});
+
+function updateRenewPreview() {
+  const custom = document.getElementById('renewCustomDate').value;
+  const preview = document.getElementById('renewPreview');
+
+  if (custom) {
+    preview.textContent = custom;
+    return;
+  }
+  if (!renewDelta) {
+    preview.textContent = 'No change';
+    return;
+  }
+  const base = new Date(window._renewBase);
+  base.setDate(base.getDate() + renewDelta);
+  preview.textContent = base.toISOString().split('T')[0];
+}
+
+async function saveRenew() {
+  if (!renewingUsername) return;
+  const err = document.getElementById('renewError');
+  const custom = document.getElementById('renewCustomDate').value;
+  err.textContent = '';
+
+  if (!custom && renewDelta === 0) {
+    err.textContent = 'Pick a duration or date';
+    return;
+  }
+
+  try {
+    if (custom) {
+      await api(`/api/users/${renewingUsername}/set-expiry`, {
+        method: 'POST',
+        body: JSON.stringify({ expiresAt: custom })
+      });
+      showToast('✅ Updated', `Expiry set to ${custom}`);
+    } else {
+      await api(`/api/users/${renewingUsername}/renew`, {
+        method: 'POST',
+        body: JSON.stringify({ days: renewDelta })
+      });
+      showToast('✅ Updated', `${renewDelta > 0 ? '+' : ''}${renewDelta} days`);
+    }
+    closeRenew();
+    renderUsers();
+    renderKPIs();
+  } catch (e) {
+    err.textContent = e.message;
+  }
+}
+
+
+/* ============================================================
+   SECTION 21 — ADMIN: DELETE / DISABLE / RESET
+   ============================================================ */
 async function deleteUser(username) {
   if (!confirm(`Delete user "${username}"?`)) return;
   try {
     await api(`/api/users/${username}`, { method: 'DELETE' });
-    renderUsers();
-    renderKPIs();
+    renderUsers(); renderKPIs();
     showToast('🗑️ Deleted', username);
-  } catch (e) {
-    showToast('⚠️ Error', e.message);
-  }
+  } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
 async function toggleDisable(username) {
@@ -893,41 +918,46 @@ async function toggleDisable(username) {
     await api(`/api/users/${username}/disable`, { method: 'POST' });
     renderUsers();
     showToast('✅ Done', 'Status updated');
-  } catch (e) {
-    showToast('⚠️ Error', e.message);
-  }
+  } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
 async function resetPassword(username) {
-  if (!confirm(`Reset password + 2FA for "${username}"?\nThe new password will follow the standard format.`)) return;
+  if (!confirm(`Reset password + 2FA for "${username}"?`)) return;
   try {
     const r = await api(`/api/users/${username}/reset`, { method: 'POST' });
     const cred = getCachedCredentials(username);
-    const name = cred?.name || username;
-    const mobile = cred?.mobile || '';
-    cacheCredentials(username, r.temp, name, mobile);
+    cacheCredentials(username, r.temp, cred?.name || username, cred?.mobile || '');
     renderUsers();
     showToast('🔑 New Password', `${username}: ${r.temp}`);
-  } catch (e) {
-    showToast('⚠️ Error', e.message);
-  }
+  } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
 
 /* ============================================================
-   SECTION 20 — WHATSAPP SHARING
+   SECTION 22 — WHATSAPP SHARING (auto-reset if no cache)
    ============================================================ */
-function openWhatsApp(username) {
-  const cred = getCachedCredentials(username);
+async function openWhatsApp(username) {
+  let cred = getCachedCredentials(username);
+
+  // No cached password → offer to reset now
   if (!cred || !cred.password) {
-    showToast('⚠️ No Password', 'Reset password first, then share');
-    return;
+    if (!confirm(`No password cached for "${username}".\n\nReset password now and share?`)) return;
+    try {
+      const r = await api(`/api/users/${username}/reset`, { method: 'POST' });
+      const all = await api('/api/users');
+      const u = all.find(x => x.username === username);
+      cacheCredentials(username, r.temp, u?.name || username, u?.mobile || '');
+      cred = { password: r.temp, name: u?.name || username, mobile: u?.mobile || '' };
+      renderUsers();
+      showToast('🔑 Reset Done', `New password: ${r.temp}`);
+    } catch (e) {
+      showToast('⚠️ Error', e.message);
+      return;
+    }
   }
+
   const mobile = (cred.mobile || '').replace(/\D/g, '');
-  if (mobile.length < 10) {
-    showToast('⚠️ No Mobile', 'User has no mobile number');
-    return;
-  }
+  if (mobile.length < 10) { showToast('⚠️ No Mobile', 'User has no mobile number'); return; }
 
   const msg =
 `Hi ${cred.name}, your TradeAlgo Pro account is ready!
@@ -938,23 +968,20 @@ Password: ${cred.password}
 
 Please change your password after your first login.`;
 
-  const url = `https://wa.me/91${mobile}?text=${encodeURIComponent(msg)}`;
-  window.open(url, '_blank');
+  window.open(`https://wa.me/91${mobile}?text=${encodeURIComponent(msg)}`, '_blank');
 }
 
 
 /* ============================================================
-   SECTION 21 — ADMIN: IMPERSONATE
+   SECTION 23 — ADMIN: IMPERSONATE
    ============================================================ */
 async function impersonate(username) {
   if (!confirm(`View as "${username}"?`)) return;
   impersonateBackup = { user: currentUser, token: getToken() };
   impersonating = true;
-
   const all = await api('/api/users');
   const u = all.find(x => x.username === username);
   if (!u) return;
-
   currentUser = { ...currentUser, name: u.name, username: u.username, role: u.role, mobile: u.mobile };
   showApp();
   showToast('👁️ Viewing', `As ${u.name}`);
@@ -971,8 +998,7 @@ function exitImpersonate() {
 
 
 /* ============================================================
-   SECTION 22 — ADMIN: BULK IMPORT (new format)
-   name, mobile, duration
+   SECTION 24 — ADMIN: BULK IMPORT
    ============================================================ */
 function loadSampleCSV() {
   document.getElementById('csvInput').value =
@@ -997,9 +1023,7 @@ async function bulkImport() {
     const [name, mobileRaw, durCode] = p;
     const mobile = (mobileRaw || '').replace(/\D/g, '');
     const dur = DURATIONS[durCode];
-    if (!name || mobile.length < 10 || !dur) {
-      fail++; errors.push(`Invalid: ${line}`); continue;
-    }
+    if (!name || mobile.length < 10 || !dur) { fail++; errors.push(`Invalid: ${line}`); continue; }
 
     const d = new Date(); d.setDate(d.getDate() + dur.days);
     const expiresAt = d.toISOString().split('T')[0];
@@ -1020,15 +1044,11 @@ async function bulkImport() {
   renderUsers();
   renderKPIs();
 
-  const resultBox = document.getElementById('importResult');
-  resultBox.innerHTML = `
+  document.getElementById('importResult').innerHTML = `
     <div style="padding:16px 20px;background:${created.length ? 'rgba(0,184,148,0.08)' : 'rgba(225,112,85,0.08)'};border-radius:12px;border:1px solid ${created.length ? 'rgba(0,184,148,0.2)' : 'rgba(225,112,85,0.2)'}">
       <strong>✅ ${created.length} created</strong>${fail ? ` · <strong style="color:var(--danger)">${fail} failed</strong>` : ''}
       ${errors.length ? `<div style="margin-top:10px;font-size:12px;color:var(--text-muted)">${errors.slice(0, 5).map(e => `• ${e}`).join('<br>')}</div>` : ''}
-      ${created.length ? `
-        <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn btn-primary btn-sm" onclick="downloadCredentials()">📥 Download Credentials CSV</button>
-        </div>` : ''}
+      ${created.length ? `<div style="margin-top:14px"><button class="btn btn-primary btn-sm" onclick="downloadCredentials()">📥 Download Credentials CSV</button></div>` : ''}
     </div>`;
 
   if (created.length) {
@@ -1041,12 +1061,8 @@ async function bulkImport() {
 function downloadCredentials() {
   const creds = window._lastImportCreds || [];
   if (!creds.length) return;
-
   const header = 'Name,Mobile,Username,Password\n';
-  const rows = creds.map(c =>
-    [c.name, c.mobile, c.username, c.password].join(',')
-  ).join('\n');
-
+  const rows = creds.map(c => [c.name, c.mobile, c.username, c.password].join(',')).join('\n');
   const blob = new Blob([header + rows], { type: 'text/csv' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1059,7 +1075,7 @@ function downloadCredentials() {
 
 
 /* ============================================================
-   SECTION 23 — ADMIN: AUDIT LOG
+   SECTION 25 — ADMIN: AUDIT LOG
    ============================================================ */
 async function renderAudit() {
   const box = document.getElementById('auditLog');
@@ -1072,7 +1088,6 @@ async function renderAudit() {
     }
     const badgeFor = lvl =>
       ({ success: 'badge-success', danger: 'badge-danger', warn: 'badge-warn' }[lvl] || 'badge-info');
-
     box.innerHTML = rows.map(e => `
       <div class="audit-row">
         <div class="audit-time">${new Date(e.created_at).toLocaleString()}</div>
@@ -1091,14 +1106,12 @@ async function clearAudit() {
     await api('/api/audit', { method: 'DELETE' });
     renderAudit();
     showToast('🗑️ Cleared', 'Audit log cleared');
-  } catch (e) {
-    showToast('⚠️ Error', e.message);
-  }
+  } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
 
 /* ============================================================
-   SECTION 24 — ADMIN: PRICING (Demo + Pro only)
+   SECTION 26 — ADMIN: PRICING
    ============================================================ */
 async function loadPrices() {
   try {
@@ -1117,31 +1130,23 @@ async function savePrices() {
     await api('/api/prices', { method: 'PUT', body: JSON.stringify(p) });
     renderKPIs();
     showToast('✅ Saved', 'Plan prices updated');
-  } catch (e) {
-    showToast('⚠️ Error', e.message);
-  }
+  } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
 
 /* ============================================================
-   SECTION 25 — ADMIN: EXPORT USERS CSV
+   SECTION 27 — ADMIN: EXPORT USERS CSV
    ============================================================ */
 async function exportUsersCSV() {
   try {
     const users = await api('/api/users');
     const header = 'Name,Username,Mobile,Role,Plan,Expires,Status\n';
     const rows = users.map(u => {
-      const status = u.disabled
-        ? 'Disabled'
+      const status = u.disabled ? 'Disabled'
         : (u.expiresAt && new Date(u.expiresAt) < new Date() ? 'Expired' : 'Active');
-      return [
-        u.name, u.username, u.mobile || '-', u.role,
-        u.plan || '-',
-        u.expiresAt ? String(u.expiresAt).slice(0, 10) : '-',
-        status
-      ].join(',');
+      return [u.name, u.username, u.mobile || '-', u.role, u.plan || '-',
+        u.expiresAt ? String(u.expiresAt).slice(0, 10) : '-', status].join(',');
     }).join('\n');
-
     const blob = new Blob([header + rows], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1150,14 +1155,12 @@ async function exportUsersCSV() {
     a.click();
     URL.revokeObjectURL(url);
     showToast('📥 Exported', `${users.length} users`);
-  } catch (e) {
-    showToast('⚠️ Error', e.message);
-  }
+  } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
 
 /* ============================================================
-   SECTION 26 — BOOTSTRAP
+   SECTION 28 — BOOTSTRAP
    ============================================================ */
 (async function initAuth() {
   const token = getToken();
@@ -1168,9 +1171,7 @@ async function exportUsersCSV() {
       currentUser = u;
       showApp();
       return;
-    } catch {
-      clearSession();
-    }
+    } catch { clearSession(); }
   }
   showLogin();
 })();

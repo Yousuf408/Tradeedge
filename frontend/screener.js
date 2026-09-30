@@ -41,6 +41,7 @@ async function initScreener() {
 
   await loadStockList();
   await ensureDataLoaded();
+  await fetchAndRender(); 
 
   SCREENER_INIT_DONE = true;
 }

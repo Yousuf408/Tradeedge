@@ -16,7 +16,6 @@ import {
   setCachedLTP,
   getLTPForTokens,
   fetchAllClosingPrices,
-  fetchAllLTP,
   getSessionStatus
 } from './brokers/angelone/Angel_REST.js';
 
@@ -41,11 +40,45 @@ const ALL_STOCKS = JSON.parse(
 );
 const STOCKS = ALL_STOCKS.filter(s => !s.disabled);
 console.log(`📋 Loaded ${ALL_STOCKS.length} stocks (${STOCKS.length} active, ${ALL_STOCKS.length - STOCKS.length} disabled)`);
+
 const SYM_BY_TOKEN = {};
 STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
 
 /* ============================================================
-   SECTION 1 — TIME / PHASE
+   SECTION 1 — STRATEGY CONFIG (add new strategies here)
+   ============================================================ */
+const STRATEGIES = {
+  advance_orb: {
+    id: 'advance_orb',
+    name: 'Advance ORB',
+    filters: {
+      maxRangePct: 1.5,       // 9:15 candle range ≤ 1.5%
+      minPrice: 150,          // 9:15 close must be ≥ ₹150
+      maxPrice: 3500          // 9:15 close must be ≤ ₹3500
+    }
+  }
+  // Future: gapup, momentum, vwap-reclaim — add entries here
+};
+
+function getStrategy(id) {
+  return STRATEGIES[id] || STRATEGIES.advance_orb;
+}
+
+function passesStrategy(candle, strategy) {
+  if (!Array.isArray(candle) || candle.length < 5) return false;
+  const high  = +candle[2];
+  const low   = +candle[3];
+  const close = +candle[4];
+  if (low <= 0 || high <= low) return false;
+  const rangePct = ((high - low) / low) * 100;
+  const f = strategy.filters;
+  if (rangePct > f.maxRangePct) return false;
+  if (close < f.minPrice || close > f.maxPrice) return false;
+  return true;
+}
+
+/* ============================================================
+   SECTION 2 — TIME / PHASE
    ============================================================ */
 function getIST() { return new Date(Date.now() + 5.5 * 60 * 60 * 1000); }
 function addDays(d, n) { return new Date(d.getTime() + n * 864e5).toISOString().split('T')[0]; }
@@ -67,7 +100,7 @@ function countFilled(date) {
 }
 
 /* ============================================================
-   SECTION 2 — ORB STATE
+   SECTION 3 — ORB STATE
    ============================================================ */
 const orbState = new Map();
 
@@ -97,7 +130,7 @@ function getOrbState(token, date) {
 }
 
 /* ============================================================
-   SECTION 3 — MIDDLEWARE + HELPERS
+   SECTION 4 — MIDDLEWARE + HELPERS
    ============================================================ */
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
@@ -167,12 +200,12 @@ function verifyTotpServer(secret, input) {
 }
 
 /* ============================================================
-   SECTION 4 — HEALTH
+   SECTION 5 — HEALTH
    ============================================================ */
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
 
 /* ============================================================
-   SECTION 5 — AUTH
+   SECTION 6 — AUTH
    ============================================================ */
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
@@ -265,7 +298,7 @@ app.post('/api/logout', auth, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 6 — FORGOT PASSWORD
+   SECTION 7 — FORGOT PASSWORD
    ============================================================ */
 app.post('/api/forgot-password/check', async (req, res) => {
   const { input } = req.body;
@@ -312,7 +345,7 @@ app.post('/api/forgot-password/reset', async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 7 — CHANGE PASSWORD + PROFILE
+   SECTION 8 — CHANGE PASSWORD + PROFILE
    ============================================================ */
 app.post('/api/change-password', auth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
@@ -360,7 +393,7 @@ app.put('/api/me', auth, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 8 — USERS (admin)
+   SECTION 9 — USERS (admin)
    ============================================================ */
 app.get('/api/users', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query(
@@ -459,7 +492,7 @@ app.delete('/api/users/:username', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 9 — AUDIT + PRICES
+   SECTION 10 — AUDIT + PRICES
    ============================================================ */
 app.get('/api/audit', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200');
@@ -483,10 +516,17 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 10 — SCREENER (thin routes — REST lives in Angel_REST.js)
+   SECTION 11 — SCREENER (multi-strategy aware)
    ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
+
+/* List all strategies — frontend uses for future dropdown */
+app.get('/api/strategies', auth, (req, res) => {
+  res.json(Object.values(STRATEGIES).map(s => ({
+    id: s.id, name: s.name, filters: s.filters
+  })));
+});
 
 app.get('/api/screener/status', auth, (req, res) => {
   const p = getScreenerPhase();
@@ -496,19 +536,33 @@ app.get('/api/screener/status', auth, (req, res) => {
   });
 });
 
+/* Data — filtered by strategy */
 app.get('/api/screener/data', auth, (req, res) => {
+  const strategy = getStrategy(req.query.strategy || 'advance_orb');
   const p = getScreenerPhase();
   if (p.phase === 'closed')  return res.json({ ok: false, phase: 'closed' });
   if (p.phase === 'forming') return res.json({ ok: false, phase: 'forming' });
 
-  const candles = getCachedCandles(STOCKS.map(s => s.token), p.date);
-  const filled = candles.filter(c => c.candle && !c.candle.error && Array.isArray(c.candle)).length;
+  const allCandles = getCachedCandles(STOCKS.map(s => s.token), p.date);
+  const passing = allCandles.filter(c => passesStrategy(c.candle, strategy));
+  const passingTokens = new Set(passing.map(c => String(c.token)));
+  const passingStocks = STOCKS.filter(s => passingTokens.has(String(s.token)));
+
   res.json({
-    ok: true, phase: p.phase, date: p.date, filled, total: STOCKS.length,
-    results: candles, stocks: STOCKS
+    ok: true,
+    phase: p.phase,
+    date: p.date,
+    strategy: strategy.id,
+    strategyName: strategy.name,
+    filters: strategy.filters,
+    filled: passing.length,
+    total: STOCKS.length,
+    results: passing,
+    stocks: passingStocks
   });
 });
 
+/* Fetch — always fetches ALL active tokens (unfiltered) */
 app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -537,15 +591,14 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* LTP — client sends only filtered tokens */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
   const p = getScreenerPhase();
   if (!p.date) return res.json({ ok: true, results: [] });
 
-  // ← REST batching handled inside Angel_REST.js
   const ltpResults = await getLTPForTokens(tokens);
-
   const candles = getCachedCandles(tokens, p.date);
   const candleMap = {};
   candles.forEach(c => {
@@ -589,7 +642,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 11 — CLOSING FETCH (thin — REST in Angel_REST.js)
+   SECTION 12 — CLOSING PRICE FETCH (15:34 IST)
    ============================================================ */
 async function fetchClosingPrices() {
   try {
@@ -598,7 +651,6 @@ async function fetchClosingPrices() {
     const tokens = STOCKS.map(s => s.token);
     console.log(`🔔 Fetching closing prices for ${tokens.length} stocks...`);
 
-    // ← All batching/rate-limit/delay logic in Angel_REST.js
     const { ok, failed } = await fetchAllClosingPrices(tokens, p.date);
 
     for (const r of ok) {
@@ -612,14 +664,12 @@ async function fetchClosingPrices() {
   } catch (e) { console.error('Closing fetch failed:', e.message); }
 }
 
-/* Admin: force-fetch closing prices (backfill any time) */
 app.post('/api/admin/force-ltp', auth, adminOnly, async (req, res) => {
   try {
     const p = getScreenerPhase();
     if (!p.date) return res.status(400).json({ error: 'No trading date' });
     const tokens = STOCKS.map(s => s.token);
 
-    // ← REST loop inside Angel_REST.js
     const { ok, failed } = await fetchAllClosingPrices(tokens, p.date);
 
     let saved = 0;
@@ -657,7 +707,7 @@ function scheduleClosingFetch() {
 }
 
 /* ============================================================
-   SECTION 12 — LOAD CACHE FROM DB
+   SECTION 13 — LOAD CACHE FROM DB (active stocks only)
    ============================================================ */
 async function loadScreenerCacheFromDB() {
   try {
@@ -678,11 +728,12 @@ async function loadScreenerCacheFromDB() {
 }
 
 /* ============================================================
-   SECTION 13 — START
+   SECTION 14 — START
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server on port ${PORT}`);
+  console.log(`📊 Strategy: ${STRATEGIES.advance_orb.name}`);
   try {
     await loginPlatform();
     console.log('✅ Angel One platform session started');

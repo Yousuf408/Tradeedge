@@ -41,7 +41,7 @@ const SYM_BY_TOKEN = {};
 STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
 
 /* ============================================================
-   SECTION 1 — PHASES
+   SECTION 1 — PHASES + TIME HELPERS
    ============================================================ */
 function getIST() {
   return new Date(Date.now() + 5.5 * 60 * 60 * 1000);
@@ -57,8 +57,8 @@ function getScreenerPhase() {
 
   if (dow === 0) return { phase: 'weekend', date: addDays(ist, -2) };
   if (dow === 6) return { phase: 'weekend', date: addDays(ist, -1) };
-  if (mins < 555) return { phase: 'closed' };
-  if (mins < 570) return { phase: 'forming' };
+  if (mins < 555) return { phase: 'closed' };   // before 9:15
+  if (mins < 570) return { phase: 'forming' };  // 9:15 - 9:30
   return { phase: 'ready', date: addDays(ist, 0) };
 }
 
@@ -68,9 +68,8 @@ function countFilled(date) {
 }
 
 /* ============================================================
-   SECTION 2 — ORB STATE TRACKING (in-memory + persisted to DB)
+   SECTION 2 — ORB STATE TRACKING (memory + DB)
    Key: `${token}_${date}`
-   Value: { lowBroken, entrySignal, firstLowBreakAt, firstEntryAt }
    ============================================================ */
 const orbState = new Map();
 
@@ -549,7 +548,7 @@ app.get('/api/screener/data', auth, (req, res) => {
   });
 });
 
-/* Button-triggered fetch — saves successful candles + resets ORB state */
+/* Button-triggered fetch — saves candles + initializes ORB state */
 app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) {
@@ -566,7 +565,6 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
     for (const r of results) {
       const c = r.candle;
       if (Array.isArray(c) && c.length >= 5) {
-        // Save to DB
         db.query(
           `INSERT INTO angel_15m_candle (date, token, sym, open, high, low, close, volume, updated_at)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
@@ -577,7 +575,6 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
           [p.date, r.token, SYM_BY_TOKEN[r.token] || '?', c[1], c[2], c[3], c[4], c[5] || 0]
         ).catch(() => {});
 
-        // Ensure ORB state exists (fresh fetch resets to false)
         if (!orbState.has(`${r.token}_${p.date}`)) {
           orbState.set(`${r.token}_${p.date}`, {
             lowBroken: false, entrySignal: false, firstLowBreakAt: null, firstEntryAt: null
@@ -592,7 +589,7 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   }
 });
 
-/* LTP fetch — also drives ORB stage transitions */
+/* LTP — also drives ORB stage transitions */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) {
@@ -603,7 +600,6 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 
   const ltpResults = await getLTPForTokens(tokens);
 
-  // Get 9:15 candles for ORB comparison
   const candles = getCachedCandles(tokens, p.date);
   const candleMap = {};
   candles.forEach(c => {
@@ -621,9 +617,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const c = candleMap[token];
     const ltp = r.ltp;
 
-    // Only update state during ready phase
     if (p.phase === 'ready' && c && ltp) {
-      // Stage 1: Low break
       if (!state.lowBroken && ltp < c.low) {
         state.lowBroken = true;
         state.firstLowBreakAt = new Date().toISOString();
@@ -633,7 +627,6 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
           [p.date, token]
         ).catch(() => {});
       }
-      // Stage 2: Entry (only after low break)
       if (state.lowBroken && !state.entrySignal && ltp > c.high) {
         state.entrySignal = true;
         state.firstEntryAt = new Date().toISOString();
@@ -657,7 +650,51 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
   res.json({ ok: true, count: enriched.length, results: enriched });
 });
 
-/* Load cache + ORB state from DB */
+/* ============================================================
+   SECTION 11 — CLOSING PRICE FETCH (auto at 15:34 IST)
+   ============================================================ */
+async function fetchClosingPrices() {
+  try {
+    const p = getScreenerPhase();
+    if (p.phase !== 'ready') return;
+    const tokens = STOCKS.map(s => s.token);
+    console.log(`🔔 Fetching closing prices for ${tokens.length} stocks...`);
+    await getLTPForTokens(tokens);
+    console.log('✅ Closing prices cached');
+  } catch (e) {
+    console.error('Closing price fetch failed:', e.message);
+  }
+}
+
+function msUntilNext1534IST() {
+  const ist = getIST();
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+
+  const target = new Date(ist);
+  target.setUTCHours(0, 0, 0, 0);
+  target.setUTCMinutes(934);   // 15:34 IST
+
+  if (mins >= 934) target.setUTCDate(target.getUTCDate() + 1);
+
+  const targetDow = target.getUTCDay();
+  if (targetDow === 6) target.setUTCDate(target.getUTCDate() + 2);
+  if (targetDow === 0) target.setUTCDate(target.getUTCDate() + 1);
+
+  return target.getTime() - ist.getTime();
+}
+
+function scheduleClosingFetch() {
+  const ms = msUntilNext1534IST();
+  console.log(`⏰ Next closing fetch in ${Math.round(ms / 60000)} min`);
+  setTimeout(async () => {
+    await fetchClosingPrices();
+    scheduleClosingFetch();
+  }, ms);
+}
+
+/* ============================================================
+   SECTION 12 — LOAD CACHE FROM DB
+   ============================================================ */
 async function loadScreenerCacheFromDB() {
   try {
     const p = getScreenerPhase();
@@ -677,7 +714,7 @@ async function loadScreenerCacheFromDB() {
 }
 
 /* ============================================================
-   SECTION 11 — START
+   SECTION 13 — START
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
@@ -688,6 +725,18 @@ app.listen(PORT, async () => {
   } catch (e) {
     console.error('⚠️ Angel One login failed at startup:', e.message);
   }
+
   await loadScreenerCacheFromDB();
+
+  // If server restarts between 15:34 and 16:00 IST weekday → fetch closing prices now
+  const nowIST = getIST();
+  const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
+  const dow = nowIST.getUTCDay();
+  if (dow >= 1 && dow <= 5 && mins >= 934 && mins <= 960) {
+    console.log('🔔 Late startup — fetching closing prices now');
+    fetchClosingPrices();
+  }
+  scheduleClosingFetch();
+
   console.log('ℹ️  Manual mode — screener fetches only when user clicks button');
 });

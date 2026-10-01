@@ -45,12 +45,16 @@ const screenerState = {
   progress: 0,
   total: STOCKS.length,
   startedAt: null,
-  error: null
+  error: null,
+  retryCount: 0
 };
 
-/* Fetch tuning */
-const FETCH_CONCURRENCY = 3;      // 3 parallel workers
-const FETCH_DELAY_MS = 1000;      // 1s per worker → ~3 req/sec (Angel One limit)
+/* Fetch tuning (proven safe with Angel One rate limits) */
+const BATCH_SIZE = 20;
+const BATCH_DELAY = 7000;      // 7s between batches (main fetch)
+const RETRY_BATCH_SIZE = 10;   // smaller batches on retry
+const RETRY_DELAY = 10000;     // 10s between retry batches
+const MAX_RETRIES = 2;
 
 function getIST() {
   return new Date(Date.now() + 5.5 * 60 * 60 * 1000);
@@ -59,7 +63,6 @@ function addDays(d, n) {
   return new Date(d.getTime() + n * 864e5).toISOString().split('T')[0];
 }
 
-/* Phase resolver: closed / forming / ready / weekend */
 function getScreenerPhase() {
   const ist = getIST();
   const dow = ist.getUTCDay();
@@ -73,45 +76,44 @@ function getScreenerPhase() {
 }
 
 /* ============================================================
-   SECTION 2 — PARALLEL FETCHER (no external dependency)
-   Runs N workers pulling tokens from a shared queue.
-   Respects Angel One rate limits via per-worker delay.
+   SECTION 2 — BACKGROUND FETCH (sequential batches + retry)
    ============================================================ */
-async function fetchCandlesParallel(tokens, date) {
-  const queue = [...tokens];
-  const results = [];
-  let failed = 0;
+let fetchInProgress = false;
 
-  async function worker() {
-    while (queue.length) {
-      const token = queue.shift();
-      try {
-        const batch = await getCandlesForTokens([token], date);
-        if (batch[0]) results.push(batch[0]);
-        else failed++;
-      } catch (e) {
-        failed++;
+/* Helper: fetch a list of tokens in batches, return { ok[], failed[] } */
+async function fetchBatchList(tokens, date, batchSize, delayMs, label) {
+  const ok = [];
+  const failed = [];
+  const totalBatches = Math.ceil(tokens.length / batchSize);
+
+  for (let i = 0; i < tokens.length; i += batchSize) {
+    const batch = tokens.slice(i, i + batchSize);
+    const batchNum = Math.floor(i / batchSize) + 1;
+
+    try {
+      const results = await getCandlesForTokens(batch, date);
+      for (const r of results) {
+        if (r.candle && !r.candle.error && Array.isArray(r.candle)) ok.push(r.token);
+        else failed.push(r.token);
       }
-      if (queue.length) await new Promise(r => setTimeout(r, FETCH_DELAY_MS));
+    } catch (e) {
+      failed.push(...batch);
+    }
+
+    console.log(`📊 ${label} batch ${batchNum}/${totalBatches} — ok:${ok.length} failed:${failed.length}`);
+    screenerState.progress = screenerState.progress + batch.length;
+
+    if (i + batchSize < tokens.length) {
+      await new Promise(r => setTimeout(r, delayMs));
     }
   }
 
-  await Promise.all(
-    Array.from({ length: FETCH_CONCURRENCY }, () => worker())
-  );
-
-  return { fetched: results.length, failed };
+  return { ok, failed };
 }
-
-/* ============================================================
-   SECTION 3 — BACKGROUND FETCH JOB
-   ============================================================ */
-let fetchInProgress = false;
 
 async function runScreenerFetch(date) {
   if (fetchInProgress) return;
   if (screenerState.status === 'ready' && screenerState.date === date) return;
-  if (screenerState.status === 'fetching' && screenerState.date === date) return;
 
   fetchInProgress = true;
   screenerState.status = 'fetching';
@@ -119,58 +121,64 @@ async function runScreenerFetch(date) {
   screenerState.progress = 0;
   screenerState.startedAt = Date.now();
   screenerState.error = null;
+  screenerState.retryCount = 0;
 
   console.log(`▶️  Screener fetch started for ${date}`);
 
-  // Progress updater — updates every 5s during fetch
-  const progressTimer = setInterval(() => {
-    const elapsed = Math.round((Date.now() - screenerState.startedAt) / 1000);
-    console.log(`⏳ Fetching ${date} — ${elapsed}s elapsed`);
-  }, 5000);
+  const tokens = STOCKS.map(s => s.token);
 
   try {
-    const tokens = STOCKS.map(s => s.token);
-    const { fetched, failed } = await fetchCandlesParallel(tokens, date);
-    screenerState.progress = fetched;
+    /* ---- Main fetch ---- */
+    const main = await fetchBatchList(tokens, date, BATCH_SIZE, BATCH_DELAY, 'Main');
+    let stillFailed = main.failed;
+
+    /* ---- Retry rounds ---- */
+    for (let attempt = 1; attempt <= MAX_RETRIES && stillFailed.length; attempt++) {
+      screenerState.retryCount = attempt;
+      console.log(`🔁 Retry ${attempt} for ${stillFailed.length} failed stocks (waiting 10s buffer)`);
+      await new Promise(r => setTimeout(r, 10000));
+
+      const retry = await fetchBatchList(stillFailed, date, RETRY_BATCH_SIZE, RETRY_DELAY, `Retry ${attempt}`);
+      stillFailed = retry.failed;
+    }
+
+    screenerState.progress = main.ok.length + (main.failed.length - stillFailed.length);
     screenerState.status = 'ready';
-    console.log(`✅ Screener fetch done — ${fetched} candles (${failed} failed) in ${Math.round((Date.now() - screenerState.startedAt)/1000)}s`);
+
+    const secs = Math.round((Date.now() - screenerState.startedAt) / 1000);
+    console.log(`✅ Screener fetch done — ok:${screenerState.progress} failed:${stillFailed.length} time:${secs}s`);
   } catch (e) {
     screenerState.status = 'error';
     screenerState.error = e.message;
     console.error('❌ Screener fetch failed:', e.message);
   } finally {
-    clearInterval(progressTimer);
     fetchInProgress = false;
   }
 }
 
 /* ============================================================
-   SECTION 4 — AUTO-FETCH SCHEDULER (fires at 9:31 IST)
+   SECTION 3 — AUTO-FETCH SCHEDULER (fires at 9:31 IST)
    ============================================================ */
 function msUntilNext931IST() {
   const ist = getIST();
-  const dow = ist.getUTCDay();
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
 
   const target = new Date(ist);
   target.setUTCHours(0, 0, 0, 0);
-  target.setUTCMinutes(571);  // 9:31 IST = 571 minutes
+  target.setUTCMinutes(571);  // 9:31 IST
 
-  // If past 9:31 today → schedule next day
   if (mins >= 571) target.setUTCDate(target.getUTCDate() + 1);
 
-  // Skip weekends
   const targetDow = target.getUTCDay();
-  if (targetDow === 6) target.setUTCDate(target.getUTCDate() + 2);  // Sat → Mon
-  if (targetDow === 0) target.setUTCDate(target.getUTCDate() + 1);  // Sun → Mon
+  if (targetDow === 6) target.setUTCDate(target.getUTCDate() + 2);
+  if (targetDow === 0) target.setUTCDate(target.getUTCDate() + 1);
 
   return target.getTime() - ist.getTime();
 }
 
 function scheduleNextAutoFetch() {
   const ms = msUntilNext931IST();
-  const mins = Math.round(ms / 60000);
-  console.log(`⏰ Next auto-fetch in ${mins} min`);
+  console.log(`⏰ Next auto-fetch in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
     const p = getScreenerPhase();
     if (p.phase === 'ready') {
@@ -182,7 +190,7 @@ function scheduleNextAutoFetch() {
 }
 
 /* ============================================================
-   SECTION 5 — MIDDLEWARE + HELPERS
+   SECTION 4 — MIDDLEWARE + HELPERS
    ============================================================ */
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
@@ -261,12 +269,12 @@ function verifyTotpServer(secret, input) {
 }
 
 /* ============================================================
-   SECTION 6 — HEALTH
+   SECTION 5 — HEALTH
    ============================================================ */
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
 
 /* ============================================================
-   SECTION 7 — AUTH ROUTES
+   SECTION 6 — AUTH ROUTES
    ============================================================ */
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
@@ -370,7 +378,7 @@ app.post('/api/logout', auth, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 8 — FORGOT PASSWORD
+   SECTION 7 — FORGOT PASSWORD
    ============================================================ */
 app.post('/api/forgot-password/check', async (req, res) => {
   const { input } = req.body;
@@ -418,7 +426,7 @@ app.post('/api/forgot-password/reset', async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 9 — CHANGE PASSWORD + SELF PROFILE
+   SECTION 8 — CHANGE PASSWORD + SELF PROFILE
    ============================================================ */
 app.post('/api/change-password', auth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
@@ -469,7 +477,7 @@ app.put('/api/me', auth, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 10 — USERS (admin)
+   SECTION 9 — USERS (admin)
    ============================================================ */
 app.get('/api/users', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query(
@@ -574,7 +582,7 @@ app.delete('/api/users/:username', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 11 — AUDIT + PRICES
+   SECTION 10 — AUDIT + PRICES
    ============================================================ */
 app.get('/api/audit', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200');
@@ -601,7 +609,7 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 12 — SCREENER ROUTES
+   SECTION 11 — SCREENER ROUTES
    ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
@@ -613,7 +621,8 @@ app.get('/api/screener/status', auth, (req, res) => {
     date: p.date || screenerState.date,
     progress: screenerState.progress,
     total: screenerState.total,
-    error: screenerState.error
+    error: screenerState.error,
+    retryCount: screenerState.retryCount
   });
 });
 
@@ -630,8 +639,7 @@ app.post('/api/screener/ensure', auth, async (req, res) => {
     return res.json({ phase: 'ready', date: p.date });
   }
 
-  // Not fetched yet — start now
-  runScreenerFetch(p.date);   // fire-and-forget
+  runScreenerFetch(p.date);
   res.json({ phase: 'fetching', progress: 0, total: screenerState.total, date: p.date });
 });
 
@@ -654,7 +662,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 13 — START
+   SECTION 12 — START
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
@@ -666,7 +674,6 @@ app.listen(PORT, async () => {
     console.error('⚠️ Angel One login failed at startup:', e.message);
   }
 
-  // Auto-fetch: if we're past 9:31 and data missing → fetch now
   const p = getScreenerPhase();
   if (p.phase === 'ready' && screenerState.status !== 'ready') {
     console.log('🔁 Startup fetch — post 9:31, fetching today\'s data');

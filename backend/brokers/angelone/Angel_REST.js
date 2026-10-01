@@ -1,38 +1,12 @@
 /* ============================================================
-   ANGEL_REST.js  —  v2 (drop-in replacement, speed-optimized)
-
-   ROOT CAUSE OF THE ORIGINAL ERROR:
-   Angel One's rate limiter intermittently returns HTTP 403 with a
-   PLAIN-TEXT body: "Access denied because of exceeding access rate"
-   (not JSON). Old code did r.json() on it → "Unexpected token 'A'".
-   Known ongoing Angel-side bug (SmartAPI forum topics 5560/5639).
-
-   v1 PROBLEM (why it got slow):
-   Serial fetch (1 token at a time) + 20s cooldowns + long backoffs
-   → a 403 storm turned a 10-min run into a 30+ min crawl.
-
-   v2 FIXES:
-   #1  PARALLEL fetch with a global token-bucket scheduler at
-       150 req/min (documented cap is 180/min, 3/sec — we stay
-       under both, never burst). 500 tokens ≈ 3.5 min instead of 13.
-   #2  LIGHT retries: 2 attempts, ~1.2s/2.4s backoff, 8s cooldown
-       (was 20-30s). Blocked tokens recover fast instead of stalling.
-   #3  RUN-LEVEL circuit breaker: 10 consecutive failures across all
-       workers → abort the whole run in ~1 min with a clear log,
-       instead of crawling for 30 min. Cached tokens are kept;
-       re-clicking Fetch resumes only the missing ones.
-   #4  Single-flight login (parallel workers can't trigger multiple
-       simultaneous logins — login limit is 1/sec).
-   #5  post() reads TEXT first, then parses JSON → real errors in
-       logs ("Rate limited HTTP 403: Access denied..."), never the
-       cryptic "Unexpected token 'A'" again.
-   #6  LTP: 30s cache TTL (client polls every 15s → half the calls
-       served from cache) and ZERO API calls outside 9:10-15:35 IST
-       weekdays. Less background load on the same API key.
-
-   TUNING (env):
-   ANGEL_CANDLE_RATE_PER_MIN=150   (max safe: 170)
-   ANGEL_CANDLE_CONCURRENCY=5
+   ANGEL_REST.js  —  v2.1
+   ALL Angel One REST logic lives here:
+   - Login (auto, platform creds)
+   - 1-min candle aggregation (9:15-9:30 window)
+   - Rate-limited parallel fetch (150/min, 5 workers)
+   - LTP batch (50/call, market hours only)
+   - Closing price via 15:30 candle (works 24/7)
+   - Cache helpers (memory only — server.js persists to DB)
    ============================================================ */
 
 import crypto from 'crypto';
@@ -43,10 +17,10 @@ const CLIENT_ID = process.env.ANGEL_CLIENT_ID;
 const PIN = process.env.ANGEL_PIN;
 const TOTP_SECRET = process.env.ANGEL_TOTP_SECRET;
 
-const CANDLE_RATE_PER_MIN = Number(process.env.ANGEL_CANDLE_RATE_PER_MIN || 150); // FIX #1
-const CANDLE_CONCURRENCY  = Number(process.env.ANGEL_CANDLE_CONCURRENCY  || 5);   // FIX #1
-const SLOT_INTERVAL_MS    = 60000 / CANDLE_RATE_PER_MIN; // 400ms at 150/min
-const LTP_TTL = 30000;                                                              // FIX #6
+const CANDLE_RATE_PER_MIN = Number(process.env.ANGEL_CANDLE_RATE_PER_MIN || 150);
+const CANDLE_CONCURRENCY  = Number(process.env.ANGEL_CANDLE_CONCURRENCY  || 5);
+const SLOT_INTERVAL_MS    = 60000 / CANDLE_RATE_PER_MIN;
+const LTP_TTL = 30000;
 
 const session = { jwtToken: null, feedToken: null, expiresAt: null, loginTime: null };
 
@@ -57,7 +31,7 @@ const failedCache = new Map();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ============================================================
-   GLOBAL RATE-LIMIT COOLDOWN  (FIX #2 — 8s, was 20-30s)
+   RATE-LIMIT COOLDOWN
    ============================================================ */
 let cooldownUntil = 0;
 
@@ -72,12 +46,7 @@ async function waitForCooldown() {
 }
 
 /* ============================================================
-   TOKEN-BUCKET SLOT SCHEDULER  (FIX #1)
-   Spaces ALL candle calls globally at SLOT_INTERVAL_MS apart,
-   across every worker and every client batch — never exceeds
-   CANDLE_RATE_PER_MIN no matter how much runs in parallel.
-   If a cooldown starts while a worker waits for its slot, the
-   worker re-reserves a fresh slot AFTER the cooldown → no burst.
+   TOKEN-BUCKET SLOT SCHEDULER (150/min global cap)
    ============================================================ */
 let nextSlotTime = 0;
 
@@ -86,15 +55,14 @@ async function acquireRateSlot() {
     await waitForCooldown();
     const now = Date.now();
     const start = Math.max(now, nextSlotTime);
-    nextSlotTime = start + SLOT_INTERVAL_MS;   // reservation is atomic (single-threaded JS)
+    nextSlotTime = start + SLOT_INTERVAL_MS;
     if (start > now) await sleep(start - now);
-    if (Date.now() >= cooldownUntil) return;   // clean → proceed
-    // otherwise loop: re-reserve after the new cooldown ends
+    if (Date.now() >= cooldownUntil) return;
   }
 }
 
 /* ============================================================
-   BASE32 + TOTP  (unchanged)
+   BASE32 + TOTP
    ============================================================ */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
@@ -129,7 +97,7 @@ function generateTOTP(secret) {
 }
 
 /* ============================================================
-   HTTP  (FIX #5 — text-first parsing, light retries)
+   HTTP (text-first parsing, retries, cooldown)
    ============================================================ */
 function buildHeaders() {
   const h = {
@@ -162,21 +130,19 @@ async function post(path, body, { retries = 2, baseBackoff = 1200 } = {}) {
       res = await fetch(BASE_URL + path, {
         method: 'POST', headers: buildHeaders(), body: JSON.stringify(body)
       });
-      text = await res.text();               // FIX #5: text first, never blind r.json()
+      text = await res.text();
     } catch (e) {
       lastErr = new Error(`Network error: ${e.message}`);
       continue;
     }
 
-    try {
-      return JSON.parse(text);               // happy path
-    } catch { /* non-JSON body → fall through */ }
+    try { return JSON.parse(text); } catch {}
 
     const snippet = text.slice(0, 120).replace(/\s+/g, ' ');
     console.error(`⛔ non-JSON response HTTP ${res.status} from ${path}: "${snippet}"`);
 
     if (res.status === 403 || res.status === 429 || /access denied/i.test(text)) {
-      startCooldown(8000, `rate-limited on ${path}`);   // FIX #2: 8s, not 20s
+      startCooldown(8000, `rate-limited on ${path}`);
       lastErr = new Error(`Rate limited (HTTP ${res.status}): ${snippet}`);
       continue;
     }
@@ -188,8 +154,7 @@ async function post(path, body, { retries = 2, baseBackoff = 1200 } = {}) {
 }
 
 /* ============================================================
-   LOGIN  (FIX #4 — single-flight: parallel workers share ONE
-   login attempt; login endpoint is limited to 1 req/sec)
+   LOGIN (single-flight)
    ============================================================ */
 export async function loginPlatform() {
   if (!API_KEY || !CLIENT_ID || !PIN || !TOTP_SECRET) {
@@ -236,7 +201,7 @@ export function getSessionStatus() {
 }
 
 /* ============================================================
-   CANDLES — 1-minute bars aggregated into 9:15–9:30 window
+   CANDLES — 1-min bars → 9:15-9:30 aggregated
    ============================================================ */
 export async function getCandlesForToken(token, date) {
   const key = `${token}_${date}`;
@@ -261,8 +226,6 @@ export async function getCandlesForToken(token, date) {
       return { error: errMsg };
     }
 
-    // Aggregate 1-min bars → single 9:15-9:30 candle
-    // bar format: [timestamp, open, high, low, close, volume]
     const bars = r.data;
     const agg = [
       bars[0][0],
@@ -284,11 +247,7 @@ export async function getCandlesForToken(token, date) {
 }
 
 /* ============================================================
-   PARALLEL BATCH FETCH  (FIX #1 + #3)
-   N workers pull from a shared queue; every call passes through
-   the global slot scheduler → total rate stays ≤ 150/min.
-   Circuit breaker: 10 consecutive failures → abort run fast.
-   500 tokens healthy ≈ 3.5 min (was ~13 min serial).
+   PARALLEL BATCH FETCH (rate-limited, circuit breaker)
    ============================================================ */
 export async function getCandlesForTokens(tokens, date) {
   const results = new Map();
@@ -296,7 +255,7 @@ export async function getCandlesForTokens(tokens, date) {
 
   for (const token of tokens) {
     const key = `${token}_${date}`;
-    if (candleCache.has(key)) results.set(String(token), candleCache.get(key)); // instant cache hits
+    if (candleCache.has(key)) results.set(String(token), candleCache.get(key));
     else queue.push(token);
   }
 
@@ -315,19 +274,15 @@ export async function getCandlesForTokens(tokens, date) {
       results.set(String(token), candle);
 
       if (Array.isArray(candle)) consecutiveFails = 0;
-      else if (++consecutiveFails >= 10) {
-        aborted = true;   // FIX #3: run-level circuit breaker
-      }
+      else if (++consecutiveFails >= 10) aborted = true;
     }
   }
 
   await Promise.all(Array.from({ length: workerCount }, worker));
 
   if (aborted) {
-    startCooldown(30000, 'circuit breaker — Angel is blocking right now');
-    console.error(`🛑 Run aborted after 10 consecutive failures (Angel rate-limit storm). ` +
-                  `Got ${results.size}/${tokens.length} in ${Math.round((Date.now() - t0) / 1000)}s. ` +
-                  `Cached tokens are kept — re-click Fetch in a few minutes to resume the rest.`);
+    startCooldown(30000, 'circuit breaker — Angel blocking');
+    console.error(`🛑 Run aborted after 10 consecutive failures. Got ${results.size}/${tokens.length} in ${Math.round((Date.now() - t0) / 1000)}s.`);
   } else {
     console.log(`✅ Batch done: ${results.size}/${tokens.length} tokens in ${Math.round((Date.now() - t0) / 1000)}s`);
   }
@@ -354,27 +309,28 @@ export function getFailedList(date) {
 }
 
 /* ============================================================
-   DB → MEMORY CACHE LOADER SUPPORT
-   Called by server.js on startup to rehydrate memory cache
-   from Supabase (Render restarts wipe memory).
+   CACHE SETTERS (used by server.js to rehydrate from DB)
    ============================================================ */
 export function setCachedCandle(token, date, candle) {
   candleCache.set(`${token}_${date}`, candle);
 }
 
+export function setCachedLTP(token, price) {
+  ltpCache.set(String(token), { price: +price, ts: Date.now() });
+}
+
 /* ============================================================
-   LTP (batch, 50 per call)  — FIX #6
+   LTP (batch, 50/call, market hours only)
    ============================================================ */
 function isMarketHoursIST() {
   const ist = new Date(Date.now() + 5.5 * 3600 * 1000);
   const dow = ist.getUTCDay();
   if (dow === 0 || dow === 6) return false;
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  return mins >= 9 * 60 + 10 && mins <= 15 * 60 + 35;   // 09:10 – 15:35 IST
+  return mins >= 9 * 60 + 10 && mins <= 15 * 60 + 35;
 }
 
 export async function getLTPForTokens(tokens) {
-  // Outside market hours: serve cache, make ZERO API calls.
   if (!isMarketHoursIST()) {
     return tokens.map(t => ({
       token: String(t),
@@ -415,9 +371,66 @@ export async function getLTPForTokens(tokens) {
   }));
 }
 
+/* ============================================================
+   CLOSING PRICE via 15:30 candle (works 24/7)
+   ============================================================ */
+export async function getClosingPriceForToken(token, date) {
+  const ok = await ensureLoggedIn();
+  if (!ok) return null;
+
+  try {
+    const r = await post('/rest/secure/angelbroking/historical/v1/getCandleData', {
+      exchange: 'NSE',
+      symboltoken: String(token),
+      interval: 'ONE_MINUTE',
+      fromdate: `${date} 15:29`,
+      todate: `${date} 15:30`
+    });
+    if (!r.status || !r.data?.length) return null;
+    return r.data[r.data.length - 1][4];
+  } catch { return null; }
+}
+
+/* ============================================================
+   BULK HELPERS — loops + batching live HERE
+   ============================================================ */
+
+/* Fetch closing price for many tokens in batches.
+   Returns { ok: [{token, price}], failed: [token] } */
+export async function fetchAllClosingPrices(tokens, date, batchSize = 50, delayMs = 20000) {
+  const ok = [];
+  const failed = [];
+
+  for (let i = 0; i < tokens.length; i += batchSize) {
+    const batch = tokens.slice(i, i + batchSize);
+    const t0 = Date.now();
+    await Promise.all(batch.map(async (token) => {
+      await acquireRateSlot();
+      const price = await getClosingPriceForToken(token, date);
+      if (price) ok.push({ token: String(token), price });
+      else failed.push(String(token));
+    }));
+    console.log(`📊 Closing batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(tokens.length / batchSize)} — ok:${ok.length} failed:${failed.length} (${Math.round((Date.now() - t0) / 1000)}s)`);
+    if (i + batchSize < tokens.length) await sleep(delayMs);
+  }
+
+  return { ok, failed };
+}
+
+/* Fetch LTP for many tokens in batches of 50 */
+export async function fetchAllLTP(tokens) {
+  const out = [];
+  for (let i = 0; i < tokens.length; i += 50) {
+    const batch = tokens.slice(i, i + 50);
+    const res = await getLTPForTokens(batch);
+    out.push(...res);
+    if (i + 50 < tokens.length) await sleep(400);
+  }
+  return out;
+}
+
+/* ============================================================
+   CACHE CLEAR
+   ============================================================ */
 export function clearCandleCache() { candleCache.clear(); }
 export function clearLtpCache() { ltpCache.clear(); }
-
-export function setCachedLTP(token, price) {
-  ltpCache.set(String(token), { price: +price, ts: Date.now() });
-}

@@ -1,6 +1,7 @@
 /* ============================================================
    SCREENER.JS
    Live 9:15 candles + LTP + SL + MAXQTY + Breakout
+   Phase-aware: closed / forming / fetching / ready / weekend
    ============================================================ */
 
 let SCREENER_STOCKS = [];
@@ -10,8 +11,8 @@ let SCREENER_INIT_DONE = false;
 let SCREENER_POLL_TIMER = null;
 let SCREENER_LTP_TIMER = null;
 
-let PER_TRADE = 10000;   // ₹ per trade
-let SL_PCT = 1;          // % stop loss
+let PER_TRADE = 10000;
+let SL_PCT = 1;
 
 /* ============================================================
    SECTION 1 — INIT
@@ -30,20 +31,18 @@ async function initScreener() {
 }
 
 /* ============================================================
-   SECTION 2 — CONTROLS (Per-Trade input + SL dropdown)
+   SECTION 2 — CONTROLS
    ============================================================ */
 function setupControls() {
   const controls = document.querySelector('.screener-controls');
   if (!controls) return;
 
-  // Hide old strategy dropdown + toggle + labels
   ['#strategySelect', '.toggle-wrapper'].forEach(sel => {
     const el = controls.querySelector(sel);
     if (el) el.style.display = 'none';
   });
   controls.querySelectorAll('button, label').forEach(el => el.style.display = 'none');
 
-  // Build new controls
   if (!document.getElementById('screenerStatusPill')) {
     controls.innerHTML = `
       <span id="screenerStatusPill"
@@ -86,7 +85,7 @@ async function loadStockList() {
 }
 
 /* ============================================================
-   SECTION 4 — ENSURE DATA LOADED
+   SECTION 4 — ENSURE DATA LOADED (phase-aware)
    ============================================================ */
 async function ensureDataLoaded() {
   try {
@@ -96,22 +95,66 @@ async function ensureDataLoaded() {
     });
     const d = await r.json();
 
-    if (d.status === 'ready') {
+    if (d.phase === 'closed') {
+      showPhaseMessage('🔒 Market closed — data will load after 9:30 AM');
+      return;
+    }
+    if (d.phase === 'forming') {
+      showPhaseMessage('🕘 9:15 candle is forming — data will load at 9:30 AM');
+      startFormingPoller();
+      return;
+    }
+    if (d.phase === 'ready') {
       setPill('✅ Live — ' + d.date, 'var(--success)');
       await fetchAndRender();
       await loadLTP();
       startLTPRefresh();
       return;
     }
-    if (d.status === 'fetching') {
+    if (d.phase === 'fetching') {
       setPill(`⏳ Fetching 0 / ${d.total}...`, '#f39c12');
       startProgressPolling();
     }
-  } catch (e) { setPill('⚠️ ' + e.message, 'var(--danger)'); }
+  } catch (e) {
+    setPill('⚠️ ' + e.message, 'var(--danger)');
+  }
+}
+
+function showPhaseMessage(msg) {
+  setPill(msg, '#f39c12');
+  const head = document.getElementById('screenerHead');
+  const body = document.getElementById('screenerBody');
+  if (head) head.innerHTML = '';
+  if (body) {
+    body.innerHTML = `<tr><td colspan="8"
+      style="text-align:center;padding:60px;color:var(--text-muted);font-size:14px">${msg}</td></tr>`;
+  }
+}
+
+/* Polls every 30s while in 'forming' phase — auto-switches to fetch at 9:30 */
+function startFormingPoller() {
+  if (SCREENER_POLL_TIMER) clearInterval(SCREENER_POLL_TIMER);
+  SCREENER_POLL_TIMER = setInterval(async () => {
+    const r = await fetch(API + '/api/screener/ensure', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
+    });
+    const d = await r.json();
+
+    if (d.phase === 'ready' || d.phase === 'fetching') {
+      clearInterval(SCREENER_POLL_TIMER);
+      SCREENER_POLL_TIMER = null;
+      ensureDataLoaded();
+    } else if (d.phase === 'closed') {
+      clearInterval(SCREENER_POLL_TIMER);
+      SCREENER_POLL_TIMER = null;
+      showPhaseMessage('🔒 Market closed — data will load after 9:30 AM');
+    }
+  }, 30000);
 }
 
 /* ============================================================
-   SECTION 5 — PROGRESS POLLING
+   SECTION 5 — PROGRESS POLLING (during fetch)
    ============================================================ */
 function startProgressPolling() {
   if (SCREENER_POLL_TIMER) clearInterval(SCREENER_POLL_TIMER);
@@ -122,20 +165,25 @@ function startProgressPolling() {
       });
       const d = await r.json();
 
-      if (d.status === 'fetching') {
+      if (d.phase === 'fetching') {
         setPill(`⏳ Fetching ${d.progress} / ${d.total}...`, '#f39c12');
         await fetchAndRender();
-      } else if (d.status === 'ready') {
+      } else if (d.phase === 'ready' || d.phase === 'weekend') {
         clearInterval(SCREENER_POLL_TIMER);
         SCREENER_POLL_TIMER = null;
         setPill('✅ Live — ' + d.date, 'var(--success)');
         await fetchAndRender();
         await loadLTP();
         startLTPRefresh();
-      } else if (d.status === 'error') {
+      } else if (d.phase === 'closed') {
         clearInterval(SCREENER_POLL_TIMER);
         SCREENER_POLL_TIMER = null;
-        setPill('❌ ' + (d.error || 'error'), 'var(--danger)');
+        showPhaseMessage('🔒 Market closed — data will load after 9:30 AM');
+      } else if (d.phase === 'forming') {
+        clearInterval(SCREENER_POLL_TIMER);
+        SCREENER_POLL_TIMER = null;
+        showPhaseMessage('🕘 9:15 candle is forming — data will load at 9:30 AM');
+        startFormingPoller();
       }
     } catch (e) { console.error(e); }
   }, 3000);
@@ -150,6 +198,8 @@ async function fetchAndRender() {
       headers: { Authorization: 'Bearer ' + getToken() }
     });
     const d = await r.json();
+    if (!d.ok) return;
+
     SCREENER_CANDLES = {};
     if (d.results) {
       for (const item of d.results) {
@@ -166,7 +216,7 @@ async function fetchAndRender() {
 }
 
 /* ============================================================
-   SECTION 7 — LTP (batch, no rate limit issue — 50 per call)
+   SECTION 7 — LTP (batch, 15s refresh)
    ============================================================ */
 async function loadLTP() {
   if (!SCREENER_STOCKS.length) return;
@@ -188,16 +238,7 @@ async function loadLTP() {
 
 function startLTPRefresh() {
   if (SCREENER_LTP_TIMER) clearInterval(SCREENER_LTP_TIMER);
-  SCREENER_LTP_TIMER = setInterval(() => {
-    if (document.getElementById('page-screener')?.classList.contains('active')) loadLTP();
-  }, 15000);
-}
-
-function stopLTPRefresh() {
-  if (SCREENER_LTP_TIMER) {
-    clearInterval(SCREENER_LTP_TIMER);
-    SCREENER_LTP_TIMER = null;
-  }
+  SCREENER_LTP_TIMER = setInterval(() => loadLTP(), 15000);
 }
 
 /* ============================================================
@@ -239,7 +280,6 @@ function renderScreenerTable() {
     const risk = ltp && sl ? (ltp - sl) : null;
     const maxQty = risk && risk > 0 ? Math.floor(PER_TRADE / risk) : '—';
 
-    // Breakout logic
     let breakout = '—', bColor = 'var(--text-muted)';
     if (ltp) {
       if (ltp > c.high) { breakout = '🚀 Bullish Breakout'; bColor = 'var(--success)'; }

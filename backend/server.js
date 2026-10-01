@@ -568,8 +568,21 @@ async function fetchClosingPrices() {
     if (p.phase !== 'ready') return;
     const tokens = STOCKS.map(s => s.token);
     console.log(`🔔 Fetching closing prices for ${tokens.length} stocks...`);
-    await getLTPForTokens(tokens);
-    console.log('✅ Closing prices cached');
+
+    const results = await getLTPForTokens(tokens);
+
+    // Save each LTP to DB
+    let saved = 0;
+    for (const r of results) {
+      if (r.ltp) {
+        saved++;
+        db.query(
+          `UPDATE angel_15m_candle SET ltp=$1, ltp_updated_at=NOW() WHERE date=$2 AND token=$3`,
+          [r.ltp, p.date, r.token]
+        ).catch(() => {});
+      }
+    }
+    console.log(`✅ Closing prices saved to DB: ${saved}/${tokens.length}`);
   } catch (e) { console.error('Closing price fetch failed:', e.message); }
 }
 

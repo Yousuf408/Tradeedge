@@ -1,9 +1,8 @@
 /* ============================================================
    ANGEL_REST.js
    ALL Angel One REST logic in one file
-   Auto-login with platform credentials (from .env)
-   In-memory caches for candles + LTP
-   Other files only call the exported functions
+   Uses 1-minute candles aggregated into 9:15-9:30 window
+   (Angel One 15-min @ 9:15 API has a known bug — returns empty)
    ============================================================ */
 
 import crypto from 'crypto';
@@ -14,16 +13,15 @@ const CLIENT_ID = process.env.ANGEL_CLIENT_ID;
 const PIN = process.env.ANGEL_PIN;
 const TOTP_SECRET = process.env.ANGEL_TOTP_SECRET;
 
-/* ---- Session (single platform account) ---- */
 const session = { jwtToken: null, feedToken: null, expiresAt: null, loginTime: null };
 
-/* ---- Caches ---- */
-const candleCache = new Map();   // `${token}_${date}` → candle
-const ltpCache = new Map();      // token → { price, ts }
-const LTP_TTL = 10000;           // 10 seconds
+const candleCache = new Map();
+const ltpCache = new Map();
+const failedCache = new Map();
+const LTP_TTL = 10000;
 
 /* ============================================================
-   BASE32 + TOTP (RFC 6238)
+   BASE32 + TOTP
    ============================================================ */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
@@ -58,7 +56,7 @@ function generateTOTP(secret) {
 }
 
 /* ============================================================
-   HTTP HELPERS
+   HTTP
    ============================================================ */
 function buildHeaders() {
   const h = {
@@ -83,7 +81,7 @@ async function post(path, body) {
 }
 
 /* ============================================================
-   LOGIN (auto, platform credentials)
+   LOGIN
    ============================================================ */
 export async function loginPlatform() {
   if (!API_KEY || !CLIENT_ID || !PIN || !TOTP_SECRET) {
@@ -119,9 +117,6 @@ async function ensureLoggedIn() {
   }
 }
 
-/* ============================================================
-   STATUS
-   ============================================================ */
 export function getSessionStatus() {
   return {
     loggedIn: !!session.jwtToken && Date.now() < session.expiresAt,
@@ -131,7 +126,7 @@ export function getSessionStatus() {
 }
 
 /* ============================================================
-   CANDLES (cached per day)
+   CANDLES — 1-minute bars aggregated into 9:15–9:30 window
    ============================================================ */
 export async function getCandlesForToken(token, date) {
   const key = `${token}_${date}`;
@@ -144,23 +139,36 @@ export async function getCandlesForToken(token, date) {
     const r = await post('/rest/secure/angelbroking/historical/v1/getCandleData', {
       exchange: 'NSE',
       symboltoken: String(token),
-      interval: 'FIFTEEN_MINUTE',
+      interval: 'ONE_MINUTE',
       fromdate: `${date} 09:15`,
-      todate: `${date} 09:16`
+      todate: `${date} 09:30`
     });
 
-        // DEBUG — log exact Angel One error response
     if (!r.status || !r.data?.length) {
-      console.log(`🔍 FAIL token=${token} status=${r.status} msg="${r.message || r.errorcode || 'unknown'}" data=${JSON.stringify(r.data).slice(0,120)}`);
+      const errMsg = r.message || r.errorcode || 'No data';
+      failedCache.set(key, { error: errMsg, ts: Date.now() });
+      console.log(`🔍 FAIL token=${token} msg="${errMsg}"`);
+      return { error: errMsg };
     }
 
-    if (r.status && r.data?.length) {
-      const candle = r.data[0];
-      candleCache.set(key, candle);
-      return candle;
-    }
-    return { error: 'No data', raw: r };
+    // Aggregate 1-min bars → single 9:15-9:30 candle
+    // bar format: [timestamp, open, high, low, close, volume]
+    const bars = r.data;
+    const agg = [
+      bars[0][0],
+      bars[0][1],
+      Math.max(...bars.map(x => x[2])),
+      Math.min(...bars.map(x => x[3])),
+      bars[bars.length - 1][4],
+      bars.reduce((s, x) => s + (x[5] || 0), 0)
+    ];
+
+    candleCache.set(key, agg);
+    failedCache.delete(key);
+    return agg;
   } catch (e) {
+    failedCache.set(key, { error: e.message, ts: Date.now() });
+    console.log(`🔍 THROW token=${token} err="${e.message}"`);
     return { error: e.message };
   }
 }
@@ -170,12 +178,11 @@ export async function getCandlesForTokens(tokens, date) {
   for (const token of tokens) {
     const candle = await getCandlesForToken(token, date);
     results.push({ token: String(token), candle });
-    await new Promise(r => setTimeout(r, 400));  // 3 req/sec rate limit
+    await new Promise(r => setTimeout(r, 400));
   }
   return results;
 }
 
-/* Return all cached candles for a date instantly (no API calls) */
 export function getCachedCandles(tokens, date) {
   return tokens.map(t => ({
     token: String(t),
@@ -183,8 +190,16 @@ export function getCachedCandles(tokens, date) {
   }));
 }
 
+export function getFailedList(date) {
+  const out = [];
+  for (const [k, v] of failedCache) {
+    if (k.endsWith(`_${date}`)) out.push({ token: k.split('_')[0], error: v.error });
+  }
+  return out;
+}
+
 /* ============================================================
-   LTP (batch, 50 tokens per call, 10s cache)
+   LTP (batch, 50 per call)
    ============================================================ */
 export async function getLTPForTokens(tokens) {
   const ok = await ensureLoggedIn();
@@ -220,8 +235,5 @@ export async function getLTPForTokens(tokens) {
   }));
 }
 
-/* ============================================================
-   CACHE CLEAR
-   ============================================================ */
 export function clearCandleCache() { candleCache.clear(); }
 export function clearLtpCache() { ltpCache.clear(); }

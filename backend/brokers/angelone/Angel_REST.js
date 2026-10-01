@@ -354,6 +354,15 @@ export function getFailedList(date) {
 }
 
 /* ============================================================
+   DB → MEMORY CACHE LOADER SUPPORT
+   Called by server.js on startup to rehydrate memory cache
+   from Supabase (Render restarts wipe memory).
+   ============================================================ */
+export function setCachedCandle(token, date, candle) {
+  candleCache.set(`${token}_${date}`, candle);
+}
+
+/* ============================================================
    LTP (batch, 50 per call)  — FIX #6
    ============================================================ */
 function isMarketHoursIST() {

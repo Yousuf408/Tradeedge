@@ -37,11 +37,7 @@ const STOCKS = JSON.parse(
 );
 
 /* ============================================================
-   SCREENER PHASES
-   closed   → weekday before 9:15        → blank
-   forming  → weekday 9:15 - 9:30        → "searching right stock"
-   ready    → weekday after 9:30         → today's candles
-   weekend  → Sat/Sun                    → last Friday's candles
+   SECTION 1 — SCREENER STATE + PHASES
    ============================================================ */
 const screenerState = {
   status: 'idle',
@@ -52,14 +48,18 @@ const screenerState = {
   error: null
 };
 
+/* Fetch tuning */
+const FETCH_CONCURRENCY = 3;      // 3 parallel workers
+const FETCH_DELAY_MS = 1000;      // 1s per worker → ~3 req/sec (Angel One limit)
+
 function getIST() {
   return new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 }
-
 function addDays(d, n) {
   return new Date(d.getTime() + n * 864e5).toISOString().split('T')[0];
 }
 
+/* Phase resolver: closed / forming / ready / weekend */
 function getScreenerPhase() {
   const ist = getIST();
   const dow = ist.getUTCDay();
@@ -67,51 +67,122 @@ function getScreenerPhase() {
 
   if (dow === 0) return { phase: 'weekend', date: addDays(ist, -2) };
   if (dow === 6) return { phase: 'weekend', date: addDays(ist, -1) };
-  if (mins < 555) return { phase: 'closed' };           // before 9:15
-  if (mins < 570) return { phase: 'forming' };          // 9:15 - 9:30
-  return { phase: 'ready', date: addDays(ist, 0) };     // after 9:30
+  if (mins < 555) return { phase: 'closed' };
+  if (mins < 570) return { phase: 'forming' };
+  return { phase: 'ready', date: addDays(ist, 0) };
 }
 
-/* Auto-clear cache when phase changes back to closed (fresh morning) */
-let lastPhase = null;
-setInterval(() => {
-  const p = getScreenerPhase();
-  if (p.phase === 'closed' && lastPhase && lastPhase !== 'closed') {
-    screenerState.status = 'idle';
-    screenerState.date = null;
-    screenerState.progress = 0;
-    console.log('🔄 Morning reset — cache cleared');
+/* ============================================================
+   SECTION 2 — PARALLEL FETCHER (no external dependency)
+   Runs N workers pulling tokens from a shared queue.
+   Respects Angel One rate limits via per-worker delay.
+   ============================================================ */
+async function fetchCandlesParallel(tokens, date) {
+  const queue = [...tokens];
+  const results = [];
+  let failed = 0;
+
+  async function worker() {
+    while (queue.length) {
+      const token = queue.shift();
+      try {
+        const batch = await getCandlesForTokens([token], date);
+        if (batch[0]) results.push(batch[0]);
+        else failed++;
+      } catch (e) {
+        failed++;
+      }
+      if (queue.length) await new Promise(r => setTimeout(r, FETCH_DELAY_MS));
+    }
   }
-  lastPhase = p.phase;
-}, 30 * 1000);
+
+  await Promise.all(
+    Array.from({ length: FETCH_CONCURRENCY }, () => worker())
+  );
+
+  return { fetched: results.length, failed };
+}
+
+/* ============================================================
+   SECTION 3 — BACKGROUND FETCH JOB
+   ============================================================ */
+let fetchInProgress = false;
 
 async function runScreenerFetch(date) {
+  if (fetchInProgress) return;
+  if (screenerState.status === 'ready' && screenerState.date === date) return;
+  if (screenerState.status === 'fetching' && screenerState.date === date) return;
+
+  fetchInProgress = true;
   screenerState.status = 'fetching';
   screenerState.date = date;
   screenerState.progress = 0;
   screenerState.startedAt = Date.now();
   screenerState.error = null;
 
-  const BATCH = 20;
-  const DELAY = 7000;
-  const tokens = STOCKS.map(s => s.token);
+  console.log(`▶️  Screener fetch started for ${date}`);
+
+  // Progress updater — updates every 5s during fetch
+  const progressTimer = setInterval(() => {
+    const elapsed = Math.round((Date.now() - screenerState.startedAt) / 1000);
+    console.log(`⏳ Fetching ${date} — ${elapsed}s elapsed`);
+  }, 5000);
 
   try {
-    for (let i = 0; i < tokens.length; i += BATCH) {
-      await getCandlesForTokens(tokens.slice(i, i + BATCH), date);
-      screenerState.progress = Math.min(i + BATCH, tokens.length);
-      if (i + BATCH < tokens.length) await new Promise(r => setTimeout(r, DELAY));
-    }
+    const tokens = STOCKS.map(s => s.token);
+    const { fetched, failed } = await fetchCandlesParallel(tokens, date);
+    screenerState.progress = fetched;
     screenerState.status = 'ready';
-    console.log(`✅ Screener fetch done: ${date}`);
+    console.log(`✅ Screener fetch done — ${fetched} candles (${failed} failed) in ${Math.round((Date.now() - screenerState.startedAt)/1000)}s`);
   } catch (e) {
     screenerState.status = 'error';
     screenerState.error = e.message;
+    console.error('❌ Screener fetch failed:', e.message);
+  } finally {
+    clearInterval(progressTimer);
+    fetchInProgress = false;
   }
 }
 
 /* ============================================================
-   MIDDLEWARE + HELPERS
+   SECTION 4 — AUTO-FETCH SCHEDULER (fires at 9:31 IST)
+   ============================================================ */
+function msUntilNext931IST() {
+  const ist = getIST();
+  const dow = ist.getUTCDay();
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+
+  const target = new Date(ist);
+  target.setUTCHours(0, 0, 0, 0);
+  target.setUTCMinutes(571);  // 9:31 IST = 571 minutes
+
+  // If past 9:31 today → schedule next day
+  if (mins >= 571) target.setUTCDate(target.getUTCDate() + 1);
+
+  // Skip weekends
+  const targetDow = target.getUTCDay();
+  if (targetDow === 6) target.setUTCDate(target.getUTCDate() + 2);  // Sat → Mon
+  if (targetDow === 0) target.setUTCDate(target.getUTCDate() + 1);  // Sun → Mon
+
+  return target.getTime() - ist.getTime();
+}
+
+function scheduleNextAutoFetch() {
+  const ms = msUntilNext931IST();
+  const mins = Math.round(ms / 60000);
+  console.log(`⏰ Next auto-fetch in ${mins} min`);
+  setTimeout(async () => {
+    const p = getScreenerPhase();
+    if (p.phase === 'ready') {
+      console.log(`⏰ Auto-fetch triggered for ${p.date}`);
+      await runScreenerFetch(p.date);
+    }
+    scheduleNextAutoFetch();
+  }, ms);
+}
+
+/* ============================================================
+   SECTION 5 — MIDDLEWARE + HELPERS
    ============================================================ */
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
@@ -190,12 +261,12 @@ function verifyTotpServer(secret, input) {
 }
 
 /* ============================================================
-   HEALTH
+   SECTION 6 — HEALTH
    ============================================================ */
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
 
 /* ============================================================
-   AUTH
+   SECTION 7 — AUTH ROUTES
    ============================================================ */
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
@@ -299,7 +370,7 @@ app.post('/api/logout', auth, async (req, res) => {
 });
 
 /* ============================================================
-   FORGOT PASSWORD
+   SECTION 8 — FORGOT PASSWORD
    ============================================================ */
 app.post('/api/forgot-password/check', async (req, res) => {
   const { input } = req.body;
@@ -347,7 +418,7 @@ app.post('/api/forgot-password/reset', async (req, res) => {
 });
 
 /* ============================================================
-   CHANGE PASSWORD
+   SECTION 9 — CHANGE PASSWORD + SELF PROFILE
    ============================================================ */
 app.post('/api/change-password', auth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
@@ -377,9 +448,6 @@ app.post('/api/change-password', auth, async (req, res) => {
   res.json({ ok: true, token, sessionId: newSessionId });
 });
 
-/* ============================================================
-   SELF PROFILE
-   ============================================================ */
 app.put('/api/me', auth, async (req, res) => {
   const { name, mobile } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
@@ -401,7 +469,7 @@ app.put('/api/me', auth, async (req, res) => {
 });
 
 /* ============================================================
-   USERS (admin)
+   SECTION 10 — USERS (admin)
    ============================================================ */
 app.get('/api/users', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query(
@@ -506,7 +574,7 @@ app.delete('/api/users/:username', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   AUDIT
+   SECTION 11 — AUDIT + PRICES
    ============================================================ */
 app.get('/api/audit', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200');
@@ -518,9 +586,6 @@ app.delete('/api/audit', auth, adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ============================================================
-   PRICES
-   ============================================================ */
 app.get('/api/prices', auth, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM prices');
   const out = {};
@@ -536,12 +601,11 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SCREENER ROUTES
+   SECTION 12 — SCREENER ROUTES
    ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
 
-/* Phase + progress — always safe to call */
 app.get('/api/screener/status', auth, (req, res) => {
   const p = getScreenerPhase();
   res.json({
@@ -553,14 +617,12 @@ app.get('/api/screener/status', auth, (req, res) => {
   });
 });
 
-/* Trigger fetch if needed — routes by phase */
 app.post('/api/screener/ensure', auth, async (req, res) => {
   const p = getScreenerPhase();
 
   if (p.phase === 'closed')  return res.json({ phase: 'closed' });
   if (p.phase === 'forming') return res.json({ phase: 'forming', opensAt: '9:30' });
 
-  // weekend or ready — have a target date
   if (screenerState.status === 'fetching' && screenerState.date === p.date) {
     return res.json({ phase: 'fetching', progress: screenerState.progress, total: screenerState.total });
   }
@@ -568,13 +630,11 @@ app.post('/api/screener/ensure', auth, async (req, res) => {
     return res.json({ phase: 'ready', date: p.date });
   }
 
-  screenerState.status = 'idle';
-  screenerState.date = null;
-  runScreenerFetch(p.date);
+  // Not fetched yet — start now
+  runScreenerFetch(p.date);   // fire-and-forget
   res.json({ phase: 'fetching', progress: 0, total: screenerState.total, date: p.date });
 });
 
-/* Fast — cached candles only, no API calls */
 app.get('/api/screener/data', auth, (req, res) => {
   const p = getScreenerPhase();
   if (p.phase === 'closed')  return res.json({ ok: false, phase: 'closed' });
@@ -584,7 +644,6 @@ app.get('/api/screener/data', auth, (req, res) => {
   res.json({ ok: true, phase: p.phase, date: p.date, results: candles, stocks: STOCKS });
 });
 
-/* LTP batch */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) {
@@ -595,7 +654,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 });
 
 /* ============================================================
-   START
+   SECTION 13 — START
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
@@ -606,4 +665,12 @@ app.listen(PORT, async () => {
   } catch (e) {
     console.error('⚠️ Angel One login failed at startup:', e.message);
   }
+
+  // Auto-fetch: if we're past 9:31 and data missing → fetch now
+  const p = getScreenerPhase();
+  if (p.phase === 'ready' && screenerState.status !== 'ready') {
+    console.log('🔁 Startup fetch — post 9:31, fetching today\'s data');
+    runScreenerFetch(p.date);
+  }
+  scheduleNextAutoFetch();
 });

@@ -50,7 +50,7 @@ const screenerState = {
 };
 
 const BATCH_SIZE = 20;
-const BATCH_DELAY = 7000;
+const BATCH_DELAY = 10000;
 const RETRY_BATCH_SIZE = 10;
 const RETRY_DELAY = 10000;
 const MAX_RETRIES = 2;

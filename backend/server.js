@@ -40,7 +40,9 @@ const STOCKS = JSON.parse(
 const SYM_BY_TOKEN = {};
 STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
 
-/* ---------- Time / phase ---------- */
+/* ============================================================
+   SECTION 1 — TIME / PHASE
+   ============================================================ */
 function getIST() { return new Date(Date.now() + 5.5 * 60 * 60 * 1000); }
 function addDays(d, n) { return new Date(d.getTime() + n * 864e5).toISOString().split('T')[0]; }
 
@@ -60,7 +62,9 @@ function countFilled(date) {
   return cached.filter(c => c.candle && !c.candle.error && Array.isArray(c.candle)).length;
 }
 
-/* ---------- ORB state ---------- */
+/* ============================================================
+   SECTION 2 — ORB STATE
+   ============================================================ */
 const orbState = new Map();
 
 async function loadOrbStateFromDB(date) {
@@ -87,7 +91,9 @@ function getOrbState(token, date) {
   };
 }
 
-/* ---------- Middleware + helpers ---------- */
+/* ============================================================
+   SECTION 3 — MIDDLEWARE + HELPERS
+   ============================================================ */
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'No token' });
@@ -155,10 +161,14 @@ function verifyTotpServer(secret, input) {
   return false;
 }
 
-/* ---------- Health ---------- */
+/* ============================================================
+   SECTION 4 — HEALTH
+   ============================================================ */
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
 
-/* ---------- Auth ---------- */
+/* ============================================================
+   SECTION 5 — AUTH
+   ============================================================ */
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
   const clean = (input || '').trim().toLowerCase();
@@ -249,7 +259,9 @@ app.post('/api/logout', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ---------- Forgot password ---------- */
+/* ============================================================
+   SECTION 6 — FORGOT PASSWORD
+   ============================================================ */
 app.post('/api/forgot-password/check', async (req, res) => {
   const { input } = req.body;
   const clean = (input || '').trim().toLowerCase();
@@ -294,7 +306,9 @@ app.post('/api/forgot-password/reset', async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ---------- Change password + profile ---------- */
+/* ============================================================
+   SECTION 7 — CHANGE PASSWORD + PROFILE
+   ============================================================ */
 app.post('/api/change-password', auth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Missing fields' });
@@ -340,7 +354,9 @@ app.put('/api/me', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* ---------- Users (admin) ---------- */
+/* ============================================================
+   SECTION 8 — USERS (admin)
+   ============================================================ */
 app.get('/api/users', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query(
     `SELECT id, name, username, mobile, role, plan, expires_at AS "expiresAt",
@@ -437,7 +453,9 @@ app.delete('/api/users/:username', auth, adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ---------- Audit + prices ---------- */
+/* ============================================================
+   SECTION 9 — AUDIT + PRICES
+   ============================================================ */
 app.get('/api/audit', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200');
   res.json(rows);
@@ -459,7 +477,9 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ---------- Screener ---------- */
+/* ============================================================
+   SECTION 10 — SCREENER
+   ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
 
@@ -561,7 +581,10 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
   res.json({ ok: true, count: enriched.length, results: enriched });
 });
 
-/* ---------- Closing fetch at 15:34 IST ---------- */
+/* ============================================================
+   SECTION 11 — CLOSING PRICE FETCH (15:34 IST)
+   Also used to backfill LTP anytime
+   ============================================================ */
 async function fetchClosingPrices() {
   try {
     const p = getScreenerPhase();
@@ -571,7 +594,6 @@ async function fetchClosingPrices() {
 
     const results = await getLTPForTokens(tokens);
 
-    // Save each LTP to DB
     let saved = 0;
     for (const r of results) {
       if (r.ltp) {
@@ -585,6 +607,34 @@ async function fetchClosingPrices() {
     console.log(`✅ Closing prices saved to DB: ${saved}/${tokens.length}`);
   } catch (e) { console.error('Closing price fetch failed:', e.message); }
 }
+
+/* Admin: force-fetch LTPs now (bypass market hours for backfill) */
+app.post('/api/admin/force-ltp', auth, adminOnly, async (req, res) => {
+  try {
+    const p = getScreenerPhase();
+    if (!p.date) return res.status(400).json({ error: 'No trading date' });
+    const tokens = STOCKS.map(s => s.token);
+
+    let saved = 0, failed = 0;
+    for (let i = 0; i < tokens.length; i += 50) {
+      const batch = tokens.slice(i, i + 50);
+      const ltpResults = await getLTPForTokens(batch);
+      for (const r of ltpResults) {
+        if (r.ltp) {
+          saved++;
+          setCachedLTP(r.token, r.ltp);
+          await db.query(
+            `UPDATE angel_15m_candle SET ltp=$1, ltp_updated_at=NOW() WHERE date=$2 AND token=$3`,
+            [r.ltp, p.date, r.token]
+          );
+        } else failed++;
+      }
+    }
+    res.json({ ok: true, saved, failed, total: tokens.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 function msUntilNext1534IST() {
   const ist = getIST();
@@ -605,7 +655,9 @@ function scheduleClosingFetch() {
   setTimeout(async () => { await fetchClosingPrices(); scheduleClosingFetch(); }, ms);
 }
 
-/* ---------- DB → memory cache loader ---------- */
+/* ============================================================
+   SECTION 12 — LOAD CACHE FROM DB
+   ============================================================ */
 async function loadScreenerCacheFromDB() {
   try {
     const p = getScreenerPhase();
@@ -623,7 +675,9 @@ async function loadScreenerCacheFromDB() {
   } catch (e) { console.error('DB load failed:', e.message); }
 }
 
-/* ---------- Start ---------- */
+/* ============================================================
+   SECTION 13 — START
+   ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server on port ${PORT}`);

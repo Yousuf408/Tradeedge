@@ -1,8 +1,36 @@
 /* ============================================================
-   ANGEL_REST.js
-   ALL Angel One REST logic in one file
+   ANGEL_REST.js  —  FIXED VERSION (drop-in replacement)
    Uses 1-minute candles aggregated into 9:15-9:30 window
    (Angel One 15-min @ 9:15 API has a known bug — returns empty)
+
+   ------------------------------------------------------------
+   WHY IT BROKE:
+   Angel One's rate limiter intermittently returns HTTP 403 with
+   a PLAIN-TEXT body:  "Access denied because of exceeding access rate"
+   (not JSON!). The old code did r.json() on that body, which throws:
+   Unexpected token 'A', "Access den"... is not valid JSON
+   This is a documented, ongoing Angel-side bug (false positives even
+   far below the documented limits) — see SmartAPI forum topics
+   5560 / 5639 etc. That's why it "suddenly" broke with no code change.
+
+   FIXES IN THIS FILE:
+   #1  post() reads the response as TEXT first, then tries JSON.parse.
+       Non-JSON responses no longer crash with a confusing SyntaxError —
+       you now see the real HTTP status + body in the logs.
+   #2  Automatic retry with exponential backoff + jitter on
+       403 / 429 / "Access denied" responses.
+   #3  Global cooldown: when rate-limited, ALL Angel calls pause for a
+       while instead of burning through the whole token list while the
+       limiter is blocking you.
+   #4  Circuit breaker in getCandlesForTokens(): aborts the batch after
+       3 consecutive failures so you don't spam a blocked API for 500
+       tokens. Re-click the Fetch button later — it resumes where it
+       left off (only "missing" tokens are fetched).
+   #5  Candle pacing configurable via env (default 1500 ms, was 1200).
+   #6  LTP: cache TTL raised to 30 s (was 10 s) so the client's 15 s
+       poll no longer hits Angel on every tick, and LTP calls are
+       skipped entirely outside market hours (9:10–15:35 IST, Mon–Fri).
+       Fewer total requests on the same API key = fewer 403s.
    ============================================================ */
 
 import crypto from 'crypto';
@@ -13,15 +41,36 @@ const CLIENT_ID = process.env.ANGEL_CLIENT_ID;
 const PIN = process.env.ANGEL_PIN;
 const TOTP_SECRET = process.env.ANGEL_TOTP_SECRET;
 
+const CANDLE_DELAY_MS = Number(process.env.ANGEL_CANDLE_DELAY_MS || 1500); // FIX #5
+const LTP_TTL = 30000;                                                     // FIX #6 (was 10000)
+
 const session = { jwtToken: null, feedToken: null, expiresAt: null, loginTime: null };
 
 const candleCache = new Map();
 const ltpCache = new Map();
 const failedCache = new Map();
-const LTP_TTL = 10000;
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ============================================================
-   BASE32 + TOTP
+   GLOBAL RATE-LIMIT COOLDOWN  (FIX #3)
+   When Angel says "Access denied", pause everything for a bit —
+   hammering on during a block just extends it and floods logs.
+   ============================================================ */
+let cooldownUntil = 0;
+
+function startCooldown(ms, reason) {
+  cooldownUntil = Math.max(cooldownUntil, Date.now() + ms);
+  console.warn(`⛔ Angel cooldown ${Math.round(ms / 1000)}s — ${reason}`);
+}
+
+async function waitForCooldown() {
+  const wait = cooldownUntil - Date.now();
+  if (wait > 0) await sleep(wait);
+}
+
+/* ============================================================
+   BASE32 + TOTP  (unchanged)
    ============================================================ */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
@@ -56,7 +105,7 @@ function generateTOTP(secret) {
 }
 
 /* ============================================================
-   HTTP
+   HTTP  (FIX #1 + #2 + #3)
    ============================================================ */
 function buildHeaders() {
   const h = {
@@ -73,15 +122,51 @@ function buildHeaders() {
   return h;
 }
 
-async function post(path, body) {
-  const r = await fetch(BASE_URL + path, {
-    method: 'POST', headers: buildHeaders(), body: JSON.stringify(body)
-  });
-  return r.json();
+async function post(path, body, { retries = 3, baseBackoff = 2000 } = {}) {
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt > 0) {
+      const backoff = baseBackoff * Math.pow(2, attempt - 1) + Math.random() * 1000; // jitter
+      console.warn(`↻ retry ${attempt}/${retries} for ${path} in ${Math.round(backoff)}ms`);
+      await sleep(backoff);
+    }
+    await waitForCooldown();
+
+    let res, text;
+    try {
+      res = await fetch(BASE_URL + path, {
+        method: 'POST', headers: buildHeaders(), body: JSON.stringify(body)
+      });
+      text = await res.text();               // FIX #1: read as TEXT, never blind r.json()
+    } catch (e) {
+      lastErr = new Error(`Network error: ${e.message}`);
+      continue;                              // network hiccup → retry
+    }
+
+    try {
+      return JSON.parse(text);               // happy path — valid JSON
+    } catch { /* fall through: non-JSON body */ }
+
+    // ---- Non-JSON body = rate limiter / WAF rejection ----
+    const snippet = text.slice(0, 120).replace(/\s+/g, ' ');
+    console.error(`⛔ non-JSON response HTTP ${res.status} from ${path}: "${snippet}"`);
+
+    if (res.status === 403 || res.status === 429 || /access denied/i.test(text)) {
+      startCooldown(20000, `rate-limited on ${path}`);   // FIX #3
+      lastErr = new Error(`Rate limited (HTTP ${res.status}): ${snippet}`);
+      continue;                                          // FIX #2: retry after cooldown
+    }
+
+    // Unexpected non-JSON (HTML error page, proxy error, etc.)
+    throw new Error(`HTTP ${res.status}: ${snippet}`);
+  }
+
+  throw lastErr || new Error('Request failed after retries');
 }
 
 /* ============================================================
-   LOGIN
+   LOGIN  (unchanged logic, now with safe post())
    ============================================================ */
 export async function loginPlatform() {
   if (!API_KEY || !CLIENT_ID || !PIN || !TOTP_SECRET) {
@@ -92,7 +177,8 @@ export async function loginPlatform() {
     clientcode: CLIENT_ID,
     password: PIN,
     totp
-  });
+  }, { retries: 2, baseBackoff: 3000 });   // login limit is 1 req/s — back off longer
+
   if (!r.status || !r.data?.jwtToken) {
     throw new Error(r.message || 'Login failed');
   }
@@ -173,12 +259,28 @@ export async function getCandlesForToken(token, date) {
   }
 }
 
+/* FIX #4 — circuit breaker: stop the batch after 3 consecutive failures
+   (almost always means Angel is rate-limiting us right now). The client
+   only ever sends "missing" tokens, so re-clicking Fetch resumes fine. */
 export async function getCandlesForTokens(tokens, date) {
   const results = [];
+  let consecutiveFails = 0;
+
   for (const token of tokens) {
+    if (consecutiveFails >= 3) {
+      console.error('🛑 Batch aborted — 3 consecutive failures (Angel rate-limit block?). ' +
+                    'Skipped remaining tokens; re-click Fetch in a few minutes to resume.');
+      startCooldown(30000, 'circuit breaker after consecutive failures');
+      break;
+    }
+
     const candle = await getCandlesForToken(token, date);
     results.push({ token: String(token), candle });
-    await new Promise(r => setTimeout(r, 1200));   // 1.2 sec per token
+
+    if (Array.isArray(candle)) consecutiveFails = 0;
+    else consecutiveFails++;
+
+    await sleep(CANDLE_DELAY_MS);   // FIX #5: default 1.5s per token (was 1.2s)
   }
   return results;
 }
@@ -199,16 +301,34 @@ export function getFailedList(date) {
 }
 
 /* ============================================================
-   LTP (batch, 50 per call)
+   LTP (batch, 50 per call)  — FIX #6
    ============================================================ */
+function isMarketHoursIST() {
+  const ist = new Date(Date.now() + 5.5 * 3600 * 1000);   // UTC → IST
+  const dow = ist.getUTCDay();
+  if (dow === 0 || dow === 6) return false;               // weekend
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  return mins >= 9 * 60 + 10 && mins <= 15 * 60 + 35;     // 09:10 – 15:35 IST
+}
+
 export async function getLTPForTokens(tokens) {
+  // Outside market hours: serve whatever is cached, make ZERO API calls.
+  // (The client polls every 15s around the clock — that was burning your
+  //  rate-limit budget on the same API key for nothing.)
+  if (!isMarketHoursIST()) {
+    return tokens.map(t => ({
+      token: String(t),
+      ltp: ltpCache.get(String(t))?.price || null
+    }));
+  }
+
   const ok = await ensureLoggedIn();
   if (!ok) return [];
 
   const now = Date.now();
   const need = tokens.filter(t => {
     const c = ltpCache.get(String(t));
-    return !c || (now - c.ts) > LTP_TTL;
+    return !c || (now - c.ts) > LTP_TTL;   // 30s TTL > 15s client poll → ~half the calls skipped
   });
 
   for (let i = 0; i < need.length; i += 50) {
@@ -217,7 +337,7 @@ export async function getLTPForTokens(tokens) {
       const r = await post('/rest/secure/angelbroking/market/v1/quote', {
         mode: 'LTP',
         exchangeTokens: { NSE: batch }
-      });
+      }, { retries: 2, baseBackoff: 2000 });
       if (r.status && r.data?.fetched) {
         for (const q of r.data.fetched) {
           ltpCache.set(q.symbolToken, { price: q.ltp, ts: now });
@@ -226,7 +346,7 @@ export async function getLTPForTokens(tokens) {
     } catch (e) {
       console.error('LTP batch failed:', e.message);
     }
-    await new Promise(r => setTimeout(r, 300));
+    await sleep(500);   // was 300ms — gentler on the shared per-key limit
   }
 
   return tokens.map(t => ({

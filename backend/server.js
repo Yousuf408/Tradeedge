@@ -31,17 +31,20 @@ const db = new pg.Pool({
 
 const SECRET = process.env.JWT_SECRET;
 
-/* ---- Load stock list ---- */
 const __dir = dirname(fileURLToPath(import.meta.url));
 const STOCKS = JSON.parse(
   readFileSync(join(__dir, 'brokers/angelone/Angel_nifty500.json'), 'utf8')
 );
 
 /* ============================================================
-   SCREENER STATE MACHINE
+   SCREENER PHASES
+   closed   → weekday before 9:15        → blank
+   forming  → weekday 9:15 - 9:30        → "searching right stock"
+   ready    → weekday after 9:30         → today's candles
+   weekend  → Sat/Sun                    → last Friday's candles
    ============================================================ */
 const screenerState = {
-  status: 'idle',       // 'idle' | 'fetching' | 'ready' | 'error'
+  status: 'idle',
   date: null,
   progress: 0,
   total: STOCKS.length,
@@ -53,23 +56,34 @@ function getIST() {
   return new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 }
 
-function formatDate(d) {
-  return d.toISOString().split('T')[0];
+function addDays(d, n) {
+  return new Date(d.getTime() + n * 864e5).toISOString().split('T')[0];
 }
 
-function getTargetDate() {
+function getScreenerPhase() {
   const ist = getIST();
   const dow = ist.getUTCDay();
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
 
-  if (dow === 0) return formatDate(new Date(ist.getTime() - 2 * 864e5));
-  if (dow === 6) return formatDate(new Date(ist.getTime() - 1 * 864e5));
-  if (mins < 570) {
-    if (dow === 1) return formatDate(new Date(ist.getTime() - 3 * 864e5));
-    return formatDate(new Date(ist.getTime() - 1 * 864e5));
-  }
-  return formatDate(ist);
+  if (dow === 0) return { phase: 'weekend', date: addDays(ist, -2) };
+  if (dow === 6) return { phase: 'weekend', date: addDays(ist, -1) };
+  if (mins < 555) return { phase: 'closed' };           // before 9:15
+  if (mins < 570) return { phase: 'forming' };          // 9:15 - 9:30
+  return { phase: 'ready', date: addDays(ist, 0) };     // after 9:30
 }
+
+/* Auto-clear cache when phase changes back to closed (fresh morning) */
+let lastPhase = null;
+setInterval(() => {
+  const p = getScreenerPhase();
+  if (p.phase === 'closed' && lastPhase && lastPhase !== 'closed') {
+    screenerState.status = 'idle';
+    screenerState.date = null;
+    screenerState.progress = 0;
+    console.log('🔄 Morning reset — cache cleared');
+  }
+  lastPhase = p.phase;
+}, 30 * 1000);
 
 async function runScreenerFetch(date) {
   screenerState.status = 'fetching';
@@ -84,42 +98,26 @@ async function runScreenerFetch(date) {
 
   try {
     for (let i = 0; i < tokens.length; i += BATCH) {
-      const batch = tokens.slice(i, i + BATCH);
-      await getCandlesForTokens(batch, date);
+      await getCandlesForTokens(tokens.slice(i, i + BATCH), date);
       screenerState.progress = Math.min(i + BATCH, tokens.length);
       if (i + BATCH < tokens.length) await new Promise(r => setTimeout(r, DELAY));
     }
     screenerState.status = 'ready';
-    console.log(`✅ Screener fetch complete: ${screenerState.progress} candles for ${date}`);
+    console.log(`✅ Screener fetch done: ${date}`);
   } catch (e) {
     screenerState.status = 'error';
     screenerState.error = e.message;
-    console.error('❌ Screener fetch failed:', e.message);
   }
 }
 
-let lastResetDate = formatDate(getIST());
-setInterval(() => {
-  const today = formatDate(getIST());
-  if (today !== lastResetDate) {
-    lastResetDate = today;
-    screenerState.status = 'idle';
-    screenerState.date = null;
-    screenerState.progress = 0;
-    console.log('🔄 Screener cache reset for new day');
-  }
-}, 60 * 1000);
-
 /* ============================================================
-   MIDDLEWARE
+   MIDDLEWARE + HELPERS
    ============================================================ */
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'No token' });
-  try {
-    req.user = jwt.verify(token, SECRET);
-    next();
-  } catch { res.status(401).json({ error: 'Invalid token' }); }
+  try { req.user = jwt.verify(token, SECRET); next(); }
+  catch { res.status(401).json({ error: 'Invalid token' }); }
 }
 
 function adminOnly(req, res, next) {
@@ -140,13 +138,11 @@ async function generateUsername(fullName, mobile) {
   const first = (fullName || '').trim().split(/\s+/)[0].toLowerCase().replace(/[^a-z0-9]/g, '');
   const last4 = (mobile || '').replace(/\D/g, '').slice(-4);
   const base = (first || 'user') + last4;
-  let candidate = base;
-  let i = 1;
+  let candidate = base, i = 1;
   while (true) {
     const { rows } = await db.query('SELECT 1 FROM users WHERE username=$1', [candidate]);
     if (!rows.length) return candidate;
-    candidate = base + i;
-    i++;
+    candidate = base + i++;
   }
 }
 
@@ -157,7 +153,6 @@ function generatePassword(fullName, mobile) {
   return `${cap}@${last4}!`;
 }
 
-/* ---- TOTP server verify ---- */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 function base32Decode(str) {
@@ -274,8 +269,7 @@ app.post('/api/complete-login', async (req, res) => {
   await log(username, 'LOGIN_SUCCESS', `User: ${username}`, 'success');
 
   res.json({
-    ok: true,
-    token,
+    ok: true, token,
     user: {
       name: user.name, username: user.username, role: user.role,
       plan: user.plan, expiresAt: user.expires_at, mobile: user.mobile,
@@ -319,8 +313,8 @@ app.post('/api/forgot-password/check', async (req, res) => {
   );
   const user = rows[0];
   if (!user) return res.status(404).json({ error: 'No account found' });
-  if (user.disabled) return res.status(403).json({ error: 'Account disabled — contact admin' });
-  if (!user.totp_secret) return res.status(400).json({ error: 'No 2FA set up — contact admin' });
+  if (user.disabled) return res.status(403).json({ error: 'Account disabled' });
+  if (!user.totp_secret) return res.status(400).json({ error: 'No 2FA set up' });
 
   res.json({ ok: true, username: user.username, name: user.name });
 });
@@ -364,18 +358,15 @@ app.post('/api/change-password', auth, async (req, res) => {
   const user = rows[0];
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const ok = await bcrypt.compare(currentPassword, user.password_hash);
-  if (!ok) {
+  if (!await bcrypt.compare(currentPassword, user.password_hash)) {
     await log(req.user.username, 'PASSWORD_CHANGE_FAILED', 'Wrong current password', 'danger');
     return res.status(401).json({ error: 'Current password is incorrect' });
   }
 
   const hash = await bcrypt.hash(newPassword, 10);
   const newSessionId = crypto.randomUUID();
-  await db.query(
-    'UPDATE users SET password_hash=$1, session_id=$2 WHERE username=$3',
-    [hash, newSessionId, req.user.username]
-  );
+  await db.query('UPDATE users SET password_hash=$1, session_id=$2 WHERE username=$3',
+    [hash, newSessionId, req.user.username]);
 
   const token = jwt.sign(
     { username: user.username, role: user.role, sessionId: newSessionId },
@@ -402,10 +393,8 @@ app.put('/api/me', auth, async (req, res) => {
       );
       if (dup.rows.length) return res.status(409).json({ error: 'Mobile already in use' });
     }
-    await db.query(
-      'UPDATE users SET name=$1, mobile=$2 WHERE username=$3',
-      [name.trim(), cleanMobile, req.user.username]
-    );
+    await db.query('UPDATE users SET name=$1, mobile=$2 WHERE username=$3',
+      [name.trim(), cleanMobile, req.user.username]);
     await log(req.user.username, 'PROFILE_UPDATED', `User: ${req.user.username}`, 'success');
     res.json({ ok: true, name: name.trim(), mobile: cleanMobile });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -462,10 +451,8 @@ app.put('/api/users/:username', auth, adminOnly, async (req, res) => {
       );
       if (dup.rows.length) return res.status(409).json({ error: 'Mobile already in use' });
     }
-    await db.query(
-      'UPDATE users SET name=$1, mobile=$2, plan=$3, role=$4 WHERE username=$5',
-      [name, cleanMobile, plan, role, target]
-    );
+    await db.query('UPDATE users SET name=$1, mobile=$2, plan=$3, role=$4 WHERE username=$5',
+      [name, cleanMobile, plan, role, target]);
     await log(req.user.username, 'USER_UPDATED', `${target}`, 'success');
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -549,54 +536,55 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SCREENER
+   SCREENER ROUTES
    ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
-
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
 
+/* Phase + progress — always safe to call */
 app.get('/api/screener/status', auth, (req, res) => {
-  const targetDate = getTargetDate();
+  const p = getScreenerPhase();
   res.json({
-    status: screenerState.status,
-    date: screenerState.date,
-    targetDate,
+    phase: p.phase,
+    date: p.date || screenerState.date,
     progress: screenerState.progress,
     total: screenerState.total,
-    error: screenerState.error,
-    lastUpdated: screenerState.startedAt
+    error: screenerState.error
   });
 });
 
+/* Trigger fetch if needed — routes by phase */
 app.post('/api/screener/ensure', auth, async (req, res) => {
-  const targetDate = getTargetDate();
+  const p = getScreenerPhase();
 
-  if (screenerState.status === 'fetching') {
-    return res.json({ status: 'fetching', progress: screenerState.progress, total: screenerState.total });
+  if (p.phase === 'closed')  return res.json({ phase: 'closed' });
+  if (p.phase === 'forming') return res.json({ phase: 'forming', opensAt: '9:30' });
+
+  // weekend or ready — have a target date
+  if (screenerState.status === 'fetching' && screenerState.date === p.date) {
+    return res.json({ phase: 'fetching', progress: screenerState.progress, total: screenerState.total });
   }
-
-  if (screenerState.status === 'ready' && screenerState.date === targetDate) {
-    return res.json({ status: 'ready', date: targetDate });
+  if (screenerState.status === 'ready' && screenerState.date === p.date) {
+    return res.json({ phase: 'ready', date: p.date });
   }
 
   screenerState.status = 'idle';
   screenerState.date = null;
-  runScreenerFetch(targetDate);
-  res.json({ status: 'fetching', progress: 0, total: screenerState.total, date: targetDate });
+  runScreenerFetch(p.date);
+  res.json({ phase: 'fetching', progress: 0, total: screenerState.total, date: p.date });
 });
 
-/* Fast — returns cached candles instantly, no API calls */
+/* Fast — cached candles only, no API calls */
 app.get('/api/screener/data', auth, (req, res) => {
-  const targetDate = getTargetDate();
-  const candles = getCachedCandles(STOCKS.map(s => s.token), targetDate);
-  res.json({
-    ok: true,
-    date: targetDate,
-    results: candles,
-    stocks: STOCKS
-  });
+  const p = getScreenerPhase();
+  if (p.phase === 'closed')  return res.json({ ok: false, phase: 'closed' });
+  if (p.phase === 'forming') return res.json({ ok: false, phase: 'forming' });
+
+  const candles = getCachedCandles(STOCKS.map(s => s.token), p.date);
+  res.json({ ok: true, phase: p.phase, date: p.date, results: candles, stocks: STOCKS });
 });
 
+/* LTP batch */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) {

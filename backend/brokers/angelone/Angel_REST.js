@@ -178,7 +178,7 @@ export async function getCandlesForTokens(tokens, date) {
   for (const token of tokens) {
     const candle = await getCandlesForToken(token, date);
     results.push({ token: String(token), candle });
-    await new Promise(r => setTimeout(r, 400));
+    await new Promise(r => setTimeout(r, 1200));   // 1.2 sec per token
   }
   return results;
 }

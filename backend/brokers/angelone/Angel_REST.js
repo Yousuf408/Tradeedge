@@ -417,3 +417,7 @@ export async function getLTPForTokens(tokens) {
 
 export function clearCandleCache() { candleCache.clear(); }
 export function clearLtpCache() { ltpCache.clear(); }
+
+export function setCachedLTP(token, price) {
+  ltpCache.set(String(token), { price: +price, ts: Date.now() });
+}

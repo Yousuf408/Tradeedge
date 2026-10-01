@@ -1,19 +1,21 @@
 /* ============================================================
    SCREENER.JS
-   Live 9:15 candles + LTP + SL + MAXQTY + Breakout
-   Phase-aware: closed / forming / fetching / ready / weekend
-   Shows progress (filled/total) during fetch, date when done
+   Manual button-triggered fetch with progress bar
+   Client sends 20 tokens per batch → server fetches → client waits 7s
    ============================================================ */
 
 let SCREENER_STOCKS = [];
 let SCREENER_CANDLES = {};
 let SCREENER_LTP = {};
 let SCREENER_INIT_DONE = false;
-let SCREENER_POLL_TIMER = null;
 let SCREENER_LTP_TIMER = null;
+let FETCHING = false;
 
 let PER_TRADE = 10000;
 let SL_PCT = 1;
+
+const BATCH_SIZE = 20;
+const BATCH_DELAY = 7000;
 
 /* ============================================================
    SECTION 1 — INIT
@@ -24,15 +26,14 @@ async function initScreener() {
     if (!SCREENER_LTP_TIMER) startLTPRefresh();
     return;
   }
-
   setupControls();
   await loadStockList();
-  await ensureDataLoaded();
+  await loadCachedData();
   SCREENER_INIT_DONE = true;
 }
 
 /* ============================================================
-   SECTION 2 — CONTROLS
+   SECTION 2 — CONTROLS (button + Per-Trade + SL)
    ============================================================ */
 function setupControls() {
   const controls = document.querySelector('.screener-controls');
@@ -44,39 +45,44 @@ function setupControls() {
   });
   controls.querySelectorAll('button, label').forEach(el => el.style.display = 'none');
 
-  if (!document.getElementById('screenerStatusPill')) {
-    controls.innerHTML = `
-      <span id="screenerStatusPill"
-            style="font-size:12px;font-weight:600;color:var(--text-muted);padding:6px 14px;
-                   background:rgba(108,92,231,0.06);border-radius:20px">Loading...</span>
-      <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:16px">Per-Trade ₹</label>
-      <input id="perTradeInput" type="number" value="10000" min="100"
-             style="width:120px;padding:8px 12px;border:2px solid rgba(0,0,0,0.06);border-radius:10px;
-                    font-size:13px;font-family:inherit"
-             onchange="onPerTradeChange()" />
-      <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">SL</label>
-      <select id="slPctSelect" onchange="onSlChange()"
-              style="padding:8px 12px;border:2px solid rgba(0,0,0,0.06);border-radius:10px;
-                     font-size:13px;font-family:inherit;cursor:pointer">
-        <option value="0.5">0.5% Fixed</option>
-        <option value="1" selected>1% Fixed</option>
-        <option value="2">2% Fixed</option>
-      </select>`;
-  }
+  controls.innerHTML = `
+    <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
+    <span id="screenerStatusPill"
+          style="font-size:12px;font-weight:600;color:var(--text-muted);padding:6px 14px;
+                 background:rgba(108,92,231,0.06);border-radius:20px;margin-left:12px">Ready</span>
+    <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:16px">Per-Trade ₹</label>
+    <input id="perTradeInput" type="number" value="10000" min="100"
+           style="width:120px;padding:8px 12px;border:2px solid rgba(0,0,0,0.06);border-radius:10px;
+                  font-size:13px;font-family:inherit"
+           onchange="onPerTradeChange()" />
+    <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">SL</label>
+    <select id="slPctSelect" onchange="onSlChange()"
+            style="padding:8px 12px;border:2px solid rgba(0,0,0,0.06);border-radius:10px;
+                   font-size:13px;font-family:inherit;cursor:pointer">
+      <option value="0.5">0.5% Fixed</option>
+      <option value="1" selected>1% Fixed</option>
+      <option value="2">2% Fixed</option>
+    </select>
+
+    <div id="progressBar" style="display:none;width:100%;margin-top:12px">
+      <div style="background:rgba(0,0,0,0.06);border-radius:10px;height:8px;overflow:hidden">
+        <div id="progressFill" style="background:var(--gradient-brand);height:100%;width:0%;transition:width 0.3s"></div>
+      </div>
+      <div id="progressText" style="font-size:11px;color:var(--text-muted);margin-top:4px;text-align:center">0 / 500</div>
+    </div>`;
 }
 
 function onPerTradeChange() {
   PER_TRADE = +document.getElementById('perTradeInput').value || 10000;
   renderScreenerTable();
 }
-
 function onSlChange() {
   SL_PCT = +document.getElementById('slPctSelect').value || 1;
   renderScreenerTable();
 }
 
 /* ============================================================
-   SECTION 3 — STOCK LIST
+   SECTION 3 — LOAD STOCK LIST + CACHED DATA
    ============================================================ */
 async function loadStockList() {
   try {
@@ -85,131 +91,13 @@ async function loadStockList() {
   } catch (e) { console.error('Stock list failed:', e); }
 }
 
-/* ============================================================
-   SECTION 4 — ENSURE DATA LOADED
-   ============================================================ */
-async function ensureDataLoaded() {
-  try {
-    const r = await fetch(API + '/api/screener/ensure', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
-    });
-    const d = await r.json();
-
-    if (d.phase === 'closed') {
-      showPhaseMessage('🔒 Market closed — data will load after 9:30 AM');
-      return;
-    }
-    if (d.phase === 'forming') {
-      showPhaseMessage('🕘 9:15 candle is forming — data will load at 9:30 AM');
-      startFormingPoller();
-      return;
-    }
-    if (d.phase === 'ready') {
-      setPill('✅ Live — ' + d.date, 'var(--success)');
-      await fetchAndRender();
-      await loadLTP();
-      startLTPRefresh();
-      return;
-    }
-    if (d.phase === 'fetching') {
-      const filled = d.filled ?? d.progress ?? 0;
-      setPill(`⏳ Fetching — ${filled} / ${d.total} loaded`, '#f39c12');
-      await fetchAndRender();
-      startProgressPolling();
-    }
-  } catch (e) {
-    setPill('⚠️ ' + e.message, 'var(--danger)');
-  }
-}
-
-function showPhaseMessage(msg) {
-  setPill(msg, '#f39c12');
-  const head = document.getElementById('screenerHead');
-  const body = document.getElementById('screenerBody');
-  const count = document.getElementById('screenerCount');
-  if (head) head.innerHTML = '';
-  if (body) {
-    body.innerHTML = `<tr><td colspan="8"
-      style="text-align:center;padding:60px;color:var(--text-muted);font-size:14px">${msg}</td></tr>`;
-  }
-  if (count) count.textContent = '';
-}
-
-/* ============================================================
-   SECTION 5 — POLLERS
-   ============================================================ */
-
-/* Polls /status every 3s during fetch — shows progress */
-function startProgressPolling() {
-  if (SCREENER_POLL_TIMER) clearInterval(SCREENER_POLL_TIMER);
-  SCREENER_POLL_TIMER = setInterval(async () => {
-    try {
-      const r = await fetch(API + '/api/screener/status', {
-        headers: { Authorization: 'Bearer ' + getToken() }
-      });
-      const d = await r.json();
-
-      if (d.phase === 'fetching') {
-        const filled = d.filled ?? d.progress ?? 0;
-        setPill(`⏳ Fetching — ${filled} / ${d.total} loaded`, '#f39c12');
-        await fetchAndRender();
-      } else if (d.phase === 'ready' || d.phase === 'weekend') {
-        clearInterval(SCREENER_POLL_TIMER);
-        SCREENER_POLL_TIMER = null;
-        setPill('✅ Live — ' + d.date, 'var(--success)');
-        await fetchAndRender();
-        await loadLTP();
-        startLTPRefresh();
-      } else if (d.phase === 'closed') {
-        clearInterval(SCREENER_POLL_TIMER);
-        SCREENER_POLL_TIMER = null;
-        showPhaseMessage('🔒 Market closed — data will load after 9:30 AM');
-      } else if (d.phase === 'forming') {
-        clearInterval(SCREENER_POLL_TIMER);
-        SCREENER_POLL_TIMER = null;
-        showPhaseMessage('🕘 9:15 candle is forming — data will load at 9:30 AM');
-        startFormingPoller();
-      }
-    } catch (e) { console.error(e); }
-  }, 3000);
-}
-
-/* Polls every 30s during 'forming' phase — auto-triggers fetch at 9:30 */
-function startFormingPoller() {
-  if (SCREENER_POLL_TIMER) clearInterval(SCREENER_POLL_TIMER);
-  SCREENER_POLL_TIMER = setInterval(async () => {
-    try {
-      const r = await fetch(API + '/api/screener/ensure', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
-      });
-      const d = await r.json();
-
-      if (d.phase === 'ready' || d.phase === 'fetching') {
-        clearInterval(SCREENER_POLL_TIMER);
-        SCREENER_POLL_TIMER = null;
-        ensureDataLoaded();
-      } else if (d.phase === 'closed') {
-        clearInterval(SCREENER_POLL_TIMER);
-        SCREENER_POLL_TIMER = null;
-        showPhaseMessage('🔒 Market closed — data will load after 9:30 AM');
-      }
-    } catch (e) { console.error(e); }
-  }, 30000);
-}
-
-/* ============================================================
-   SECTION 6 — FETCH CANDLES + RENDER
-   ============================================================ */
-async function fetchAndRender() {
+async function loadCachedData() {
   try {
     const r = await fetch(API + '/api/screener/data', {
       headers: { Authorization: 'Bearer ' + getToken() }
     });
     const d = await r.json();
     if (!d.ok) return;
-
     SCREENER_CANDLES = {};
     if (d.results) {
       for (const item of d.results) {
@@ -222,11 +110,98 @@ async function fetchAndRender() {
       }
     }
     renderScreenerTable();
+    if (Object.keys(SCREENER_CANDLES).length) {
+      loadLTP();
+      startLTPRefresh();
+    }
   } catch (e) { console.error(e); }
 }
 
 /* ============================================================
-   SECTION 7 — LTP (batch, 15s refresh)
+   SECTION 4 — MANUAL FETCH (button → client batches)
+   ============================================================ */
+async function startFetch() {
+  if (FETCHING) return;
+  if (!SCREENER_STOCKS.length) { showToast('⚠️ No stocks loaded', ''); return; }
+
+  FETCHING = true;
+  const btn = document.getElementById('fetch915Btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Fetching...';
+
+  const bar = document.getElementById('progressBar');
+  bar.style.display = 'block';
+
+  const tokens = SCREENER_STOCKS.map(s => s.token);
+  const total = tokens.length;
+  let ok = 0, failed = 0;
+
+  // Only fetch tokens we don't have yet
+  const missing = tokens.filter(t => !SCREENER_CANDLES[t]);
+
+  // If all cached → just fetch LTP
+  if (!missing.length) {
+    setPill('✅ Already cached', 'var(--success)');
+    updateProgress(total, total);
+    FETCHING = false;
+    btn.disabled = false;
+    btn.textContent = '⚡ Refresh LTP';
+    await loadLTP();
+    startLTPRefresh();
+    return;
+  }
+
+  for (let i = 0; i < missing.length; i += BATCH_SIZE) {
+    const batch = missing.slice(i, i + BATCH_SIZE);
+    setPill(`⏳ Fetching ${i + batch.length} / ${missing.length}...`, '#f39c12');
+
+    try {
+      const r = await fetch(API + '/api/screener/fetch-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
+        body: JSON.stringify({ tokens: batch })
+      });
+      const d = await r.json();
+      if (d.results) {
+        for (const item of d.results) {
+          const c = item.candle;
+          if (Array.isArray(c) && c.length >= 5) {
+            SCREENER_CANDLES[item.token] = {
+              open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5] || 0
+            };
+            ok++;
+          } else failed++;
+        }
+      }
+      renderScreenerTable();
+      updateProgress(total - missing.length + i + batch.length, total);
+    } catch (e) { failed += batch.length; }
+
+    if (i + BATCH_SIZE < missing.length) {
+      await new Promise(r => setTimeout(r, BATCH_DELAY));
+    }
+  }
+
+  setPill(`✅ Done — ok:${ok} failed:${failed}`, failed ? '#f39c12' : 'var(--success)');
+  FETCHING = false;
+  btn.disabled = false;
+  btn.textContent = '⚡ Fetch 9:15 Candles';
+
+  // Start LTP after candles done
+  await loadLTP();
+  startLTPRefresh();
+}
+
+function updateProgress(done, total) {
+  const fill = document.getElementById('progressFill');
+  const text = document.getElementById('progressText');
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  if (fill) fill.style.width = pct + '%';
+  if (text) text.textContent = `${done} / ${total} (${pct}%)`;
+}
+
+/* ============================================================
+   SECTION 5 — LTP (batch, 15s refresh)
    ============================================================ */
 async function loadLTP() {
   if (!SCREENER_STOCKS.length) return;
@@ -252,7 +227,7 @@ function startLTPRefresh() {
 }
 
 /* ============================================================
-   SECTION 8 — RENDER TABLE
+   SECTION 6 — RENDER TABLE
    ============================================================ */
 function renderScreenerTable() {
   const head = document.getElementById('screenerHead');
@@ -271,8 +246,7 @@ function renderScreenerTable() {
     <th>Breakout Status</th>
   </tr>`;
 
-  let loaded = 0;
-  let pending = 0;
+  let loaded = 0, pending = 0;
 
   body.innerHTML = SCREENER_STOCKS.map(s => {
     const c = SCREENER_CANDLES[s.token];
@@ -282,7 +256,7 @@ function renderScreenerTable() {
       pending++;
       return `<tr>
         <td><strong>${s.sym}</strong><br><span style="font-size:11px;color:var(--text-muted)">Token: ${s.token}</span></td>
-        <td colspan="7" style="color:var(--text-muted);font-size:12px">— waiting —</td>
+        <td colspan="7" style="color:var(--text-muted);font-size:12px">— pending —</td>
       </tr>`;
     }
     loaded++;
@@ -313,16 +287,14 @@ function renderScreenerTable() {
 
   if (count) {
     const total = SCREENER_STOCKS.length;
-    if (pending > 0) {
-      count.textContent = `⏳ ${loaded} loaded · ${pending} pending · ${total} total`;
-    } else {
-      count.textContent = `✅ ${loaded} / ${total} loaded`;
-    }
+    count.textContent = pending > 0
+      ? `⏳ ${loaded} loaded · ${pending} pending · ${total} total`
+      : `✅ ${loaded} / ${total} loaded`;
   }
 }
 
 /* ============================================================
-   SECTION 9 — HELPERS
+   SECTION 7 — HELPERS
    ============================================================ */
 function setPill(text, color) {
   const pill = document.getElementById('screenerStatusPill');

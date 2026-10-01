@@ -148,12 +148,18 @@ export async function getCandlesForToken(token, date) {
       fromdate: `${date} 09:15`,
       todate: `${date} 09:16`
     });
+
+    // DEBUG — log exact Angel One error response
+    if (!r.status || !r.data?.length) {
+      console.log('🔍 Angel err for token', token, ':', JSON.stringify(r).slice(0, 300));
+    }
+
     if (r.status && r.data?.length) {
       const candle = r.data[0];
       candleCache.set(key, candle);
       return candle;
     }
-    return { error: 'No data' };
+    return { error: 'No data', raw: r };
   } catch (e) {
     return { error: e.message };
   }

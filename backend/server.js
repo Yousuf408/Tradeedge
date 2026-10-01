@@ -36,9 +36,11 @@ const db = new pg.Pool({
 const SECRET = process.env.JWT_SECRET;
 
 const __dir = dirname(fileURLToPath(import.meta.url));
-const STOCKS = JSON.parse(
+const ALL_STOCKS = JSON.parse(
   readFileSync(join(__dir, 'brokers/angelone/Angel_nifty500.json'), 'utf8')
 );
+const STOCKS = ALL_STOCKS.filter(s => !s.disabled);
+console.log(`📋 Loaded ${ALL_STOCKS.length} stocks (${STOCKS.length} active, ${ALL_STOCKS.length - STOCKS.length} disabled)`);
 const SYM_BY_TOKEN = {};
 STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
 
@@ -71,9 +73,10 @@ const orbState = new Map();
 
 async function loadOrbStateFromDB(date) {
   try {
+    const activeTokens = STOCKS.map(s => String(s.token));
     const { rows } = await db.query(
-      'SELECT token, low_broken, first_low_break_at, entry_signal, first_entry_at FROM angel_15m_candle WHERE date=$1',
-      [date]
+      'SELECT token, low_broken, first_low_break_at, entry_signal, first_entry_at FROM angel_15m_candle WHERE date=$1 AND token = ANY($2)',
+      [date, activeTokens]
     );
     for (const r of rows) {
       orbState.set(`${r.token}_${date}`, {
@@ -660,9 +663,10 @@ async function loadScreenerCacheFromDB() {
   try {
     const p = getScreenerPhase();
     if (!p.date) return;
+    const activeTokens = STOCKS.map(s => String(s.token));
     const { rows } = await db.query(
-      'SELECT token, open, high, low, close, volume, ltp FROM angel_15m_candle WHERE date=$1',
-      [p.date]
+      'SELECT token, open, high, low, close, volume, ltp FROM angel_15m_candle WHERE date=$1 AND token = ANY($2)',
+      [p.date, activeTokens]
     );
     for (const r of rows) {
       setCachedCandle(r.token, p.date, [0, +r.open, +r.high, +r.low, +r.close, +r.volume]);

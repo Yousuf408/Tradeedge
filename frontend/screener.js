@@ -15,8 +15,8 @@ let FETCHING = false;
 
 let PER_TRADE = 10000;
 
-const BATCH_SIZE = 20;
-const BATCH_DELAY = 7000;
+const BATCH_SIZE = 50;
+const BATCH_DELAY = 500;
 
 /* ============================================================
    SECTION 1 — INIT

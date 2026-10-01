@@ -52,12 +52,11 @@ const STRATEGIES = {
     id: 'advance_orb',
     name: 'Advance ORB',
     filters: {
-      maxRangePct: 1.5,       // 9:15 candle range ≤ 1.5%
-      minPrice: 150,          // 9:15 close must be ≥ ₹150
-      maxPrice: 3500          // 9:15 close must be ≤ ₹3500
+      maxRangePct: 1.5,
+      minPrice: 150,
+      maxPrice: 3500
     }
   }
-  // Future: gapup, momentum, vwap-reclaim — add entries here
 };
 
 function getStrategy(id) {
@@ -78,20 +77,54 @@ function passesStrategy(candle, strategy) {
 }
 
 /* ============================================================
-   SECTION 2 — TIME / PHASE
+   SECTION 2 — TIME / PHASE / HOLIDAYS
    ============================================================ */
 function getIST() { return new Date(Date.now() + 5.5 * 60 * 60 * 1000); }
 function addDays(d, n) { return new Date(d.getTime() + n * 864e5).toISOString().split('T')[0]; }
 
+/* Holiday cache — loaded from Supabase */
+let holidaySet = new Set();
+
+async function loadHolidaysFromDB() {
+  try {
+    const { rows } = await db.query('SELECT date::text AS d FROM trading_holidays');
+    holidaySet = new Set(rows.map(r => r.d));
+    console.log(`📅 Loaded ${holidaySet.size} trading holidays`);
+  } catch (e) {
+    console.error('Holiday load failed:', e.message);
+  }
+}
+
+function isHoliday(dateStr) { return holidaySet.has(dateStr); }
+
+function isTradingDay(dateObj) {
+  const dow = dateObj.getUTCDay();
+  if (dow === 0 || dow === 6) return false;
+  return !isHoliday(dateObj.toISOString().split('T')[0]);
+}
+
+function getPreviousTradingDay(dateObj) {
+  const d = new Date(dateObj);
+  for (let i = 0; i < 15; i++) {
+    d.setUTCDate(d.getUTCDate() - 1);
+    if (isTradingDay(d)) return d.toISOString().split('T')[0];
+  }
+  return d.toISOString().split('T')[0];
+}
+
 function getScreenerPhase() {
   const ist = getIST();
-  const dow = ist.getUTCDay();
+  const today = ist.toISOString().split('T')[0];
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  if (dow === 0) return { phase: 'weekend', date: addDays(ist, -2) };
-  if (dow === 6) return { phase: 'weekend', date: addDays(ist, -1) };
+
+  // Weekend or holiday → show last trading day's data
+  if (!isTradingDay(ist)) {
+    return { phase: 'weekend', date: getPreviousTradingDay(ist) };
+  }
+
   if (mins < 555) return { phase: 'closed' };
   if (mins < 570) return { phase: 'forming' };
-  return { phase: 'ready', date: addDays(ist, 0) };
+  return { phase: 'ready', date: today };
 }
 
 function countFilled(date) {
@@ -516,12 +549,46 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 11 — SCREENER (multi-strategy aware)
+   SECTION 11 — TRADING HOLIDAYS (admin)
+   ============================================================ */
+app.get('/api/admin/holidays', auth, adminOnly, async (req, res) => {
+  const { rows } = await db.query(
+    'SELECT date::text AS date, reason FROM trading_holidays ORDER BY date ASC'
+  );
+  res.json(rows);
+});
+
+app.post('/api/admin/holidays', auth, adminOnly, async (req, res) => {
+  const { date, reason } = req.body;
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: 'Date must be YYYY-MM-DD' });
+  }
+  try {
+    await db.query(
+      'INSERT INTO trading_holidays (date, reason) VALUES ($1, $2) ON CONFLICT (date) DO UPDATE SET reason=EXCLUDED.reason',
+      [date, reason || null]
+    );
+    await loadHolidaysFromDB();
+    await log(req.user.username, 'HOLIDAY_ADDED', `${date} — ${reason || ''}`, 'success');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/admin/holidays/:date', auth, adminOnly, async (req, res) => {
+  try {
+    await db.query('DELETE FROM trading_holidays WHERE date=$1', [req.params.date]);
+    await loadHolidaysFromDB();
+    await log(req.user.username, 'HOLIDAY_REMOVED', req.params.date, 'warn');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ============================================================
+   SECTION 12 — SCREENER (multi-strategy aware)
    ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
 
-/* List all strategies — frontend uses for future dropdown */
 app.get('/api/strategies', auth, (req, res) => {
   res.json(Object.values(STRATEGIES).map(s => ({
     id: s.id, name: s.name, filters: s.filters
@@ -536,7 +603,6 @@ app.get('/api/screener/status', auth, (req, res) => {
   });
 });
 
-/* Data — filtered by strategy */
 app.get('/api/screener/data', auth, (req, res) => {
   const strategy = getStrategy(req.query.strategy || 'advance_orb');
   const p = getScreenerPhase();
@@ -562,7 +628,6 @@ app.get('/api/screener/data', auth, (req, res) => {
   });
 });
 
-/* Fetch — always fetches ALL active tokens (unfiltered) */
 app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -591,7 +656,6 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* LTP — client sends only filtered tokens */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -642,7 +706,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 12 — CLOSING PRICE FETCH (15:34 IST)
+   SECTION 13 — CLOSING PRICE FETCH (15:34 IST)
    ============================================================ */
 async function fetchClosingPrices() {
   try {
@@ -707,7 +771,7 @@ function scheduleClosingFetch() {
 }
 
 /* ============================================================
-   SECTION 13 — LOAD CACHE FROM DB (active stocks only)
+   SECTION 14 — LOAD CACHE FROM DB
    ============================================================ */
 async function loadScreenerCacheFromDB() {
   try {
@@ -722,13 +786,13 @@ async function loadScreenerCacheFromDB() {
       setCachedCandle(r.token, p.date, [0, +r.open, +r.high, +r.low, +r.close, +r.volume]);
       if (r.ltp) setCachedLTP(r.token, r.ltp);
     }
-    console.log(`📦 Loaded ${rows.length} candles from DB`);
+    console.log(`📦 Loaded ${rows.length} candles from DB for ${p.date}`);
     await loadOrbStateFromDB(p.date);
   } catch (e) { console.error('DB load failed:', e.message); }
 }
 
 /* ============================================================
-   SECTION 14 — START
+   SECTION 15 — START
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
@@ -739,6 +803,10 @@ app.listen(PORT, async () => {
     console.log('✅ Angel One platform session started');
   } catch (e) { console.error('⚠️ Angel One login failed at startup:', e.message); }
 
+  // Load holidays FIRST (needed by phase logic)
+  await loadHolidaysFromDB();
+
+  // Now load cache (phase will correctly return last trading day's date)
   await loadScreenerCacheFromDB();
 
   const nowIST = getIST();

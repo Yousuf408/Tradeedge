@@ -1,36 +1,38 @@
 /* ============================================================
-   ANGEL_REST.js  —  FIXED VERSION (drop-in replacement)
-   Uses 1-minute candles aggregated into 9:15-9:30 window
-   (Angel One 15-min @ 9:15 API has a known bug — returns empty)
+   ANGEL_REST.js  —  v2 (drop-in replacement, speed-optimized)
 
-   ------------------------------------------------------------
-   WHY IT BROKE:
-   Angel One's rate limiter intermittently returns HTTP 403 with
-   a PLAIN-TEXT body:  "Access denied because of exceeding access rate"
-   (not JSON!). The old code did r.json() on that body, which throws:
-   Unexpected token 'A', "Access den"... is not valid JSON
-   This is a documented, ongoing Angel-side bug (false positives even
-   far below the documented limits) — see SmartAPI forum topics
-   5560 / 5639 etc. That's why it "suddenly" broke with no code change.
+   ROOT CAUSE OF THE ORIGINAL ERROR:
+   Angel One's rate limiter intermittently returns HTTP 403 with a
+   PLAIN-TEXT body: "Access denied because of exceeding access rate"
+   (not JSON). Old code did r.json() on it → "Unexpected token 'A'".
+   Known ongoing Angel-side bug (SmartAPI forum topics 5560/5639).
 
-   FIXES IN THIS FILE:
-   #1  post() reads the response as TEXT first, then tries JSON.parse.
-       Non-JSON responses no longer crash with a confusing SyntaxError —
-       you now see the real HTTP status + body in the logs.
-   #2  Automatic retry with exponential backoff + jitter on
-       403 / 429 / "Access denied" responses.
-   #3  Global cooldown: when rate-limited, ALL Angel calls pause for a
-       while instead of burning through the whole token list while the
-       limiter is blocking you.
-   #4  Circuit breaker in getCandlesForTokens(): aborts the batch after
-       3 consecutive failures so you don't spam a blocked API for 500
-       tokens. Re-click the Fetch button later — it resumes where it
-       left off (only "missing" tokens are fetched).
-   #5  Candle pacing configurable via env (default 1500 ms, was 1200).
-   #6  LTP: cache TTL raised to 30 s (was 10 s) so the client's 15 s
-       poll no longer hits Angel on every tick, and LTP calls are
-       skipped entirely outside market hours (9:10–15:35 IST, Mon–Fri).
-       Fewer total requests on the same API key = fewer 403s.
+   v1 PROBLEM (why it got slow):
+   Serial fetch (1 token at a time) + 20s cooldowns + long backoffs
+   → a 403 storm turned a 10-min run into a 30+ min crawl.
+
+   v2 FIXES:
+   #1  PARALLEL fetch with a global token-bucket scheduler at
+       150 req/min (documented cap is 180/min, 3/sec — we stay
+       under both, never burst). 500 tokens ≈ 3.5 min instead of 13.
+   #2  LIGHT retries: 2 attempts, ~1.2s/2.4s backoff, 8s cooldown
+       (was 20-30s). Blocked tokens recover fast instead of stalling.
+   #3  RUN-LEVEL circuit breaker: 10 consecutive failures across all
+       workers → abort the whole run in ~1 min with a clear log,
+       instead of crawling for 30 min. Cached tokens are kept;
+       re-clicking Fetch resumes only the missing ones.
+   #4  Single-flight login (parallel workers can't trigger multiple
+       simultaneous logins — login limit is 1/sec).
+   #5  post() reads TEXT first, then parses JSON → real errors in
+       logs ("Rate limited HTTP 403: Access denied..."), never the
+       cryptic "Unexpected token 'A'" again.
+   #6  LTP: 30s cache TTL (client polls every 15s → half the calls
+       served from cache) and ZERO API calls outside 9:10-15:35 IST
+       weekdays. Less background load on the same API key.
+
+   TUNING (env):
+   ANGEL_CANDLE_RATE_PER_MIN=150   (max safe: 170)
+   ANGEL_CANDLE_CONCURRENCY=5
    ============================================================ */
 
 import crypto from 'crypto';
@@ -41,8 +43,10 @@ const CLIENT_ID = process.env.ANGEL_CLIENT_ID;
 const PIN = process.env.ANGEL_PIN;
 const TOTP_SECRET = process.env.ANGEL_TOTP_SECRET;
 
-const CANDLE_DELAY_MS = Number(process.env.ANGEL_CANDLE_DELAY_MS || 1500); // FIX #5
-const LTP_TTL = 30000;                                                     // FIX #6 (was 10000)
+const CANDLE_RATE_PER_MIN = Number(process.env.ANGEL_CANDLE_RATE_PER_MIN || 150); // FIX #1
+const CANDLE_CONCURRENCY  = Number(process.env.ANGEL_CANDLE_CONCURRENCY  || 5);   // FIX #1
+const SLOT_INTERVAL_MS    = 60000 / CANDLE_RATE_PER_MIN; // 400ms at 150/min
+const LTP_TTL = 30000;                                                              // FIX #6
 
 const session = { jwtToken: null, feedToken: null, expiresAt: null, loginTime: null };
 
@@ -53,9 +57,7 @@ const failedCache = new Map();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ============================================================
-   GLOBAL RATE-LIMIT COOLDOWN  (FIX #3)
-   When Angel says "Access denied", pause everything for a bit —
-   hammering on during a block just extends it and floods logs.
+   GLOBAL RATE-LIMIT COOLDOWN  (FIX #2 — 8s, was 20-30s)
    ============================================================ */
 let cooldownUntil = 0;
 
@@ -67,6 +69,28 @@ function startCooldown(ms, reason) {
 async function waitForCooldown() {
   const wait = cooldownUntil - Date.now();
   if (wait > 0) await sleep(wait);
+}
+
+/* ============================================================
+   TOKEN-BUCKET SLOT SCHEDULER  (FIX #1)
+   Spaces ALL candle calls globally at SLOT_INTERVAL_MS apart,
+   across every worker and every client batch — never exceeds
+   CANDLE_RATE_PER_MIN no matter how much runs in parallel.
+   If a cooldown starts while a worker waits for its slot, the
+   worker re-reserves a fresh slot AFTER the cooldown → no burst.
+   ============================================================ */
+let nextSlotTime = 0;
+
+async function acquireRateSlot() {
+  for (;;) {
+    await waitForCooldown();
+    const now = Date.now();
+    const start = Math.max(now, nextSlotTime);
+    nextSlotTime = start + SLOT_INTERVAL_MS;   // reservation is atomic (single-threaded JS)
+    if (start > now) await sleep(start - now);
+    if (Date.now() >= cooldownUntil) return;   // clean → proceed
+    // otherwise loop: re-reserve after the new cooldown ends
+  }
 }
 
 /* ============================================================
@@ -105,7 +129,7 @@ function generateTOTP(secret) {
 }
 
 /* ============================================================
-   HTTP  (FIX #1 + #2 + #3)
+   HTTP  (FIX #5 — text-first parsing, light retries)
    ============================================================ */
 function buildHeaders() {
   const h = {
@@ -122,12 +146,12 @@ function buildHeaders() {
   return h;
 }
 
-async function post(path, body, { retries = 3, baseBackoff = 2000 } = {}) {
+async function post(path, body, { retries = 2, baseBackoff = 1200 } = {}) {
   let lastErr = null;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (attempt > 0) {
-      const backoff = baseBackoff * Math.pow(2, attempt - 1) + Math.random() * 1000; // jitter
+      const backoff = baseBackoff * Math.pow(2, attempt - 1) + Math.random() * 500;
       console.warn(`↻ retry ${attempt}/${retries} for ${path} in ${Math.round(backoff)}ms`);
       await sleep(backoff);
     }
@@ -138,27 +162,25 @@ async function post(path, body, { retries = 3, baseBackoff = 2000 } = {}) {
       res = await fetch(BASE_URL + path, {
         method: 'POST', headers: buildHeaders(), body: JSON.stringify(body)
       });
-      text = await res.text();               // FIX #1: read as TEXT, never blind r.json()
+      text = await res.text();               // FIX #5: text first, never blind r.json()
     } catch (e) {
       lastErr = new Error(`Network error: ${e.message}`);
-      continue;                              // network hiccup → retry
+      continue;
     }
 
     try {
-      return JSON.parse(text);               // happy path — valid JSON
-    } catch { /* fall through: non-JSON body */ }
+      return JSON.parse(text);               // happy path
+    } catch { /* non-JSON body → fall through */ }
 
-    // ---- Non-JSON body = rate limiter / WAF rejection ----
     const snippet = text.slice(0, 120).replace(/\s+/g, ' ');
     console.error(`⛔ non-JSON response HTTP ${res.status} from ${path}: "${snippet}"`);
 
     if (res.status === 403 || res.status === 429 || /access denied/i.test(text)) {
-      startCooldown(20000, `rate-limited on ${path}`);   // FIX #3
+      startCooldown(8000, `rate-limited on ${path}`);   // FIX #2: 8s, not 20s
       lastErr = new Error(`Rate limited (HTTP ${res.status}): ${snippet}`);
-      continue;                                          // FIX #2: retry after cooldown
+      continue;
     }
 
-    // Unexpected non-JSON (HTML error page, proxy error, etc.)
     throw new Error(`HTTP ${res.status}: ${snippet}`);
   }
 
@@ -166,7 +188,8 @@ async function post(path, body, { retries = 3, baseBackoff = 2000 } = {}) {
 }
 
 /* ============================================================
-   LOGIN  (unchanged logic, now with safe post())
+   LOGIN  (FIX #4 — single-flight: parallel workers share ONE
+   login attempt; login endpoint is limited to 1 req/sec)
    ============================================================ */
 export async function loginPlatform() {
   if (!API_KEY || !CLIENT_ID || !PIN || !TOTP_SECRET) {
@@ -177,7 +200,7 @@ export async function loginPlatform() {
     clientcode: CLIENT_ID,
     password: PIN,
     totp
-  }, { retries: 2, baseBackoff: 3000 });   // login limit is 1 req/s — back off longer
+  }, { retries: 2, baseBackoff: 3000 });
 
   if (!r.status || !r.data?.jwtToken) {
     throw new Error(r.message || 'Login failed');
@@ -191,16 +214,17 @@ export async function loginPlatform() {
   return { ok: true, expiresAt: session.expiresAt };
 }
 
-async function ensureLoggedIn() {
-  if (session.jwtToken && Date.now() < session.expiresAt - 60000) return true;
-  try {
-    await loginPlatform();
-    console.log('✅ Angel One session started');
-    return true;
-  } catch (e) {
-    console.error('❌ Angel login failed:', e.message);
-    return false;
+let loginInFlight = null;
+
+function ensureLoggedIn() {
+  if (session.jwtToken && Date.now() < session.expiresAt - 60000) return Promise.resolve(true);
+  if (!loginInFlight) {
+    loginInFlight = loginPlatform()
+      .then(() => { console.log('✅ Angel One session started'); return true; })
+      .catch(e => { console.error('❌ Angel login failed:', e.message); return false; })
+      .finally(() => { loginInFlight = null; });
   }
+  return loginInFlight;
 }
 
 export function getSessionStatus() {
@@ -259,30 +283,59 @@ export async function getCandlesForToken(token, date) {
   }
 }
 
-/* FIX #4 — circuit breaker: stop the batch after 3 consecutive failures
-   (almost always means Angel is rate-limiting us right now). The client
-   only ever sends "missing" tokens, so re-clicking Fetch resumes fine. */
+/* ============================================================
+   PARALLEL BATCH FETCH  (FIX #1 + #3)
+   N workers pull from a shared queue; every call passes through
+   the global slot scheduler → total rate stays ≤ 150/min.
+   Circuit breaker: 10 consecutive failures → abort run fast.
+   500 tokens healthy ≈ 3.5 min (was ~13 min serial).
+   ============================================================ */
 export async function getCandlesForTokens(tokens, date) {
-  const results = [];
-  let consecutiveFails = 0;
+  const results = new Map();
+  const queue = [];
 
   for (const token of tokens) {
-    if (consecutiveFails >= 3) {
-      console.error('🛑 Batch aborted — 3 consecutive failures (Angel rate-limit block?). ' +
-                    'Skipped remaining tokens; re-click Fetch in a few minutes to resume.');
-      startCooldown(30000, 'circuit breaker after consecutive failures');
-      break;
-    }
-
-    const candle = await getCandlesForToken(token, date);
-    results.push({ token: String(token), candle });
-
-    if (Array.isArray(candle)) consecutiveFails = 0;
-    else consecutiveFails++;
-
-    await sleep(CANDLE_DELAY_MS);   // FIX #5: default 1.5s per token (was 1.2s)
+    const key = `${token}_${date}`;
+    if (candleCache.has(key)) results.set(String(token), candleCache.get(key)); // instant cache hits
+    else queue.push(token);
   }
-  return results;
+
+  let consecutiveFails = 0;
+  let aborted = false;
+  const t0 = Date.now();
+  const workerCount = Math.min(CANDLE_CONCURRENCY, Math.max(queue.length, 1));
+
+  async function worker() {
+    while (queue.length && !aborted) {
+      const token = queue.shift();
+      await acquireRateSlot();
+      if (aborted) { queue.unshift(token); break; }
+
+      const candle = await getCandlesForToken(token, date);
+      results.set(String(token), candle);
+
+      if (Array.isArray(candle)) consecutiveFails = 0;
+      else if (++consecutiveFails >= 10) {
+        aborted = true;   // FIX #3: run-level circuit breaker
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, worker));
+
+  if (aborted) {
+    startCooldown(30000, 'circuit breaker — Angel is blocking right now');
+    console.error(`🛑 Run aborted after 10 consecutive failures (Angel rate-limit storm). ` +
+                  `Got ${results.size}/${tokens.length} in ${Math.round((Date.now() - t0) / 1000)}s. ` +
+                  `Cached tokens are kept — re-click Fetch in a few minutes to resume the rest.`);
+  } else {
+    console.log(`✅ Batch done: ${results.size}/${tokens.length} tokens in ${Math.round((Date.now() - t0) / 1000)}s`);
+  }
+
+  return tokens.map(t => ({
+    token: String(t),
+    candle: results.get(String(t)) || { error: 'skipped (run aborted)' }
+  }));
 }
 
 export function getCachedCandles(tokens, date) {
@@ -304,17 +357,15 @@ export function getFailedList(date) {
    LTP (batch, 50 per call)  — FIX #6
    ============================================================ */
 function isMarketHoursIST() {
-  const ist = new Date(Date.now() + 5.5 * 3600 * 1000);   // UTC → IST
+  const ist = new Date(Date.now() + 5.5 * 3600 * 1000);
   const dow = ist.getUTCDay();
-  if (dow === 0 || dow === 6) return false;               // weekend
+  if (dow === 0 || dow === 6) return false;
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  return mins >= 9 * 60 + 10 && mins <= 15 * 60 + 35;     // 09:10 – 15:35 IST
+  return mins >= 9 * 60 + 10 && mins <= 15 * 60 + 35;   // 09:10 – 15:35 IST
 }
 
 export async function getLTPForTokens(tokens) {
-  // Outside market hours: serve whatever is cached, make ZERO API calls.
-  // (The client polls every 15s around the clock — that was burning your
-  //  rate-limit budget on the same API key for nothing.)
+  // Outside market hours: serve cache, make ZERO API calls.
   if (!isMarketHoursIST()) {
     return tokens.map(t => ({
       token: String(t),
@@ -328,7 +379,7 @@ export async function getLTPForTokens(tokens) {
   const now = Date.now();
   const need = tokens.filter(t => {
     const c = ltpCache.get(String(t));
-    return !c || (now - c.ts) > LTP_TTL;   // 30s TTL > 15s client poll → ~half the calls skipped
+    return !c || (now - c.ts) > LTP_TTL;
   });
 
   for (let i = 0; i < need.length; i += 50) {
@@ -337,7 +388,7 @@ export async function getLTPForTokens(tokens) {
       const r = await post('/rest/secure/angelbroking/market/v1/quote', {
         mode: 'LTP',
         exchangeTokens: { NSE: batch }
-      }, { retries: 2, baseBackoff: 2000 });
+      });
       if (r.status && r.data?.fetched) {
         for (const q of r.data.fetched) {
           ltpCache.set(q.symbolToken, { price: q.ltp, ts: now });
@@ -346,7 +397,7 @@ export async function getLTPForTokens(tokens) {
     } catch (e) {
       console.error('LTP batch failed:', e.message);
     }
-    await sleep(500);   // was 300ms — gentler on the shared per-key limit
+    await sleep(400);
   }
 
   return tokens.map(t => ({

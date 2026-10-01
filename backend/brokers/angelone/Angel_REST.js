@@ -149,9 +149,9 @@ export async function getCandlesForToken(token, date) {
       todate: `${date} 09:16`
     });
 
-    // DEBUG — log exact Angel One error response
+        // DEBUG — log exact Angel One error response
     if (!r.status || !r.data?.length) {
-      console.log('🔍 Angel err for token', token, ':', JSON.stringify(r).slice(0, 300));
+      console.log(`🔍 FAIL token=${token} status=${r.status} msg="${r.message || r.errorcode || 'unknown'}" data=${JSON.stringify(r.data).slice(0,120)}`);
     }
 
     if (r.status && r.data?.length) {

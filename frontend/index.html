@@ -152,7 +152,6 @@
     <span class="status"><span class="dot"></span> Live</span>
     <span class="balance">₹1,24,500</span>
 
-    <!-- 4.1 — Name pill (replaces avatar circle) + dropdown -->
     <div class="avatar-wrap">
       <button id="userPill" onclick="toggleAvatarMenu(event)"
               style="background:rgba(108,92,231,0.08);border:none;padding:8px 16px;border-radius:10px;
@@ -246,6 +245,7 @@
       <button class="tab-btn" onclick="switchTab('import', event)">📥 Bulk Import</button>
       <button class="tab-btn" onclick="switchTab('audit', event)">📜 Audit Log</button>
       <button class="tab-btn" onclick="switchTab('prices', event)">💵 Plans & Pricing</button>
+      <button class="tab-btn" onclick="switchTab('holidays', event)">📅 Holidays</button>
     </div>
 
     <!-- 5.3.1 — TAB: Users -->
@@ -346,6 +346,40 @@ Rahul Verma,9876543212,5d"></textarea>
         <div style="padding:0 24px 24px">
           <button class="btn btn-primary" onclick="savePrices()">💾 Save Prices</button>
         </div>
+      </div>
+    </div>
+
+    <!-- 5.3.5 — TAB: Trading Holidays (bulk) -->
+    <div id="tab-holidays" class="tab-content">
+      <div class="panel-glass">
+        <div class="panel-head"><h3>📅 Bulk Add / Update Holidays</h3></div>
+        <div class="panel-body">
+          <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px">
+            Format: <code>YYYY-MM-DD,Reason</code> — one per line. Existing dates update the reason.
+          </p>
+          <textarea id="holidayBulkInput" class="form-input" rows="8"
+            style="font-family:monospace;font-size:12px"
+            placeholder="2026-10-02,Gandhi Jayanti
+2026-10-20,Diwali Laxmi Puja
+2026-10-21,Diwali Balipratipada"></textarea>
+          <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+            <button class="btn btn-primary" onclick="bulkAddHolidays()">📥 Add / Update</button>
+            <button class="btn btn-outline" onclick="loadCurrentHolidaysIntoInput()">📄 Load Current</button>
+            <button class="btn btn-outline" onclick="loadSampleHolidays()">📋 Load 2026 Sample</button>
+          </div>
+          <div id="holidayResult" style="margin-top:16px"></div>
+        </div>
+      </div>
+
+      <div class="panel-glass">
+        <div class="panel-head">
+          <h3>📋 All Holidays</h3>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-outline btn-sm" onclick="deleteSelectedHolidays()">🗑️ Remove Selected</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteAllHolidays()">🗑️ Remove All</button>
+          </div>
+        </div>
+        <div class="panel-body table-wrap" id="holidaysTable"></div>
       </div>
     </div>
   </div>
@@ -490,7 +524,7 @@ Rahul Verma,9876543212,5d"></textarea>
   </div>
 </div>
 
-     <!-- 6.3 — Renew / Adjust Expiry Modal -->
+<!-- 6.3 — Renew / Adjust Expiry Modal -->
 <div id="renewModal" class="modal-overlay">
   <div class="modal-box">
     <h3>🔄 Renew or Adjust</h3>

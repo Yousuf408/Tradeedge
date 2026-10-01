@@ -12,6 +12,7 @@ import {
   loginPlatform,
   getCandlesForTokens,
   getCachedCandles,
+  setCachedCandle,
   getLTPForTokens,
   getSessionStatus
 } from './brokers/angelone/Angel_REST.js';
@@ -36,8 +37,11 @@ const STOCKS = JSON.parse(
   readFileSync(join(__dir, 'brokers/angelone/Angel_nifty500.json'), 'utf8')
 );
 
+const SYM_BY_TOKEN = {};
+STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
+
 /* ============================================================
-   SECTION 1 — PHASES (closed / forming / ready / weekend)
+   SECTION 1 — PHASES
    ============================================================ */
 function getIST() {
   return new Date(Date.now() + 5.5 * 60 * 60 * 1000);
@@ -53,19 +57,51 @@ function getScreenerPhase() {
 
   if (dow === 0) return { phase: 'weekend', date: addDays(ist, -2) };
   if (dow === 6) return { phase: 'weekend', date: addDays(ist, -1) };
-  if (mins < 555) return { phase: 'closed' };   // before 9:15
-  if (mins < 570) return { phase: 'forming' };  // 9:15 - 9:30
+  if (mins < 555) return { phase: 'closed' };
+  if (mins < 570) return { phase: 'forming' };
   return { phase: 'ready', date: addDays(ist, 0) };
 }
 
-/* Count filled candles for a date */
 function countFilled(date) {
   const cached = getCachedCandles(STOCKS.map(s => s.token), date);
   return cached.filter(c => c.candle && !c.candle.error && Array.isArray(c.candle)).length;
 }
 
 /* ============================================================
-   SECTION 2 — MIDDLEWARE + HELPERS
+   SECTION 2 — ORB STATE TRACKING (in-memory + persisted to DB)
+   Key: `${token}_${date}`
+   Value: { lowBroken, entrySignal, firstLowBreakAt, firstEntryAt }
+   ============================================================ */
+const orbState = new Map();
+
+async function loadOrbStateFromDB(date) {
+  try {
+    const { rows } = await db.query(
+      'SELECT token, low_broken, first_low_break_at, entry_signal, first_entry_at FROM angel_15m_candle WHERE date=$1',
+      [date]
+    );
+    for (const r of rows) {
+      orbState.set(`${r.token}_${date}`, {
+        lowBroken: !!r.low_broken,
+        entrySignal: !!r.entry_signal,
+        firstLowBreakAt: r.first_low_break_at,
+        firstEntryAt: r.first_entry_at
+      });
+    }
+    console.log(`🎯 Loaded ORB state for ${rows.length} stocks`);
+  } catch (e) {
+    console.error('ORB state load failed:', e.message);
+  }
+}
+
+function getOrbState(token, date) {
+  return orbState.get(`${token}_${date}`) || {
+    lowBroken: false, entrySignal: false, firstLowBreakAt: null, firstEntryAt: null
+  };
+}
+
+/* ============================================================
+   SECTION 3 — MIDDLEWARE + HELPERS
    ============================================================ */
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
@@ -144,12 +180,12 @@ function verifyTotpServer(secret, input) {
 }
 
 /* ============================================================
-   SECTION 3 — HEALTH
+   SECTION 4 — HEALTH
    ============================================================ */
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
 
 /* ============================================================
-   SECTION 4 — AUTH
+   SECTION 5 — AUTH
    ============================================================ */
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
@@ -253,7 +289,7 @@ app.post('/api/logout', auth, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 5 — FORGOT PASSWORD
+   SECTION 6 — FORGOT PASSWORD
    ============================================================ */
 app.post('/api/forgot-password/check', async (req, res) => {
   const { input } = req.body;
@@ -301,7 +337,7 @@ app.post('/api/forgot-password/reset', async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 6 — CHANGE PASSWORD + SELF PROFILE
+   SECTION 7 — CHANGE PASSWORD + SELF PROFILE
    ============================================================ */
 app.post('/api/change-password', auth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
@@ -352,7 +388,7 @@ app.put('/api/me', auth, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 7 — USERS (admin)
+   SECTION 8 — USERS (admin)
    ============================================================ */
 app.get('/api/users', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query(
@@ -457,7 +493,7 @@ app.delete('/api/users/:username', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 8 — AUDIT + PRICES
+   SECTION 9 — AUDIT + PRICES
    ============================================================ */
 app.get('/api/audit', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200');
@@ -484,12 +520,11 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 9 — SCREENER (button-triggered, cached)
+   SECTION 10 — SCREENER
    ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
 
-/* Phase info */
 app.get('/api/screener/status', auth, (req, res) => {
   const p = getScreenerPhase();
   res.json({
@@ -500,7 +535,6 @@ app.get('/api/screener/status', auth, (req, res) => {
   });
 });
 
-/* Returns all currently cached candles (fast, no API calls) */
 app.get('/api/screener/data', auth, (req, res) => {
   const p = getScreenerPhase();
   if (p.phase === 'closed')  return res.json({ ok: false, phase: 'closed' });
@@ -509,17 +543,13 @@ app.get('/api/screener/data', auth, (req, res) => {
   const candles = getCachedCandles(STOCKS.map(s => s.token), p.date);
   const filled = candles.filter(c => c.candle && !c.candle.error && Array.isArray(c.candle)).length;
   res.json({
-    ok: true,
-    phase: p.phase,
-    date: p.date,
-    filled,
-    total: STOCKS.length,
-    results: candles,
-    stocks: STOCKS
+    ok: true, phase: p.phase, date: p.date,
+    filled, total: STOCKS.length,
+    results: candles, stocks: STOCKS
   });
 });
 
-/* Client-driven batch fetch — sends up to 20 tokens, gets candles back */
+/* Button-triggered fetch — saves successful candles + resets ORB state */
 app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) {
@@ -532,24 +562,122 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
 
   try {
     const results = await getCandlesForTokens(tokens, p.date);
+
+    for (const r of results) {
+      const c = r.candle;
+      if (Array.isArray(c) && c.length >= 5) {
+        // Save to DB
+        db.query(
+          `INSERT INTO angel_15m_candle (date, token, sym, open, high, low, close, volume, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+           ON CONFLICT (date, token) DO UPDATE SET
+             sym=EXCLUDED.sym, open=EXCLUDED.open, high=EXCLUDED.high,
+             low=EXCLUDED.low, close=EXCLUDED.close, volume=EXCLUDED.volume,
+             updated_at=NOW()`,
+          [p.date, r.token, SYM_BY_TOKEN[r.token] || '?', c[1], c[2], c[3], c[4], c[5] || 0]
+        ).catch(() => {});
+
+        // Ensure ORB state exists (fresh fetch resets to false)
+        if (!orbState.has(`${r.token}_${p.date}`)) {
+          orbState.set(`${r.token}_${p.date}`, {
+            lowBroken: false, entrySignal: false, firstLowBreakAt: null, firstEntryAt: null
+          });
+        }
+      }
+    }
+
     res.json({ ok: true, date: p.date, results });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-/* LTP batch */
+/* LTP fetch — also drives ORB stage transitions */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) {
     return res.status(400).json({ error: 'tokens array required' });
   }
-  const results = await getLTPForTokens(tokens);
-  res.json({ ok: true, count: results.length, results });
+  const p = getScreenerPhase();
+  if (!p.date) return res.json({ ok: true, results: [] });
+
+  const ltpResults = await getLTPForTokens(tokens);
+
+  // Get 9:15 candles for ORB comparison
+  const candles = getCachedCandles(tokens, p.date);
+  const candleMap = {};
+  candles.forEach(c => {
+    if (Array.isArray(c.candle) && c.candle.length >= 5) {
+      candleMap[String(c.token)] = { high: +c.candle[2], low: +c.candle[3] };
+    }
+  });
+
+  const enriched = [];
+
+  for (const r of ltpResults) {
+    const token = String(r.token);
+    const key = `${token}_${p.date}`;
+    const state = getOrbState(token, p.date);
+    const c = candleMap[token];
+    const ltp = r.ltp;
+
+    // Only update state during ready phase
+    if (p.phase === 'ready' && c && ltp) {
+      // Stage 1: Low break
+      if (!state.lowBroken && ltp < c.low) {
+        state.lowBroken = true;
+        state.firstLowBreakAt = new Date().toISOString();
+        db.query(
+          `UPDATE angel_15m_candle SET low_broken=true, first_low_break_at=NOW()
+           WHERE date=$1 AND token=$2 AND low_broken=false`,
+          [p.date, token]
+        ).catch(() => {});
+      }
+      // Stage 2: Entry (only after low break)
+      if (state.lowBroken && !state.entrySignal && ltp > c.high) {
+        state.entrySignal = true;
+        state.firstEntryAt = new Date().toISOString();
+        db.query(
+          `UPDATE angel_15m_candle SET entry_signal=true, first_entry_at=NOW()
+           WHERE date=$1 AND token=$2 AND entry_signal=false`,
+          [p.date, token]
+        ).catch(() => {});
+      }
+      orbState.set(key, state);
+    }
+
+    enriched.push({
+      token,
+      ltp,
+      lowBroken: state.lowBroken,
+      entrySignal: state.entrySignal
+    });
+  }
+
+  res.json({ ok: true, count: enriched.length, results: enriched });
 });
 
+/* Load cache + ORB state from DB */
+async function loadScreenerCacheFromDB() {
+  try {
+    const p = getScreenerPhase();
+    if (!p.date) return;
+    const { rows } = await db.query(
+      'SELECT token, open, high, low, close, volume FROM angel_15m_candle WHERE date=$1',
+      [p.date]
+    );
+    for (const r of rows) {
+      setCachedCandle(r.token, p.date, [0, +r.open, +r.high, +r.low, +r.close, +r.volume]);
+    }
+    console.log(`📦 Loaded ${rows.length} candles from DB`);
+    await loadOrbStateFromDB(p.date);
+  } catch (e) {
+    console.error('DB load failed:', e.message);
+  }
+}
+
 /* ============================================================
-   SECTION 10 — START
+   SECTION 11 — START
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
@@ -560,5 +688,6 @@ app.listen(PORT, async () => {
   } catch (e) {
     console.error('⚠️ Angel One login failed at startup:', e.message);
   }
+  await loadScreenerCacheFromDB();
   console.log('ℹ️  Manual mode — screener fetches only when user clicks button');
 });

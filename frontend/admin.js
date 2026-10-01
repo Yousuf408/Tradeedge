@@ -157,19 +157,17 @@ function hideToast() {
 
 
 /* ============================================================
-   SECTION 7 — MODAL HELPERS (open/close + Escape key)
+   SECTION 7 — MODAL HELPERS
    ============================================================ */
 function closeAllModals() {
   document.querySelectorAll('.modal-overlay').forEach(m => m.classList.remove('open'));
   document.getElementById('avatarMenu')?.classList.remove('open');
 }
 
-// ESC closes any open modal
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') closeAllModals();
 });
 
-// Click outside the modal box closes it
 document.querySelectorAll('.modal-overlay').forEach(overlay => {
   overlay.addEventListener('click', e => {
     if (e.target === overlay) closeAllModals();
@@ -177,12 +175,15 @@ document.querySelectorAll('.modal-overlay').forEach(overlay => {
 });
 
 
+/* ============================================================
+   SECTION 8 — NAVIGATION
+   ============================================================ */
 function navigateTo(pageId) {
   DOM.navLinks.forEach(a => a.classList.toggle('active', a.dataset.page === pageId));
   DOM.pages.forEach(p => p.classList.toggle('active', p.id === 'page-' + pageId));
 
   if (pageId === 'portfolio' && typeof loadPortfolio === 'function') loadPortfolio();
-  if (pageId === 'screener' && typeof initScreener === 'function') initScreener();  // ← ADD THIS
+  if (pageId === 'screener' && typeof initScreener === 'function') initScreener();
   if (pageId === 'settings') loadProfileForm();
   if (pageId === 'users' && currentUser?.role === 'admin' && !impersonating) {
     renderKPIs();
@@ -565,6 +566,7 @@ function switchTab(name, e) {
   document.getElementById('tab-' + name).classList.add('active');
   if (name === 'audit') renderAudit();
   if (name === 'prices') loadPrices();
+  if (name === 'holidays') renderHolidays();
 }
 
 
@@ -786,7 +788,7 @@ async function saveEditUser() {
 
 
 /* ============================================================
-   SECTION 20 — ADMIN: RENEW MODAL (add / reduce / custom date)
+   SECTION 20 — ADMIN: RENEW MODAL
    ============================================================ */
 async function openRenew(username) {
   try {
@@ -800,12 +802,10 @@ async function openRenew(username) {
     document.getElementById('renewCurrent').textContent =
       u.expiresAt ? String(u.expiresAt).slice(0, 10) : 'No expiry';
 
-    // Reset UI
     document.querySelectorAll('#renewAddChips .chip, #renewSubChips .chip').forEach(c => c.classList.remove('active'));
     document.getElementById('renewCustomDate').value = '';
     document.getElementById('renewError').textContent = '';
 
-    // Base current expiry for preview
     window._renewBase = u.expiresAt ? new Date(u.expiresAt) : new Date();
     updateRenewPreview();
 
@@ -821,7 +821,6 @@ function closeRenew() {
   renewDelta = 0;
 }
 
-// Chip clicks
 document.querySelectorAll('#renewAddChips .chip').forEach(chip => {
   chip.addEventListener('click', () => {
     const days = +chip.dataset.days;
@@ -932,12 +931,11 @@ async function resetPassword(username) {
 
 
 /* ============================================================
-   SECTION 22 — WHATSAPP SHARING (auto-reset if no cache)
+   SECTION 22 — WHATSAPP SHARING
    ============================================================ */
 async function openWhatsApp(username) {
   let cred = getCachedCredentials(username);
 
-  // No cached password → offer to reset now
   if (!cred || !cred.password) {
     if (!confirm(`No password cached for "${username}".\n\nReset password now and share?`)) return;
     try {
@@ -996,7 +994,7 @@ function exitImpersonate() {
 
 
 /* ============================================================
-   SECTION 24 — ADMIN: BULK IMPORT
+   SECTION 24 — ADMIN: BULK IMPORT USERS
    ============================================================ */
 function loadSampleCSV() {
   document.getElementById('csvInput').value =
@@ -1158,7 +1156,157 @@ async function exportUsersCSV() {
 
 
 /* ============================================================
-   SECTION 28 — BOOTSTRAP
+   SECTION 28 — ADMIN: TRADING HOLIDAYS (bulk management)
+   ============================================================ */
+async function renderHolidays() {
+  const box = document.getElementById('holidaysTable');
+  if (!box) return;
+  try {
+    const rows = await api('/api/admin/holidays');
+    if (!rows.length) {
+      box.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No holidays yet. Add above.</div>';
+      return;
+    }
+    box.innerHTML = `
+      <table class="table-modern">
+        <thead><tr>
+          <th style="width:40px"><input type="checkbox" id="hCheckAll" onclick="toggleAllHolidayChecks(this.checked)" /></th>
+          <th>Date</th>
+          <th>Day</th>
+          <th>Reason</th>
+          <th>Action</th>
+        </tr></thead>
+        <tbody>${rows.map(h => {
+          const day = new Date(h.date + 'T00:00:00Z').toLocaleDateString('en-IN', { weekday: 'long' });
+          return `<tr>
+            <td><input type="checkbox" class="holiday-check" value="${h.date}" /></td>
+            <td><strong>${h.date}</strong></td>
+            <td>${day}</td>
+            <td>${h.reason || '—'}</td>
+            <td><button class="btn btn-danger btn-sm" onclick="deleteHoliday('${h.date}')">🗑️</button></td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>`;
+  } catch (e) {
+    box.innerHTML = `<div style="color:var(--danger)">${e.message}</div>`;
+  }
+}
+
+function toggleAllHolidayChecks(checked) {
+  document.querySelectorAll('.holiday-check').forEach(c => c.checked = checked);
+}
+
+async function bulkAddHolidays() {
+  const raw = document.getElementById('holidayBulkInput').value.trim();
+  if (!raw) { showToast('⚠️ Empty', 'Paste holiday list first'); return; }
+
+  const lines = raw.split('\n').filter(l => l.trim());
+  let ok = 0, fail = 0;
+  const errors = [];
+
+  const btn = event?.target;
+  const orig = btn?.textContent;
+  if (btn) { btn.textContent = '⏳ Adding...'; btn.disabled = true; }
+
+  for (const line of lines) {
+    const [datePart, ...reasonParts] = line.split(',');
+    const date = (datePart || '').trim();
+    const reason = reasonParts.join(',').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      fail++; errors.push(`Bad date: ${line}`); continue;
+    }
+    try {
+      await api('/api/admin/holidays', {
+        method: 'POST',
+        body: JSON.stringify({ date, reason })
+      });
+      ok++;
+    } catch (e) { fail++; errors.push(`${date}: ${e.message}`); }
+  }
+
+  if (btn) { btn.textContent = orig; btn.disabled = false; }
+
+  document.getElementById('holidayResult').innerHTML = `
+    <div style="padding:14px 18px;background:${ok ? 'rgba(0,184,148,0.1)' : 'rgba(225,112,85,0.1)'};border-radius:10px">
+      <strong>✅ ${ok} added/updated</strong>${fail ? ` · <strong style="color:var(--danger)">${fail} failed</strong>` : ''}
+      ${errors.length ? `<div style="margin-top:10px;font-size:12px;color:var(--text-muted)">${errors.slice(0,5).map(e => `• ${e}`).join('<br>')}</div>` : ''}
+    </div>`;
+
+  if (ok) document.getElementById('holidayBulkInput').value = '';
+  renderHolidays();
+  showToast('📥 Holidays', `${ok} added, ${fail} failed`);
+}
+
+async function loadCurrentHolidaysIntoInput() {
+  try {
+    const rows = await api('/api/admin/holidays');
+    document.getElementById('holidayBulkInput').value =
+      rows.map(h => `${h.date},${h.reason || ''}`).join('\n');
+    showToast('📄 Loaded', `${rows.length} holidays in editor`);
+  } catch (e) { showToast('⚠️ Error', e.message); }
+}
+
+function loadSampleHolidays() {
+  document.getElementById('holidayBulkInput').value =
+`2026-01-26,Republic Day
+2026-02-26,Mahashivratri
+2026-03-04,Holi
+2026-03-21,Id-Ul-Fitr
+2026-04-01,Annual Bank Closing
+2026-04-03,Good Friday
+2026-04-14,Dr. Ambedkar Jayanti
+2026-05-01,Maharashtra Day
+2026-05-28,Bakri Id
+2026-08-15,Independence Day
+2026-08-26,Ganesh Chaturthi
+2026-10-02,Gandhi Jayanti
+2026-10-20,Diwali Laxmi Puja
+2026-10-21,Diwali Balipratipada
+2026-11-24,Guru Nanak Jayanti
+2026-12-25,Christmas`;
+  showToast('📋 Sample', '2026 list loaded — click Add / Update');
+}
+
+async function deleteHoliday(date) {
+  if (!confirm(`Remove holiday ${date}?`)) return;
+  try {
+    await api(`/api/admin/holidays/${date}`, { method: 'DELETE' });
+    renderHolidays();
+    showToast('🗑️ Removed', date);
+  } catch (e) { showToast('⚠️ Error', e.message); }
+}
+
+async function deleteSelectedHolidays() {
+  const checked = [...document.querySelectorAll('.holiday-check:checked')].map(c => c.value);
+  if (!checked.length) { showToast('⚠️ None Selected', 'Tick holidays to remove'); return; }
+  if (!confirm(`Remove ${checked.length} holiday(s)?`)) return;
+
+  let ok = 0;
+  for (const date of checked) {
+    try { await api(`/api/admin/holidays/${date}`, { method: 'DELETE' }); ok++; }
+    catch {}
+  }
+  renderHolidays();
+  showToast('🗑️ Removed', `${ok} holiday(s) deleted`);
+}
+
+async function deleteAllHolidays() {
+  if (!confirm('Remove ALL holidays? This cannot be undone.')) return;
+  try {
+    const rows = await api('/api/admin/holidays');
+    let ok = 0;
+    for (const h of rows) {
+      try { await api(`/api/admin/holidays/${h.date}`, { method: 'DELETE' }); ok++; }
+      catch {}
+    }
+    renderHolidays();
+    showToast('🗑️ Cleared', `${ok} holidays removed`);
+  } catch (e) { showToast('⚠️ Error', e.message); }
+}
+
+
+/* ============================================================
+   SECTION 29 — BOOTSTRAP
    ============================================================ */
 (async function initAuth() {
   const token = getToken();

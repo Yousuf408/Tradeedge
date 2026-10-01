@@ -15,6 +15,8 @@ import {
   setCachedCandle,
   setCachedLTP,
   getLTPForTokens,
+  fetchAllClosingPrices,
+  fetchAllLTP,
   getSessionStatus
 } from './brokers/angelone/Angel_REST.js';
 
@@ -478,7 +480,7 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 10 — SCREENER
+   SECTION 10 — SCREENER (thin routes — REST lives in Angel_REST.js)
    ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
@@ -538,7 +540,9 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
   const p = getScreenerPhase();
   if (!p.date) return res.json({ ok: true, results: [] });
 
+  // ← REST batching handled inside Angel_REST.js
   const ltpResults = await getLTPForTokens(tokens);
+
   const candles = getCachedCandles(tokens, p.date);
   const candleMap = {};
   candles.forEach(c => {
@@ -582,55 +586,49 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 11 — CLOSING PRICE FETCH (15:34 IST)
-   Also used to backfill LTP anytime
+   SECTION 11 — CLOSING FETCH (thin — REST in Angel_REST.js)
    ============================================================ */
 async function fetchClosingPrices() {
   try {
     const p = getScreenerPhase();
-    if (p.phase !== 'ready') return;
+    if (!p.date) return;
     const tokens = STOCKS.map(s => s.token);
     console.log(`🔔 Fetching closing prices for ${tokens.length} stocks...`);
 
-    const results = await getLTPForTokens(tokens);
+    // ← All batching/rate-limit/delay logic in Angel_REST.js
+    const { ok, failed } = await fetchAllClosingPrices(tokens, p.date);
 
-    let saved = 0;
-    for (const r of results) {
-      if (r.ltp) {
-        saved++;
-        db.query(
-          `UPDATE angel_15m_candle SET ltp=$1, ltp_updated_at=NOW() WHERE date=$2 AND token=$3`,
-          [r.ltp, p.date, r.token]
-        ).catch(() => {});
-      }
+    for (const r of ok) {
+      setCachedLTP(r.token, r.price);
+      db.query(
+        `UPDATE angel_15m_candle SET ltp=$1, ltp_updated_at=NOW() WHERE date=$2 AND token=$3`,
+        [r.price, p.date, r.token]
+      ).catch(() => {});
     }
-    console.log(`✅ Closing prices saved to DB: ${saved}/${tokens.length}`);
-  } catch (e) { console.error('Closing price fetch failed:', e.message); }
+    console.log(`✅ Closing prices saved: ${ok.length}/${tokens.length} (failed: ${failed.length})`);
+  } catch (e) { console.error('Closing fetch failed:', e.message); }
 }
 
-/* Admin: force-fetch LTPs now (bypass market hours for backfill) */
+/* Admin: force-fetch closing prices (backfill any time) */
 app.post('/api/admin/force-ltp', auth, adminOnly, async (req, res) => {
   try {
     const p = getScreenerPhase();
     if (!p.date) return res.status(400).json({ error: 'No trading date' });
     const tokens = STOCKS.map(s => s.token);
 
-    let saved = 0, failed = 0;
-    for (let i = 0; i < tokens.length; i += 50) {
-      const batch = tokens.slice(i, i + 50);
-      const ltpResults = await getLTPForTokens(batch);
-      for (const r of ltpResults) {
-        if (r.ltp) {
-          saved++;
-          setCachedLTP(r.token, r.ltp);
-          await db.query(
-            `UPDATE angel_15m_candle SET ltp=$1, ltp_updated_at=NOW() WHERE date=$2 AND token=$3`,
-            [r.ltp, p.date, r.token]
-          );
-        } else failed++;
-      }
+    // ← REST loop inside Angel_REST.js
+    const { ok, failed } = await fetchAllClosingPrices(tokens, p.date);
+
+    let saved = 0;
+    for (const r of ok) {
+      saved++;
+      setCachedLTP(r.token, r.price);
+      await db.query(
+        `UPDATE angel_15m_candle SET ltp=$1, ltp_updated_at=NOW() WHERE date=$2 AND token=$3`,
+        [r.price, p.date, r.token]
+      );
     }
-    res.json({ ok: true, saved, failed, total: tokens.length });
+    res.json({ ok: true, saved, failed: failed.length, total: tokens.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

@@ -1,19 +1,18 @@
 /* ============================================================
    SCREENER.JS
-   Multi-strategy aware. Data is shared; each strategy applies
-   its own filter + stage logic.
+   Multi-strategy + ORB stage tracking + timestamps
    ============================================================ */
 
-let SCREENER_ALL_STOCKS = [];       // 387 from server (unfiltered)
-let SCREENER_STOCKS = [];           // filtered by current strategy
-let SCREENER_ALL_CANDLES = {};      // token → candle (all fetched)
-let SCREENER_LTP = {};              // token → price
-let SCREENER_ORB = {};              // token → {lowBroken, entrySignal}
+let SCREENER_ALL_STOCKS = [];
+let SCREENER_STOCKS = [];
+let SCREENER_ALL_CANDLES = {};
+let SCREENER_LTP = {};
+let SCREENER_ORB = {};
 let SCREENER_INIT_DONE = false;
 let SCREENER_LTP_TIMER = null;
 let FETCHING = false;
 
-const CURRENT_STRATEGY = 'orb';
+const CURRENT_STRATEGY = 'advance_orb';
 const STRATEGY_FILTER = { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 };
 
 let PER_TRADE = 10000;
@@ -54,7 +53,7 @@ function setupControls() {
           style="font-size:12px;font-weight:600;color:var(--text-muted);padding:6px 14px;
                  background:rgba(108,92,231,0.06);border-radius:20px;margin-left:12px">Ready</span>
     <span style="font-size:11px;color:var(--text-muted);margin-left:12px">
-      Filter: Range ≤ ${STRATEGY_FILTER.maxRangePct}% · Price ₹${STRATEGY_FILTER.minPrice}–${STRATEGY_FILTER.maxPrice}
+      Range ≤ ${STRATEGY_FILTER.maxRangePct}% · ₹${STRATEGY_FILTER.minPrice}–${STRATEGY_FILTER.maxPrice}
     </span>
     <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:16px">Per-Trade ₹</label>
     <input id="perTradeInput" type="number" value="10000" min="100"
@@ -75,7 +74,7 @@ function onPerTradeChange() {
 }
 
 /* ============================================================
-   SECTION 3 — FILTER (per strategy)
+   SECTION 3 — FILTER
    ============================================================ */
 function passesFilter(candle) {
   if (!candle) return false;
@@ -118,7 +117,6 @@ async function loadCachedData() {
         }
       }
     }
-    // Server already returned the filtered set of stocks — use it
     if (d.stocks) SCREENER_ALL_STOCKS = d.stocks.length ? d.stocks : SCREENER_ALL_STOCKS;
     recomputeFilteredStocks();
     renderScreenerTable();
@@ -131,7 +129,7 @@ async function loadCachedData() {
 }
 
 /* ============================================================
-   SECTION 5 — FETCH (fetches all; filter applies live)
+   SECTION 5 — FETCH
    ============================================================ */
 async function startFetch() {
   if (FETCHING) return;
@@ -143,7 +141,6 @@ async function startFetch() {
   btn.textContent = '⏳ Fetching...';
   document.getElementById('progressBar').style.display = 'block';
 
-  // Fetch ALL active tokens — filter happens after candle known
   const allTokens = SCREENER_ALL_STOCKS.map(s => s.token);
   const total = allTokens.length;
   let ok = 0, failed = 0;
@@ -183,7 +180,6 @@ async function startFetch() {
           } else failed++;
         }
       }
-      // Live filter + render after each batch
       recomputeFilteredStocks();
       renderScreenerTable();
       updateProgress(total - missing.length + i + batch.length, total);
@@ -212,7 +208,7 @@ function updateProgress(done, total) {
 }
 
 /* ============================================================
-   SECTION 6 — LTP (polls filtered stocks only)
+   SECTION 6 — LTP + ORB state
    ============================================================ */
 async function loadLTP() {
   if (!SCREENER_STOCKS.length) return;
@@ -228,7 +224,12 @@ async function loadLTP() {
         if (item.ltp) SCREENER_LTP[item.token] = item.ltp;
         SCREENER_ORB[item.token] = {
           lowBroken: !!item.lowBroken,
-          entrySignal: !!item.entrySignal
+          pullbackConfirmed: !!item.pullbackConfirmed,
+          entrySignal: !!item.entrySignal,
+          newLowAt: item.newLowAt || null,
+          pullbackAt: item.pullbackAt || null,
+          breakoutAt: item.breakoutAt || null,
+          serverTime: item.serverTime || null
         };
       }
     }
@@ -242,18 +243,28 @@ function startLTPRefresh() {
 }
 
 /* ============================================================
-   SECTION 7 — ORB STAGE RESOLVER
+   SECTION 7 — ORB STAGE + TIME HELPERS
    ============================================================ */
 function resolveOrbStage(token, candle, ltp) {
-  const orb = SCREENER_ORB[token] || { lowBroken: false, entrySignal: false };
-  if (orb.entrySignal) return { label: '🎯 ENTRY SIGNAL', color: '#6C5CE7', weight: 700 };
-  if (orb.lowBroken)   return { label: '⬇️ Low Broken — waiting entry', color: '#f39c12', weight: 600 };
+  const orb = SCREENER_ORB[token] || { lowBroken: false, pullbackConfirmed: false, entrySignal: false };
+
+  if (orb.entrySignal)      return { label: '🎯 ENTRY SIGNAL', color: '#6C5CE7', weight: 700 };
+  if (orb.pullbackConfirmed) return { label: '↩️ Pullback confirmed', color: '#f39c12', weight: 600 };
+  if (orb.lowBroken)         return { label: '⬇️ Low Broken', color: '#f39c12', weight: 600 };
   if (ltp && candle) {
-    if (ltp > candle.high) return { label: '⏸️ Inside (above 9:15 High)', color: 'var(--text-muted)', weight: 500 };
-    if (ltp < candle.low)  return { label: '⬇️ Below Low (confirming...)', color: '#f39c12', weight: 600 };
+    if (ltp > candle.high) return { label: '⏸️ Above High (ignored)', color: 'var(--text-muted)', weight: 500 };
     return { label: '⏸️ Inside Range', color: 'var(--text-muted)', weight: 500 };
   }
   return { label: '— waiting —', color: 'var(--text-muted)', weight: 500 };
+}
+
+function formatTimeIST(isoStr) {
+  if (!isoStr) return '—';
+  try {
+    const d = new Date(isoStr);
+    const ist = new Date(d.getTime() + 5.5 * 3600 * 1000);
+    return ist.toISOString().slice(11, 19);
+  } catch { return '—'; }
 }
 
 /* ============================================================
@@ -267,17 +278,22 @@ function renderScreenerTable() {
 
   head.innerHTML = `<tr>
     <th>Stock / Company</th>
-    <th>Current LTP</th>
-    <th>9:15 High</th>
-    <th>9:15 Low</th>
-    <th>SL (9:15 Low)</th>
-    <th>Target (+1%)</th>
+    <th>LTP</th>
+    <th>9:15 H</th>
+    <th>9:15 L</th>
+    <th>SL</th>
+    <th>Target</th>
     <th>MAXQTY</th>
-    <th>ORB Stage</th>
+    <th>NEW LOW</th>
+    <th>PULLBACK</th>
+    <th>BREAKOUT</th>
+    <th>LAST UPDATE</th>
+    <th>ORB STAGE</th>
+    <th>ACTION</th>
   </tr>`;
 
   if (!SCREENER_STOCKS.length) {
-    body.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:60px;color:var(--text-muted)">
+    body.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:60px;color:var(--text-muted)">
       No stocks match the strategy filter yet.<br>
       Click <strong>⚡ Fetch 9:15 Candles</strong> to load data.
     </td></tr>`;
@@ -288,6 +304,7 @@ function renderScreenerTable() {
   body.innerHTML = SCREENER_STOCKS.map(s => {
     const c = SCREENER_ALL_CANDLES[s.token];
     const ltp = SCREENER_LTP[s.token];
+    const orb = SCREENER_ORB[s.token] || {};
 
     const sl = c.low;
     const target = c.high * 1.01;
@@ -295,15 +312,27 @@ function renderScreenerTable() {
     const maxQty = risk > 0 ? Math.floor(PER_TRADE / risk) : '—';
     const stage = resolveOrbStage(s.token, c, ltp);
 
+    const newLowTime    = formatTimeIST(orb.newLowAt);
+    const pullbackTime  = formatTimeIST(orb.pullbackAt);
+    const breakoutTime  = formatTimeIST(orb.breakoutAt);
+    const lastUpdate    = formatTimeIST(orb.serverTime);
+
     return `<tr>
-      <td><strong>${s.sym}</strong><br><span style="font-size:11px;color:var(--text-muted)">Token: ${s.token}</span></td>
+      <td><strong>${s.sym}</strong><br><span style="font-size:11px;color:var(--text-muted)">${s.token}</span></td>
       <td style="font-weight:700">${ltp ? '₹' + ltp.toFixed(2) : '—'}</td>
       <td style="color:var(--success);font-weight:600">₹${c.high.toFixed(2)}</td>
       <td style="color:var(--danger);font-weight:600">₹${c.low.toFixed(2)}</td>
       <td>₹${sl.toFixed(2)}</td>
       <td style="color:#6C5CE7;font-weight:600">₹${target.toFixed(2)}</td>
       <td style="font-weight:700;color:#6C5CE7">${maxQty}</td>
-      <td style="color:${stage.color};font-weight:${stage.weight}">${stage.label}</td>
+      <td style="color:#e17055;font-weight:600;font-family:monospace">${newLowTime}</td>
+      <td style="color:#f39c12;font-weight:600;font-family:monospace">${pullbackTime}</td>
+      <td style="color:#00b894;font-weight:600;font-family:monospace">${breakoutTime}</td>
+      <td style="color:var(--text-muted);font-size:11px;font-family:monospace">${lastUpdate}</td>
+      <td style="color:${stage.color};font-weight:${stage.weight};font-size:12px">${stage.label}</td>
+      <td>${orb.entrySignal
+        ? `<button class="btn btn-success btn-sm" onclick="placeOrder('${s.sym}')">Buy</button>`
+        : '<span style="color:var(--text-muted);font-size:11px">—</span>'}</td>
     </tr>`;
   }).join('');
 
@@ -311,7 +340,14 @@ function renderScreenerTable() {
 }
 
 /* ============================================================
-   SECTION 9 — HELPERS
+   SECTION 9 — ORDER PLACEHOLDER
+   ============================================================ */
+function placeOrder(sym) {
+  showToast('📝 Order', `Buy signal for ${sym} — order placement coming soon`);
+}
+
+/* ============================================================
+   SECTION 10 — HELPERS
    ============================================================ */
 function setPill(text, color) {
   const pill = document.getElementById('screenerStatusPill');

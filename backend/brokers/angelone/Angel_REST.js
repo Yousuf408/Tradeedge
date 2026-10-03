@@ -434,7 +434,9 @@ export async function fetchAllLTP(tokens) {
    ============================================================ */
 export function clearCandleCache() { candleCache.clear(); }
 export function clearLtpCache() { ltpCache.clear(); }
-export function getFeedToken() { return session.feedToken; }
+
 export function getCachedLTP(token) {
   return ltpCache.get(String(token))?.price || null;
 }
+
+export function getFeedToken() { return session.feedToken; }

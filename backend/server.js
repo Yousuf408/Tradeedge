@@ -1,3 +1,37 @@
+/* ============================================================
+   server.js — TradeAlgo Pro backend
+
+   STRUCTURE:
+    §1  Imports
+    §2  Config (env, DB, stock list, strategy)
+    §3  Time / phases / holidays
+    §4  ORB state (memory + DB sync)
+    §5  WebSocket manager (tick → stages)
+    §6  Middleware + helpers
+    §7  Auth routes
+    §8  Forgot password
+    §9  Change password + profile
+    §10 Users CRUD (admin)
+    §11 Audit + prices
+    §12 Trading holidays (admin)
+    §13 Screener routes
+    §14 Closing prices (15:34 IST)
+    §15 DB cache loader
+    §16 Start
+
+   DATA FLOW:
+    9:15 fetch → candles cached (memory + DB)
+                ↓
+    WS subscribes to all active tokens
+                ↓
+    Every tick → update ORB stages + LTP in DB
+                ↓
+    Client polls /api/screener/ltp → gets stage data
+                ↓
+    15:30 → WS stops
+    15:34 → closing prices saved
+   ============================================================ */
+
 import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
@@ -16,11 +50,17 @@ import {
   setCachedLTP,
   getLTPForTokens,
   fetchAllClosingPrices,
-  getSessionStatus
+  getSessionStatus,
+  getFeedToken
 } from './brokers/angelone/Angel_REST.js';
+import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 
 dotenv.config();
 
+
+/* ============================================================
+   SECTION 2 — CONFIG
+   ============================================================ */
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
@@ -35,6 +75,7 @@ const db = new pg.Pool({
 const SECRET = process.env.JWT_SECRET;
 
 const __dir = dirname(fileURLToPath(import.meta.url));
+
 const ALL_STOCKS = JSON.parse(
   readFileSync(join(__dir, 'brokers/angelone/Angel_nifty500.json'), 'utf8')
 );
@@ -44,7 +85,7 @@ console.log(`📋 Stocks: ${STOCKS.length} active / ${ALL_STOCKS.length} total`)
 const SYM_BY_TOKEN = {};
 STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
 
-/* ---- Strategy config ---- */
+/* ---- Strategy config — add new strategies here ---- */
 const STRATEGIES = {
   advance_orb: {
     id: 'advance_orb',
@@ -64,7 +105,10 @@ function passesStrategy(candle, strategy) {
   return rangePct <= f.maxRangePct && close >= f.minPrice && close <= f.maxPrice;
 }
 
-/* ---- Time / Phase ---- */
+
+/* ============================================================
+   SECTION 3 — TIME / PHASES / HOLIDAYS
+   ============================================================ */
 const getIST = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 const addDays = (d, n) => new Date(d.getTime() + n * 864e5).toISOString().split('T')[0];
 
@@ -79,7 +123,10 @@ async function loadHolidaysFromDB() {
 }
 
 const isHoliday = s => holidaySet.has(s);
-const isTradingDay = d => d.getUTCDay() !== 0 && d.getUTCDay() !== 6 && !isHoliday(d.toISOString().split('T')[0]);
+const isTradingDay = d =>
+  d.getUTCDay() !== 0 &&
+  d.getUTCDay() !== 6 &&
+  !isHoliday(d.toISOString().split('T')[0]);
 
 function getPreviousTradingDay(dateObj) {
   const d = new Date(dateObj);
@@ -106,7 +153,10 @@ function countFilled(date) {
   return cached.filter(c => c.candle && !c.candle.error && Array.isArray(c.candle)).length;
 }
 
-/* ---- ORB state ---- */
+
+/* ============================================================
+   SECTION 4 — ORB STATE (memory + DB)
+   ============================================================ */
 const orbState = new Map();
 
 async function loadOrbStateFromDB(date) {
@@ -137,7 +187,134 @@ const getOrbState = (token, date) => orbState.get(`${token}_${date}`) || {
   firstLowBreakAt: null, firstPullbackAt: null, firstEntryAt: null
 };
 
-/* ---- Middleware ---- */
+
+/* ============================================================
+   SECTION 5 — WEBSOCKET MANAGER
+   Live tick → updates ORB stages + LTP in real time
+   ============================================================ */
+let wsStarted = false;
+let wsConnectedTokens = 0;
+
+/* Called for every tick from WebSocket */
+function handleTick(token, ltp) {
+  const p = getScreenerPhase();
+  if (p.phase !== 'ready' || !p.date) return;
+
+  const candleArr = getCachedCandles([token], p.date)[0]?.candle;
+  if (!Array.isArray(candleArr) || candleArr.length < 5) return;
+
+  const low = +candleArr[3];
+  const high = +candleArr[2];
+  const key = `${token}_${p.date}`;
+  const state = getOrbState(token, p.date);
+  let changed = false;
+
+  /* Stage 1 — Low broken */
+  if (!state.lowBroken && ltp < low) {
+    state.lowBroken = true;
+    state.firstLowBreakAt = new Date().toISOString();
+    db.query(
+      `UPDATE angel_15m_candle SET low_broken=true, first_low_break_at=NOW()
+       WHERE date=$1 AND token=$2 AND low_broken=false`,
+      [p.date, token]
+    ).catch(() => {});
+    changed = true;
+  }
+
+  /* Stage 2 — Pullback confirmed (price returned inside range) */
+  if (state.lowBroken && !state.pullbackConfirmed && ltp > low && ltp < high) {
+    state.pullbackConfirmed = true;
+    state.firstPullbackAt = new Date().toISOString();
+    db.query(
+      `UPDATE angel_15m_candle SET pullback_confirmed=true, first_pullback_at=NOW()
+       WHERE date=$1 AND token=$2 AND pullback_confirmed=false`,
+      [p.date, token]
+    ).catch(() => {});
+    changed = true;
+  }
+
+  /* Stage 3 — Entry (high broken after pullback) */
+  if (state.pullbackConfirmed && !state.entrySignal && ltp > high) {
+    state.entrySignal = true;
+    state.firstEntryAt = new Date().toISOString();
+    db.query(
+      `UPDATE angel_15m_candle SET entry_signal=true, first_entry_at=NOW()
+       WHERE date=$1 AND token=$2 AND entry_signal=false`,
+      [p.date, token]
+    ).catch(() => {});
+    changed = true;
+  }
+
+  if (changed) orbState.set(key, state);
+
+  /* Always update LTP */
+  setCachedLTP(token, ltp);
+  db.query(
+    `UPDATE angel_15m_candle SET ltp=$1, ltp_updated_at=NOW() WHERE date=$2 AND token=$3`,
+    [ltp, p.date, token]
+  ).catch(() => {});
+}
+
+/* Start WS after 9:15 fetch is done and phase is 'ready' */
+function startWebSocketForReadyPhase() {
+  if (wsStarted) return;
+  const p = getScreenerPhase();
+  if (p.phase !== 'ready' || !p.date) return;
+
+  const session = getSessionStatus();
+  if (!session.loggedIn) return;
+
+  const feedToken = getFeedToken();
+  if (!feedToken) { console.log('⚠️  WS skipped — no feed token'); return; }
+
+  const tokens = STOCKS.map(s => String(s.token));
+
+  try {
+    startWS({
+      apiKey: process.env.ANGEL_API_KEY,
+      clientCode: process.env.ANGEL_CLIENT_ID,
+      feedToken,
+      tokens,
+      onTick: handleTick,
+      onDisconnect: async (gapStart, gapEnd) => {
+        const gapSec = Math.round((gapEnd - gapStart) / 1000);
+        console.log(`🔁 WS gap ${gapSec}s — reconnecting`);
+      }
+    });
+    wsStarted = true;
+    wsConnectedTokens = tokens.length;
+    console.log(`🔌 WS started for ${tokens.length} tokens`);
+  } catch (e) {
+    console.error('WS start failed:', e.message);
+  }
+}
+
+function stopWebSocketIfNeeded() {
+  if (!wsStarted) return;
+  const ist = getIST();
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  const dow = ist.getUTCDay();
+
+  // Stop after 15:30 or on non-trading days
+  if (dow === 0 || dow === 6 || !isTradingDay(ist) || mins >= 930) {
+    stopWS();
+    wsStarted = false;
+    wsConnectedTokens = 0;
+    console.log('🔌 WS stopped');
+  }
+}
+
+/* Watchdog: start/stop WS every 60s based on phase */
+setInterval(() => {
+  const p = getScreenerPhase();
+  if (p.phase === 'ready') startWebSocketForReadyPhase();
+  else stopWebSocketIfNeeded();
+}, 60 * 1000);
+
+
+/* ============================================================
+   SECTION 6 — MIDDLEWARE + HELPERS
+   ============================================================ */
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'No token' });
@@ -152,8 +329,10 @@ function adminOnly(req, res, next) {
 
 async function log(actor, action, details = '', level = 'info') {
   try {
-    await db.query('INSERT INTO audit_log (actor, action, details, level) VALUES ($1,$2,$3,$4)',
-      [actor, action, details, level]);
+    await db.query(
+      'INSERT INTO audit_log (actor, action, details, level) VALUES ($1,$2,$3,$4)',
+      [actor, action, details, level]
+    );
   } catch {}
 }
 
@@ -176,7 +355,7 @@ const generatePassword = (fullName, mobile) => {
   return `${cap}@${last4}!`;
 };
 
-/* ---- TOTP ---- */
+/* ---- TOTP verification (for forgot-password) ---- */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 function base32Decode(str) {
@@ -210,14 +389,12 @@ function verifyTotpServer(secret, input) {
   return [step - 1, step, step + 1].some(c => totpAt(secret, c) === input);
 }
 
+
 /* ============================================================
-   ROUTES — HEALTH
+   SECTION 7 — AUTH ROUTES
    ============================================================ */
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
 
-/* ============================================================
-   ROUTES — AUTH
-   ============================================================ */
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
   const clean = (input || '').trim().toLowerCase();
@@ -308,8 +485,9 @@ app.post('/api/logout', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
+
 /* ============================================================
-   ROUTES — FORGOT PASSWORD
+   SECTION 8 — FORGOT PASSWORD
    ============================================================ */
 app.post('/api/forgot-password/check', async (req, res) => {
   const { input } = req.body;
@@ -355,8 +533,9 @@ app.post('/api/forgot-password/reset', async (req, res) => {
   res.json({ ok: true });
 });
 
+
 /* ============================================================
-   ROUTES — CHANGE PASSWORD + PROFILE
+   SECTION 9 — CHANGE PASSWORD + PROFILE
    ============================================================ */
 app.post('/api/change-password', auth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
@@ -377,9 +556,10 @@ app.post('/api/change-password', auth, async (req, res) => {
   await db.query('UPDATE users SET password_hash=$1, session_id=$2 WHERE username=$3',
     [hash, newSessionId, req.user.username]);
 
-  const token = jwt.sign({ username: user.username, role: user.role, sessionId: newSessionId },
-    SECRET, { expiresIn: '7h' });
-
+  const token = jwt.sign(
+    { username: user.username, role: user.role, sessionId: newSessionId },
+    SECRET, { expiresIn: '7h' }
+  );
   await log(req.user.username, 'PASSWORD_CHANGED', `User: ${req.user.username}`, 'success');
   res.json({ ok: true, token, sessionId: newSessionId });
 });
@@ -402,8 +582,9 @@ app.put('/api/me', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
 /* ============================================================
-   ROUTES — USERS (admin)
+   SECTION 10 — USERS CRUD (admin)
    ============================================================ */
 app.get('/api/users', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query(
@@ -426,7 +607,8 @@ app.post('/api/users', auth, adminOnly, async (req, res) => {
 
   try {
     await db.query(
-      'INSERT INTO users (name, username, mobile, password_hash, plan, expires_at) VALUES ($1,$2,$3,$4,$5,$6)',
+      `INSERT INTO users (name, username, mobile, password_hash, plan, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
       [name.trim(), username, cleanMobile, hash, plan || 'Demo', expiresAt]
     );
     await log(req.user.username, 'USER_CREATED', `${name} (@${username})`, 'success');
@@ -498,8 +680,9 @@ app.delete('/api/users/:username', auth, adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
+
 /* ============================================================
-   ROUTES — AUDIT + PRICES
+   SECTION 11 — AUDIT + PRICES
    ============================================================ */
 app.get('/api/audit', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200');
@@ -525,8 +708,9 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
+
 /* ============================================================
-   ROUTES — TRADING HOLIDAYS (admin)
+   SECTION 12 — TRADING HOLIDAYS (admin)
    ============================================================ */
 app.get('/api/admin/holidays', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT date::text AS date, reason FROM trading_holidays ORDER BY date ASC');
@@ -558,11 +742,13 @@ app.delete('/api/admin/holidays/:date', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
 /* ============================================================
-   ROUTES — SCREENER
+   SECTION 13 — SCREENER ROUTES
    ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
+app.get('/api/ws/status', auth, (req, res) => res.json(getWSStatus()));
 
 app.get('/api/strategies', auth, (req, res) => {
   res.json(Object.values(STRATEGIES).map(s => ({ id: s.id, name: s.name, filters: s.filters })));
@@ -572,7 +758,8 @@ app.get('/api/screener/status', auth, (req, res) => {
   const p = getScreenerPhase();
   res.json({
     phase: p.phase, date: p.date || null,
-    filled: p.date ? countFilled(p.date) : 0, total: STOCKS.length
+    filled: p.date ? countFilled(p.date) : 0, total: STOCKS.length,
+    ws: getWSStatus()
   });
 });
 
@@ -588,16 +775,10 @@ app.get('/api/screener/data', auth, (req, res) => {
   const passingStocks = STOCKS.filter(s => passingTokens.has(String(s.token)));
 
   res.json({
-    ok: true,
-    phase: p.phase,
-    date: p.date,
-    strategy: strategy.id,
-    strategyName: strategy.name,
-    filters: strategy.filters,
-    filled: passing.length,
-    total: STOCKS.length,
-    results: passing,
-    stocks: passingStocks
+    ok: true, phase: p.phase, date: p.date,
+    strategy: strategy.id, strategyName: strategy.name, filters: strategy.filters,
+    filled: passing.length, total: STOCKS.length,
+    results: passing, stocks: passingStocks
   });
 });
 
@@ -634,64 +815,22 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* Client polls this — reads from memory, no API calls */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
   const p = getScreenerPhase();
   if (!p.date) return res.json({ ok: true, results: [] });
 
-  const ltpResults = await getLTPForTokens(tokens);
-  const candles = getCachedCandles(tokens, p.date);
-  const candleMap = {};
-  candles.forEach(c => {
-    if (Array.isArray(c.candle) && c.candle.length >= 5) {
-      candleMap[String(c.token)] = { high: +c.candle[2], low: +c.candle[3] };
-    }
-  });
-
   const serverTime = new Date().toISOString();
-  const enriched = [];
-
-  for (const r of ltpResults) {
-    const token = String(r.token);
-    const key = `${token}_${p.date}`;
+  const enriched = tokens.map(t => {
+    const token = String(t);
     const state = getOrbState(token, p.date);
-    const c = candleMap[token];
-    const ltp = r.ltp;
-
-    if (p.phase === 'ready' && c && ltp) {
-      // Stage 1: Low broken
-      if (!state.lowBroken && ltp < c.low) {
-        state.lowBroken = true;
-        state.firstLowBreakAt = new Date().toISOString();
-        db.query(`UPDATE angel_15m_candle SET low_broken=true, first_low_break_at=NOW() WHERE date=$1 AND token=$2 AND low_broken=false`,
-          [p.date, token]).catch(() => {});
-      }
-      // Stage 2: Pullback confirmed — price back inside range
-      if (state.lowBroken && !state.pullbackConfirmed && ltp > c.low && ltp < c.high) {
-        state.pullbackConfirmed = true;
-        state.firstPullbackAt = new Date().toISOString();
-        db.query(`UPDATE angel_15m_candle SET pullback_confirmed=true, first_pullback_at=NOW() WHERE date=$1 AND token=$2 AND pullback_confirmed=false`,
-          [p.date, token]).catch(() => {});
-      }
-      // Stage 3: Entry — high broken AFTER pullback
-      if (state.pullbackConfirmed && !state.entrySignal && ltp > c.high) {
-        state.entrySignal = true;
-        state.firstEntryAt = new Date().toISOString();
-        db.query(`UPDATE angel_15m_candle SET entry_signal=true, first_entry_at=NOW() WHERE date=$1 AND token=$2 AND entry_signal=false`,
-          [p.date, token]).catch(() => {});
-      }
-      orbState.set(key, state);
-    }
-
-    if (ltp) {
-      db.query(`UPDATE angel_15m_candle SET ltp=$1, ltp_updated_at=NOW() WHERE date=$2 AND token=$3`,
-        [ltp, p.date, token]).catch(() => {});
-    }
-
-    enriched.push({
+    const candleArr = getCachedCandles([token], p.date)[0]?.candle;
+    const ltp = candleArr ? undefined : undefined; // read from cache elsewhere
+    return {
       token,
-      ltp,
+      ltp: null,     // filled by Angel_REST cache via getLTPForTokens if needed
       lowBroken: state.lowBroken,
       pullbackConfirmed: state.pullbackConfirmed,
       entrySignal: state.entrySignal,
@@ -699,13 +838,15 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       pullbackAt: state.firstPullbackAt,
       breakoutAt: state.firstEntryAt,
       serverTime
-    });
-  }
+    };
+  });
+
   res.json({ ok: true, count: enriched.length, results: enriched });
 });
 
+
 /* ============================================================
-   CLOSING PRICE FETCH (15:34 IST daily)
+   SECTION 14 — CLOSING PRICES (15:34 IST)
    ============================================================ */
 async function fetchClosingPrices() {
   try {
@@ -729,7 +870,6 @@ app.post('/api/admin/force-ltp', auth, adminOnly, async (req, res) => {
     const p = getScreenerPhase();
     if (!p.date) return res.status(400).json({ error: 'No trading date' });
     const tokens = STOCKS.map(s => s.token);
-
     const { ok, failed } = await fetchAllClosingPrices(tokens, p.date);
     let saved = 0;
     for (const r of ok) {
@@ -761,8 +901,9 @@ function scheduleClosingFetch() {
   setTimeout(async () => { await fetchClosingPrices(); scheduleClosingFetch(); }, ms);
 }
 
+
 /* ============================================================
-   LOAD CACHE FROM DB
+   SECTION 15 — DB CACHE LOADER
    ============================================================ */
 async function loadScreenerCacheFromDB() {
   try {
@@ -782,21 +923,24 @@ async function loadScreenerCacheFromDB() {
   } catch (e) { console.error('DB load failed:', e.message); }
 }
 
+
 /* ============================================================
-   START
+   SECTION 16 — START
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server on port ${PORT}`);
   console.log(`📊 Strategy: ${STRATEGIES.advance_orb.name}`);
+
   try {
     await loginPlatform();
     console.log('✅ Angel One session started');
-  } catch (e) { console.error('⚠️ Angel login failed:', e.message); }
+  } catch (e) { console.error('⚠️  Angel login failed:', e.message); }
 
   await loadHolidaysFromDB();
   await loadScreenerCacheFromDB();
 
+  // Late startup — if server restarts after 15:34 on a weekday, fetch closing now
   const nowIST = getIST();
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
   const dow = nowIST.getUTCDay();
@@ -806,5 +950,5 @@ app.listen(PORT, async () => {
   }
   scheduleClosingFetch();
 
-  console.log('ℹ️  Manual mode');
+  console.log('ℹ️  Ready — manual fetch + live WS');
 });

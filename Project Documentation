@@ -1,0 +1,121 @@
+
+---
+
+## 5. FILE-BY-FILE BREAKDOWN
+
+### 5.1 `backend/server.js`
+
+**Purpose:** Main backend — all HTTP routes, scheduled tasks, DB operations.
+
+**Structure (section-wise):**
+
+| Section | Content |
+|---|---|
+| §1 Imports | Express, bcrypt, JWT, pg, crypto, Angel_REST, Angel_WS |
+| §2 Config | DB pool, JWT secret, load STOCKS from JSON, STRATEGIES config, passesStrategy() |
+| §3 Time / Phases | `getIST()`, `getScreenerPhase()` (closed/forming/ready/weekend), holiday checks |
+| §4 ORB State | In-memory Map + `loadOrbStateFromDB()`, `getOrbState()` |
+| §5 WebSocket | `handleTick()` (3-stage logic), `startWebSocketForReadyPhase()`, watchdog timer |
+| §6 Middleware | `auth`, `adminOnly`, `log`, `generateUsername`, `generatePassword`, TOTP verify |
+| §7 Auth | `/api/login`, `/api/complete-login`, `/api/session-check`, `/api/logout` |
+| §8 Forgot | `/api/forgot-password/check`, `/api/forgot-password/reset` |
+| §9 Password | `/api/change-password`, `/api/me` (profile) |
+| §10 Users CRUD | GET/POST/PUT/DELETE users + renew, set-expiry, reset, disable |
+| §11 Audit + Prices | `/api/audit`, `/api/prices` |
+| §12 Holidays | `/api/admin/holidays` GET/POST/DELETE |
+| §13 Screener | `/api/stocks`, `/api/screener/status`, `/api/screener/data`, `/api/screener/fetch-batch`, `/api/screener/ltp` |
+| §14 Closing | `fetchClosingPrices()` (15:34 IST scheduler), `/api/admin/force-ltp` |
+| §15 DB Loader | `loadScreenerCacheFromDB()` (rehydrate memory on boot) |
+| §16 Start | `app.listen()` + boot sequence |
+
+**Critical flows:**
+
+1. **Server boot:**
+   - Load holidays from DB
+   - Login to Angel One
+   - Load 9:15 candles from DB into memory cache
+   - Load ORB states from DB
+   - Schedule closing fetch at 15:34 IST
+   - Start WS watchdog (checks every 60s)
+
+2. **Phase detection (`getScreenerPhase`):**
+   - Weekend/holiday → `weekend`, date = previous trading day
+   - Before 9:15 IST → `closed`
+   - 9:15–9:30 IST → `forming`
+   - After 9:30 IST → `ready`, date = today
+
+3. **WebSocket watchdog:**
+   - Every 60s: if phase is `ready`, call `startWebSocketForReadyPhase()`
+   - If phase not `ready` and WS running, stop WS
+
+**Exports:** None (entry point).
+
+---
+
+### 5.2 `backend/brokers/angelone/Angel_REST.js`
+
+**Purpose:** All Angel One REST API logic. No business logic here.
+
+**Key exports:**
+
+| Function | Purpose |
+|---|---|
+| `loginPlatform()` | Auto-login with TOTP from env |
+| `getSessionStatus()` | Returns `{ loggedIn, expiresAt, loginTime }` |
+| `getCandlesForToken(token, date)` | Fetch + aggregate 9:15–9:30 candle |
+| `getCandlesForTokens(tokens, date)` | Batch fetch (5 workers, 150 req/min cap) |
+| `getCachedCandles(tokens, date)` | Read from memory (no API) |
+| `setCachedCandle(token, date, candle)` | Write to memory (used by server for DB rehydration) |
+| `setCachedLTP(token, price)` | Cache an LTP value |
+| `getCachedLTP(token)` | Read cached LTP |
+| `getLTPForTokens(tokens)` | Batch LTP fetch (50/call, market hours only) |
+| `getClosingPriceForToken(token, date)` | Fetch 15:30 close via 1-min candle |
+| `fetchAllClosingPrices(tokens, date)` | Bulk closing fetch (batched) |
+| `fetchAllLTP(tokens)` | Bulk LTP fetch |
+| `getFeedToken()` | Returns WebSocket feed token from session |
+| `getFailedList(date)` | Failed candle list |
+| `clearCandleCache()`, `clearLtpCache()` | Reset memory |
+
+**Rate limiting:**
+- Global token bucket: 150 req/min (configurable via `ANGEL_CANDLE_RATE_PER_MIN`)
+- 5 parallel workers
+- 8s cooldown on HTTP 403/429
+- Circuit breaker: 10 consecutive failures → abort batch
+- Text-first parsing (no blind `r.json()`)
+
+**Cache structure:**
+- `candleCache: Map<"token_date", [ts, open, high, low, close, volume]>`
+- `ltpCache: Map<token, { price, ts }>` — 30s TTL
+- `session: { jwtToken, feedToken, expiresAt, loginTime }`
+
+**Angel One API endpoints used:**
+- Login: `/rest/auth/angelbroking/user/v1/loginByPassword`
+- Candles: `/rest/secure/angelbroking/historical/v1/getCandleData`
+- LTP: `/rest/secure/angelbroking/market/v1/quote`
+
+**Interval format:** `ONE_MINUTE` (aggregated 15 bars for 9:15–9:30 range).
+
+---
+
+### 5.3 `backend/brokers/angelone/Angel_WS.js`
+
+**Purpose:** WebSocket connection to Angel One SmartAPI stream.
+
+**Key exports:**
+
+| Function | Purpose |
+|---|---|
+| `startWS({ apiKey, clientCode, feedToken, tokens, onTick, onDisconnect })` | Connect + subscribe |
+| `stopWS()` | Close connection |
+| `resubscribe(tokens)` | Change subscribed tokens |
+| `getWSStatus()` | `{ running, connected, connectedAt, lastTickMs, tokenCount }` |
+
+**Behavior:**
+- Connects to `wss://smartapisocket.angelone.in/smart-stream`
+- Sends subscribe message (mode 1 = LTP) for all tokens
+- Heartbeat ping every 25 sec
+- Auto-reconnect on drop (3 sec delay)
+- Fires `onTick(token, ltp)` on every tick
+- Fires `onDisconnect(gapStart, gapEnd)` on connection loss
+
+**Binary tick format (LTP mode, 52 bytes):**

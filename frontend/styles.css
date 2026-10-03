@@ -66,9 +66,6 @@ body {
   background: var(--bg-primary);
   color: var(--text-primary);
   min-height: 100vh;
-  background-image:
-    radial-gradient(ellipse at 10% 20%, rgba(108,92,231,0.04), transparent 60%),
-    radial-gradient(ellipse at 90% 80%, rgba(162,155,254,0.04), transparent 60%);
   transition: background 0.3s ease, color 0.3s ease;
 }
 body.logged-out .navbar, body.logged-out .container { display: none; }

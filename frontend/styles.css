@@ -79,9 +79,6 @@ body.logged-out .navbar, body.logged-out .container { display: none; }
   padding: 24px; z-index: 2000; overflow-y: auto;
   background: linear-gradient(135deg, #eef1f9 0%, #e6e9f5 50%, #eef1f9 100%);
 }
-body[data-theme="dark"] .auth-screen {
-  background: linear-gradient(135deg, #0b0a1a 0%, #1a1333 50%, #0b0a1a 100%);
-}
 .auth-screen::before, .auth-screen::after {
   content: ''; position: fixed;
   border-radius: 50%; filter: blur(100px);

@@ -15,101 +15,148 @@
 <div id="authScreen" class="auth-screen">
   <div class="auth-card">
 
-    <!-- 1.1 — Login -->
-    <div id="loginStep1">
-      <div class="auth-logo">📊 TradeAlgo Pro</div>
-      <div class="auth-sub">Sign in to continue</div>
-      <div class="auth-field">
-        <label>Username or Mobile</label>
-        <input id="authUser" type="text" placeholder="Enter username or mobile" autocomplete="username" />
+    <!-- Shared header with organic wave curve -->
+    <div class="auth-header">
+      <div class="auth-brand">
+        <div class="auth-brand-icon">📊</div>
+        <div class="auth-brand-name">TradeAlgo Pro</div>
       </div>
-      <div class="auth-field">
-        <label>Password</label>
-        <input id="authPass" type="password" placeholder="Enter password" autocomplete="current-password"
-               onkeydown="if(event.key==='Enter') doLogin()" />
+      <div class="auth-welcome">
+        <h1>Welcome Back!</h1>
+        <p>Sign in to continue to your workspace</p>
       </div>
-      <div class="auth-error" id="authError"></div>
-      <button class="btn btn-primary auth-btn" onclick="doLogin()">Continue</button>
-      <div style="margin-top:14px;font-size:13px">
-        <a onclick="showForgotStep(1)" style="color:#6C5CE7;cursor:pointer;font-weight:600">Forgot password?</a>
-      </div>
+      <svg class="auth-curve" viewBox="0 0 420 60" preserveAspectRatio="none">
+        <path d="M0,30 C100,60 320,0 420,30 L420,60 L0,60 Z" fill="#ffffff"/>
+      </svg>
     </div>
 
-    <!-- 1.2 — TOTP Verify -->
-    <div id="loginStep2Verify" style="display:none">
-      <div class="auth-logo">🔐 Two-Factor Auth</div>
-      <div class="auth-sub">Enter the 6-digit code from your authenticator app</div>
-      <div class="auth-field">
-        <label>6-digit code</label>
-        <input id="authTotp" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
-               style="letter-spacing:8px;text-align:center;font-size:22px;font-weight:700"
-               onkeydown="if(event.key==='Enter') verifyLoginTotp()" />
-      </div>
-      <div class="auth-error" id="authTotpError"></div>
-      <button class="btn btn-primary auth-btn" onclick="verifyLoginTotp()">Verify</button>
-      <button class="btn btn-outline auth-btn" style="margin-top:8px" onclick="cancelTotp()">Back</button>
-    </div>
+    <div class="auth-body">
 
-    <!-- 1.3 — TOTP Setup -->
-    <div id="loginStep2Setup" style="display:none">
-      <div class="auth-logo">🔐 Set Up 2FA</div>
-      <div class="auth-sub">Scan this QR with Google Authenticator or Authy</div>
-      <div class="qr-box"><img id="setupQR" alt="QR Code" /></div>
-      <div class="auth-field">
-        <label>Or type this key manually</label>
-        <input id="setupSecret" type="text" readonly style="font-family:monospace;font-size:12px;text-align:center" />
+      <!-- 1.1 — Login -->
+      <div id="loginStep1">
+        <div class="auth-field">
+          <label>Username or Mobile</label>
+          <div class="auth-input-wrap">
+            <input id="authUser" type="text" placeholder="Enter username or mobile" autocomplete="username" />
+            <svg class="auth-input-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
+            </svg>
+          </div>
+        </div>
+        <div class="auth-field">
+          <label>Password</label>
+          <div class="auth-input-wrap">
+            <input id="authPass" type="password" placeholder="Enter password" autocomplete="current-password"
+                   onkeydown="if(event.key==='Enter') doLogin()" />
+            <button type="button" class="auth-toggle-eye" onclick="toggleAuthPwd('authPass', this)">SHOW</button>
+            <svg class="auth-input-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+          </div>
+        </div>
+        <div class="auth-error" id="authError"></div>
+        <button class="auth-btn" onclick="doLogin()">Sign In</button>
+        <a class="auth-link" onclick="showForgotStep(1)">Forgot password?</a>
+        <div class="auth-secure">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+          </svg>
+          Protected dashboard access
+        </div>
       </div>
-      <div class="auth-field">
-        <label>Enter the 6-digit code from your app</label>
-        <input id="setupCode" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
-               style="text-align:center;letter-spacing:6px;font-size:18px;font-weight:700"
-               onkeydown="if(event.key==='Enter') confirmSetup()" />
-      </div>
-      <div class="auth-error" id="setupError"></div>
-      <button class="btn btn-primary auth-btn" onclick="confirmSetup()">Activate & Login</button>
-      <button class="btn btn-outline auth-btn" style="margin-top:8px" onclick="cancelTotp()">Back</button>
-    </div>
 
-    <!-- 1.4 — Forgot Password: Step 1 -->
-    <div id="forgotStep1" style="display:none">
-      <div class="auth-logo">🔓 Reset Password</div>
-      <div class="auth-sub">Enter your username or mobile to continue</div>
-      <div class="auth-field">
-        <label>Username or Mobile</label>
-        <input id="forgotInput" type="text" placeholder="Enter username or mobile"
-               onkeydown="if(event.key==='Enter') forgotCheck()" />
+      <!-- 1.2 — TOTP Verify -->
+      <div id="loginStep2Verify" style="display:none">
+        <div class="auth-field">
+          <label>6-digit code</label>
+          <div class="auth-input-wrap">
+            <input id="authTotp" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
+                   style="letter-spacing:8px;text-align:center;font-size:20px;font-weight:700"
+                   onkeydown="if(event.key==='Enter') verifyLoginTotp()" />
+          </div>
+        </div>
+        <div class="auth-error" id="authTotpError"></div>
+        <button class="auth-btn" onclick="verifyLoginTotp()">Verify</button>
+        <button class="auth-secondary-btn" onclick="cancelTotp()">Back to Login</button>
       </div>
-      <div class="auth-error" id="forgotError"></div>
-      <button class="btn btn-primary auth-btn" onclick="forgotCheck()">Continue</button>
-      <button class="btn btn-outline auth-btn" style="margin-top:8px" onclick="showLoginStep(1)">Back to Login</button>
-      <div style="margin-top:16px;font-size:12px;color:#7e8fa3">
-        Lost your phone too? Contact admin to reset manually.
-      </div>
-    </div>
 
-    <!-- 1.5 — Forgot Password: Step 2 -->
-    <div id="forgotStep2" style="display:none">
-      <div class="auth-logo">🔓 Reset Password</div>
-      <div class="auth-sub" id="forgotUserLabel">Verify your identity</div>
-      <div class="auth-field">
-        <label>6-digit code from your authenticator app</label>
-        <input id="forgotTotp" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
-               style="letter-spacing:8px;text-align:center;font-size:20px;font-weight:700" />
+      <!-- 1.3 — TOTP Setup -->
+      <div id="loginStep2Setup" style="display:none">
+        <div class="qr-box"><img id="setupQR" alt="QR Code" /></div>
+        <div class="auth-field">
+          <label>Or type this key manually</label>
+          <div class="auth-input-wrap">
+            <input id="setupSecret" type="text" readonly
+                   style="font-family:monospace;font-size:12px;text-align:center" />
+          </div>
+        </div>
+        <div class="auth-field">
+          <label>Enter the 6-digit code from your app</label>
+          <div class="auth-input-wrap">
+            <input id="setupCode" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
+                   style="text-align:center;letter-spacing:6px;font-size:18px;font-weight:700"
+                   onkeydown="if(event.key==='Enter') confirmSetup()" />
+          </div>
+        </div>
+        <div class="auth-error" id="setupError"></div>
+        <button class="auth-btn" onclick="confirmSetup()">Activate & Login</button>
+        <button class="auth-secondary-btn" onclick="cancelTotp()">Back</button>
       </div>
-      <div class="auth-field">
-        <label>New Password</label>
-        <input id="forgotNew" type="password" placeholder="At least 6 characters" />
-      </div>
-      <div class="auth-field">
-        <label>Confirm New Password</label>
-        <input id="forgotConfirm" type="password" placeholder="Repeat new password"
-               onkeydown="if(event.key==='Enter') forgotReset()" />
-      </div>
-      <div class="auth-error" id="forgotError2"></div>
-      <button class="btn btn-primary auth-btn" onclick="forgotReset()">Reset Password</button>
-      <button class="btn btn-outline auth-btn" style="margin-top:8px" onclick="showForgotStep(1)">Back</button>
-    </div>
 
+      <!-- 1.4 — Forgot Password Step 1 -->
+      <div id="forgotStep1" style="display:none">
+        <div class="auth-field">
+          <label>Username or Mobile</label>
+          <div class="auth-input-wrap">
+            <input id="forgotInput" type="text" placeholder="Enter username or mobile"
+                   onkeydown="if(event.key==='Enter') forgotCheck()" />
+            <svg class="auth-input-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
+            </svg>
+          </div>
+        </div>
+        <div class="auth-error" id="forgotError"></div>
+        <button class="auth-btn" onclick="forgotCheck()">Continue</button>
+        <button class="auth-secondary-btn" onclick="showLoginStep(1)">Back to Login</button>
+        <div class="auth-hint">Lost your phone too? Contact admin to reset manually.</div>
+      </div>
+
+      <!-- 1.5 — Forgot Password Step 2 -->
+      <div id="forgotStep2" style="display:none">
+        <div id="forgotUserLabel" style="font-size:12px;color:#3a4b60;text-align:center;margin-bottom:14px;font-weight:600"></div>
+        <div class="auth-field">
+          <label>6-digit code from authenticator</label>
+          <div class="auth-input-wrap">
+            <input id="forgotTotp" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
+                   style="letter-spacing:8px;text-align:center;font-size:20px;font-weight:700" />
+          </div>
+        </div>
+        <div class="auth-field">
+          <label>New Password</label>
+          <div class="auth-input-wrap">
+            <input id="forgotNew" type="password" placeholder="At least 6 characters" />
+            <button type="button" class="auth-toggle-eye" onclick="toggleAuthPwd('forgotNew', this)">SHOW</button>
+            <svg class="auth-input-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+          </div>
+        </div>
+        <div class="auth-field">
+          <label>Confirm New Password</label>
+          <div class="auth-input-wrap">
+            <input id="forgotConfirm" type="password" placeholder="Repeat new password"
+                   onkeydown="if(event.key==='Enter') forgotReset()" />
+            <svg class="auth-input-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+          </div>
+        </div>
+        <div class="auth-error" id="forgotError2"></div>
+        <button class="auth-btn" onclick="forgotReset()">Reset Password</button>
+        <button class="auth-secondary-btn" onclick="showForgotStep(1)">Back</button>
+      </div>
+
+    </div>
   </div>
 </div>
 
@@ -119,9 +166,23 @@
      ============================================================ -->
 <div id="expiredScreen" class="auth-screen" style="display:none">
   <div class="auth-card">
-    <div class="auth-logo">⛔ Subscription Expired</div>
-    <div class="auth-sub" id="expiredMsg">Your subscription has ended.</div>
-    <button class="btn btn-primary auth-btn" onclick="showLogin()">Back to Login</button>
+    <div class="auth-header">
+      <div class="auth-brand">
+        <div class="auth-brand-icon">⛔</div>
+        <div class="auth-brand-name">TradeAlgo Pro</div>
+      </div>
+      <div class="auth-welcome">
+        <h1>Subscription Expired</h1>
+        <p>Please contact admin to renew your plan</p>
+      </div>
+      <svg class="auth-curve" viewBox="0 0 420 60" preserveAspectRatio="none">
+        <path d="M0,30 C100,60 320,0 420,30 L420,60 L0,60 Z" fill="#ffffff"/>
+      </svg>
+    </div>
+    <div class="auth-body">
+      <div id="expiredMsg" style="font-size:13px;color:#3a4b60;text-align:center;margin:8px 0 20px;line-height:1.6"></div>
+      <button class="auth-btn" onclick="showLogin()">Back to Login</button>
+    </div>
   </div>
 </div>
 
@@ -365,7 +426,6 @@ Rahul Verma,9876543212,5d"></textarea>
           <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
             <button class="btn btn-primary" onclick="bulkAddHolidays()">📥 Add / Update</button>
             <button class="btn btn-outline" onclick="loadCurrentHolidaysIntoInput()">📄 Load Current</button>
-            <button class="btn btn-outline" onclick="loadSampleHolidays()">📋 Load 2026 Sample</button>
           </div>
           <div id="holidayResult" style="margin-top:16px"></div>
         </div>

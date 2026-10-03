@@ -48,6 +48,7 @@ import {
   getCachedCandles,
   setCachedCandle,
   setCachedLTP,
+  getCachedLTP,
   getLTPForTokens,
   fetchAllClosingPrices,
   getSessionStatus,
@@ -827,7 +828,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const token = String(t);
     const state = getOrbState(token, p.date);
     const candleArr = getCachedCandles([token], p.date)[0]?.candle;
-    const ltp = candleArr ? undefined : undefined; // read from cache elsewhere
+    const ltp = getCachedLTP(token);
     return {
       token,
       ltp: null,     // filled by Angel_REST cache via getLTPForTokens if needed

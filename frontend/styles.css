@@ -71,18 +71,18 @@ body.logged-out .navbar, body.logged-out .container { display: none; }
 ::-webkit-scrollbar-thumb { background: var(--gradient-brand); border-radius: 12px; }
 
 /* ============================================================
-   AUTH SCREEN — always white card, works in both themes
+   AUTH SCREEN — always dark, white card (both themes)
    ============================================================ */
 .auth-screen {
   position: fixed; inset: 0;
   display: flex; align-items: center; justify-content: center;
   padding: 24px; z-index: 2000; overflow-y: auto;
-  background: linear-gradient(135deg, #eef1f9 0%, #e6e9f5 50%, #eef1f9 100%);
+  background: linear-gradient(135deg, #0b0a1a 0%, #1a1333 50%, #0b0a1a 100%);
 }
 .auth-screen::before, .auth-screen::after {
   content: ''; position: fixed;
   border-radius: 50%; filter: blur(100px);
-  opacity: 0.35; pointer-events: none; z-index: 0;
+  opacity: 0.25; pointer-events: none; z-index: 0;
 }
 .auth-screen::before { width: 480px; height: 480px; background: #A29BFE; top: -180px; left: -180px; }
 .auth-screen::after  { width: 480px; height: 480px; background: #6C5CE7; bottom: -180px; right: -180px; }
@@ -91,9 +91,9 @@ body.logged-out .navbar, body.logged-out .container { display: none; }
   width: 100%; max-width: 420px;
   background: #ffffff; border-radius: 28px;
   box-shadow:
-    0 24px 60px rgba(108, 92, 231, 0.15),
-    0 8px 20px rgba(11, 26, 51, 0.06),
-    0 0 0 1px rgba(108, 92, 231, 0.05);
+    0 24px 60px rgba(0, 0, 0, 0.5),
+    0 8px 20px rgba(0, 0, 0, 0.3),
+    0 0 0 1px rgba(255, 255, 255, 0.05);
   overflow: hidden; position: relative; z-index: 2;
   animation: authFadeUp 0.5s cubic-bezier(0.2, 0, 0, 1);
   text-align: left;

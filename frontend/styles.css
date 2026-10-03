@@ -58,19 +58,29 @@ body[data-theme="dark"] {
   --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 8px 28px rgba(0, 0, 0, 0.5);
   --shadow-lg: 0 18px 50px rgba(0, 0, 0, 0.6);
+
+  /* Multi-color gradient + bright glow orbs for dark mode */
+  background-color: #0b0a1a;
+  background-image:
+    linear-gradient(135deg, #0b0a1a 0%, #1a1333 50%, #0b0a1a 100%),
+    radial-gradient(ellipse at 10% 20%, rgba(108,92,231,0.25), transparent 60%),
+    radial-gradient(ellipse at 90% 80%, rgba(162,155,254,0.25), transparent 60%);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
+
 body {
   font-family: 'Inter', -apple-system, sans-serif;
-  background: var(--bg-primary);
+  background-color: var(--bg-primary);
   color: var(--text-primary);
   min-height: 100vh;
   background-image:
     radial-gradient(ellipse at 10% 20%, rgba(108,92,231,0.04), transparent 60%),
     radial-gradient(ellipse at 90% 80%, rgba(162,155,254,0.04), transparent 60%);
-  transition: background 0.3s ease, color 0.3s ease;
+  background-attachment: fixed;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
+
 body.logged-out .navbar, body.logged-out .container { display: none; }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-thumb { background: var(--gradient-brand); border-radius: 12px; }

@@ -1321,3 +1321,17 @@ async function deleteAllHolidays() {
   }
   showLogin();
 })();
+/* ============================================================
+   SECTION 30 — PASSWORD TOGGLE HELPER
+   ============================================================ */
+function toggleAuthPwd(inputId, btn) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  if (input.type === 'password') {
+    input.type = 'text';
+    btn.textContent = 'HIDE';
+  } else {
+    input.type = 'password';
+    btn.textContent = 'SHOW';
+  }
+}

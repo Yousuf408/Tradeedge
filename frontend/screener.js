@@ -1,12 +1,13 @@
 /* ============================================================
-   SCREENER.JS  — v1.5
+   SCREENER.JS  — v1.6
    Multi-strategy + ORB + timestamps + cachedTokens + SSE
-   + Change % column (descending sort) + NIFTY 50 live header
-   + 9:15 Range column (H / L combined)
+   + Change % (descending sort) + NIFTY 50 live header
+   + Combined columns: LTP/Chg %, 9:15 Range, Target/SL
 
-   CHANGELOG v1.5 (2026-10-05):
-   - 9:15 High + 9:15 Low merged into single "9:15 Range (H / L)" column
-   - colspan 14 → 13
+   CHANGELOG v1.6 (2026-10-05):
+   - LTP + Change % merged into "LTP / Chg %"
+   - SL + Target merged into "Target / SL"
+   - Column count 13 → 11
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -301,7 +302,6 @@ function updateProgress(done, total) {
    ============================================================ */
 async function loadLTP() {
   const tokens = SCREENER_STOCKS.map(s => s.token);
-  /* Always include NIFTY 50 for the header */
   if (!tokens.includes(NIFTY50_TOKEN)) tokens.push(NIFTY50_TOKEN);
 
   try {
@@ -415,11 +415,9 @@ function renderScreenerTable() {
 
   head.innerHTML = `<tr>
     <th>Stock / Company</th>
-    <th>LTP</th>
-    <th>Change %</th>
+    <th>LTP / Chg %</th>
     <th>9:15 Range (H / L)</th>
-    <th>SL</th>
-    <th>Target</th>
+    <th>Target / SL</th>
     <th>MAXQTY</th>
     <th>NEW LOW</th>
     <th>PULLBACK</th>
@@ -430,7 +428,7 @@ function renderScreenerTable() {
   </tr>`;
 
   if (!SCREENER_STOCKS.length) {
-    body.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:60px;color:var(--text-muted)">
+    body.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:60px;color:var(--text-muted)">
       No stocks match the strategy filter yet.<br>
       Click <strong>⚡ Fetch 9:15 Candles</strong> to load data.
     </td></tr>`;
@@ -452,13 +450,13 @@ function renderScreenerTable() {
     const stage = resolveOrbStage(s.token, c, ltp);
 
     const changePct = computeChangePct(s.token);
-    let changeCell;
+    let changeLine;
     if (changePct === null) {
-      changeCell = '<span style="color:var(--text-muted)">—</span>';
+      changeLine = '<span style="color:var(--text-muted)">—</span>';
     } else {
       const isPos = changePct >= 0;
       const color = isPos ? 'var(--success)' : 'var(--danger)';
-      changeCell = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
+      changeLine = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
     }
 
     const newLowTime    = formatTimeIST(orb.newLowAt);
@@ -468,14 +466,18 @@ function renderScreenerTable() {
 
     return `<tr>
       <td><strong>${s.sym}</strong><br><span style="font-size:11px;color:var(--text-muted)">${s.token}</span></td>
-      <td style="font-weight:700">${ltp ? '₹' + ltp.toFixed(2) : '—'}</td>
-      <td>${changeCell}</td>
+      <td style="white-space:nowrap;line-height:1.4">
+        <div style="font-weight:700">${ltp ? '₹' + ltp.toFixed(2) : '—'}</div>
+        <div>${changeLine}</div>
+      </td>
       <td style="white-space:nowrap;line-height:1.4">
         <div style="color:var(--success);font-weight:600">H: ₹${c.high.toFixed(2)}</div>
         <div style="color:var(--danger);font-weight:600">L: ₹${c.low.toFixed(2)}</div>
       </td>
-      <td>₹${sl.toFixed(2)}</td>
-      <td style="color:#6C5CE7;font-weight:600">₹${target.toFixed(2)}</td>
+      <td style="white-space:nowrap;line-height:1.4">
+        <div style="color:#6C5CE7;font-weight:600">T: ₹${target.toFixed(2)}</div>
+        <div style="color:var(--text-secondary);font-weight:600">SL: ₹${sl.toFixed(2)}</div>
+      </td>
       <td style="font-weight:700;color:#6C5CE7">${maxQty}</td>
       <td style="color:#e17055;font-weight:600;font-family:monospace">${newLowTime}</td>
       <td style="color:#f39c12;font-weight:600;font-family:monospace">${pullbackTime}</td>

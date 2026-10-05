@@ -1,21 +1,23 @@
 /* ============================================================
-   SCREENER.JS  — v1.2
+   SCREENER.JS  — v1.3
    Multi-strategy + ORB stage tracking + timestamps
    + cachedTokens tracking (survives browser crash)
-   + SSE real-time LTP push (replaces 15s polling)
+   + SSE real-time LTP push
+   + Change % column (LTP vs previous close) with descending sort
 
-   CHANGELOG v1.2 (2026-10-05):
-   - SSE stream replaces fast polling for LTP
-   - Polling now runs every 30s — syncs ORB stage only
-   - Batch size 20 for frequent progress updates
-   - cachedTokens tracking from /api/screener/data
+   CHANGELOG v1.3 (2026-10-05):
+   - Added SCREENER_PREV_CLOSE map
+   - Added "Change %" column (right after LTP)
+   - Rows sorted by Change % descending (highest on top)
+   - prevClose consumed from /api/screener/ltp response
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
 let SCREENER_STOCKS = [];
 let SCREENER_ALL_CANDLES = {};
-let SCREENER_CACHED_TOKENS = new Set();   // tokens already saved server-side
+let SCREENER_CACHED_TOKENS = new Set();
 let SCREENER_LTP = {};
+let SCREENER_PREV_CLOSE = {};   // token → previous trading day close
 let SCREENER_ORB = {};
 let SCREENER_INIT_DONE = false;
 let SCREENER_LTP_TIMER = null;
@@ -26,7 +28,7 @@ const CURRENT_STRATEGY = 'advance_orb';
 const STRATEGY_FILTER = { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 };
 
 let PER_TRADE = 10000;
-const BATCH_SIZE = 20;       // smaller batches → frequent progress updates
+const BATCH_SIZE = 20;
 const BATCH_DELAY = 150;
 
 /* ============================================================
@@ -101,6 +103,29 @@ function recomputeFilteredStocks() {
 }
 
 /* ============================================================
+   SECTION 3.1 — CHANGE % HELPERS
+   ============================================================ */
+function computeChangePct(token) {
+  const ltp = SCREENER_LTP[token];
+  const prevClose = SCREENER_PREV_CLOSE[token];
+  if (!ltp || !prevClose || prevClose <= 0) return null;
+  return ((ltp - prevClose) / prevClose) * 100;
+}
+
+/* Sort stocks by Change % descending (highest on top).
+   Stocks without change % go to the bottom. */
+function sortByChangePct(stocks) {
+  return [...stocks].sort((a, b) => {
+    const aPct = computeChangePct(a.token);
+    const bPct = computeChangePct(b.token);
+    if (aPct === null && bPct === null) return 0;
+    if (aPct === null) return 1;    // a goes below
+    if (bPct === null) return -1;   // b goes below
+    return bPct - aPct;              // descending
+  });
+}
+
+/* ============================================================
    SECTION 4 — LOAD STOCK LIST + CACHED DATA
    ============================================================ */
 async function loadStockList() {
@@ -118,7 +143,6 @@ async function loadCachedData() {
     const d = await r.json();
     if (!d.ok) return;
 
-    /* Load cached candles that passed the strategy */
     SCREENER_ALL_CANDLES = {};
     if (d.results) {
       for (const item of d.results) {
@@ -131,12 +155,10 @@ async function loadCachedData() {
       }
     }
 
-    /* Track which tokens are already saved on the server */
     if (Array.isArray(d.cachedTokens)) {
       d.cachedTokens.forEach(t => SCREENER_CACHED_TOKENS.add(String(t)));
     }
 
-    /* Do NOT overwrite SCREENER_ALL_STOCKS — /api/stocks already has the full list */
     recomputeFilteredStocks();
     renderScreenerTable();
 
@@ -164,7 +186,6 @@ async function startFetch() {
   const total = allTokens.length;
   let ok = 0, failed = 0;
 
-  /* Only fetch what we haven't already saved on the server */
   const missing = allTokens.filter(t => !SCREENER_CACHED_TOKENS.has(String(t)));
 
   if (!missing.length) {
@@ -254,6 +275,7 @@ async function loadLTP() {
     if (d.results) {
       for (const item of d.results) {
         if (item.ltp) SCREENER_LTP[item.token] = item.ltp;
+        if (item.prevClose) SCREENER_PREV_CLOSE[item.token] = item.prevClose;
         SCREENER_ORB[item.token] = {
           lowBroken: !!item.lowBroken,
           pullbackConfirmed: !!item.pullbackConfirmed,
@@ -277,7 +299,6 @@ function startLTPRefresh() {
 
 /* ============================================================
    SECTION 6.1 — SSE real-time LTP push
-   Server batches ticks every 300ms and pushes here.
    ============================================================ */
 function startSSE() {
   if (SCREENER_SSE) return;
@@ -303,7 +324,6 @@ function startSSE() {
   };
 
   SCREENER_SSE.onerror = () => {
-    /* EventSource auto-reconnects — just log */
     console.warn('📡 SSE dropped — reconnecting...');
   };
 }
@@ -352,6 +372,7 @@ function renderScreenerTable() {
   head.innerHTML = `<tr>
     <th>Stock / Company</th>
     <th>LTP</th>
+    <th>Change %</th>
     <th>9:15 H</th>
     <th>9:15 L</th>
     <th>SL</th>
@@ -366,7 +387,7 @@ function renderScreenerTable() {
   </tr>`;
 
   if (!SCREENER_STOCKS.length) {
-    body.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:60px;color:var(--text-muted)">
+    body.innerHTML = `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
       No stocks match the strategy filter yet.<br>
       Click <strong>⚡ Fetch 9:15 Candles</strong> to load data.
     </td></tr>`;
@@ -374,7 +395,10 @@ function renderScreenerTable() {
     return;
   }
 
-  body.innerHTML = SCREENER_STOCKS.map(s => {
+  /* Sort by Change % descending */
+  const sorted = sortByChangePct(SCREENER_STOCKS);
+
+  body.innerHTML = sorted.map(s => {
     const c = SCREENER_ALL_CANDLES[s.token];
     const ltp = SCREENER_LTP[s.token];
     const orb = SCREENER_ORB[s.token] || {};
@@ -385,6 +409,17 @@ function renderScreenerTable() {
     const maxQty = risk > 0 ? Math.floor(PER_TRADE / risk) : '—';
     const stage = resolveOrbStage(s.token, c, ltp);
 
+    const changePct = computeChangePct(s.token);
+    let changeCell;
+    if (changePct === null) {
+      changeCell = '<span style="color:var(--text-muted)">—</span>';
+    } else {
+      const isPos = changePct >= 0;
+      const color = isPos ? 'var(--success)' : 'var(--danger)';
+      const arrow = isPos ? '▲' : '▼';
+      changeCell = `<span style="color:${color};font-weight:700">${arrow} ${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
+    }
+
     const newLowTime    = formatTimeIST(orb.newLowAt);
     const pullbackTime  = formatTimeIST(orb.pullbackAt);
     const breakoutTime  = formatTimeIST(orb.breakoutAt);
@@ -393,6 +428,7 @@ function renderScreenerTable() {
     return `<tr>
       <td><strong>${s.sym}</strong><br><span style="font-size:11px;color:var(--text-muted)">${s.token}</span></td>
       <td style="font-weight:700">${ltp ? '₹' + ltp.toFixed(2) : '—'}</td>
+      <td>${changeCell}</td>
       <td style="color:var(--success);font-weight:600">₹${c.high.toFixed(2)}</td>
       <td style="color:var(--danger);font-weight:600">₹${c.low.toFixed(2)}</td>
       <td>₹${sl.toFixed(2)}</td>

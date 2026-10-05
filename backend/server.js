@@ -1,32 +1,15 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v1.5
+   server.js — TradeAlgo Pro backend  |  v1.6
    ============================================================
 
-   STRUCTURE:
-    §1  Imports
-    §2  Config (env, DB, stock list, strategy)
-    §3  Time / phases / holidays
-    §4  ORB state (memory + DB sync)
-    §5  WebSocket manager (tick → stages) + SSE broadcast
-        + batched LTP DB writer
-    §6  Middleware + helpers
-    §7  Auth routes
-    §8  Forgot password
-    §9  Change password + profile
-    §10 Users CRUD (admin)
-    §11 Audit + prices
-    §12 Trading holidays (admin)
-    §13 Screener routes + SSE stream
-    §14 Closing prices (15:34 IST)
-    §15 DB cache loader + previous close loader
-    §16 Start
+   STRUCTURE: (unchanged — see v1.5 header)
 
-   CHANGELOG v1.5 (2026-10-05):
-    - Added prevCloseCache + loadPrevCloseFromDB()
-    - Added fetchMissingPrevClose() — FULL quote batch (50/call)
-    - /api/screener/ltp now returns prevClose per token
-    - Daily refresh: after closing fetch, prevClose is updated
-    - Removed temporary test-full-quote endpoint
+   CHANGELOG v1.6 (2026-10-05):
+    - Added NIFTY50_TOKEN (99926000) — streamed via same WS
+    - WS subscribes to NIFTY 50 + all NSE equities (exchangeType 1)
+    - handleTick: NIFTY 50 path caches LTP + broadcasts via SSE
+    - prevClose also fetched for NIFTY 50 (FULL quote batch)
+    - NIFTY 50 excluded from ORB / screener / fetch-batch logic
    ============================================================ */
 
 import express from 'express';
@@ -84,7 +67,11 @@ console.log(`📋 Stocks: ${STOCKS.length} active / ${ALL_STOCKS.length} total`)
 const SYM_BY_TOKEN = {};
 STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
 
-/* ---- Strategy config — add new strategies here ---- */
+/* ---- NIFTY 50 index (streamed via same WS, exchangeType 1) ---- */
+const NIFTY50_TOKEN = '99926000';
+const NIFTY50_SYM = 'NIFTY 50';
+
+/* ---- Strategy config ---- */
 const STRATEGIES = {
   advance_orb: {
     id: 'advance_orb',
@@ -190,14 +177,12 @@ const getOrbState = (token, date) => orbState.get(`${token}_${date}`) || {
 /* ============================================================
    SECTION 4.1 — PREVIOUS CLOSE (memory + DB + FULL quote fallback)
    ============================================================ */
-/* prevCloseCache: token → previous trading session close price.
-   Populated from DB on boot. Missing tokens filled via Angel FULL quote. */
 const prevCloseCache = new Map();
 
 async function loadPrevCloseFromDB() {
   try {
-    const activeTokens = STOCKS.map(s => String(s.token));
-    /* Grab the latest non-null prev_close for each token, from any date */
+    /* Include NIFTY 50 in the fetch list */
+    const activeTokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
     const { rows } = await db.query(
       `SELECT DISTINCT ON (token) token, prev_close
        FROM angel_15m_candle
@@ -213,9 +198,9 @@ async function loadPrevCloseFromDB() {
 }
 
 async function fetchMissingPrevClose() {
-  const missing = STOCKS
-    .map(s => String(s.token))
-    .filter(t => !prevCloseCache.has(t));
+  /* Include NIFTY 50 */
+  const allTokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
+  const missing = allTokens.filter(t => !prevCloseCache.has(t));
 
   if (!missing.length) {
     console.log('✅ prevClose: nothing missing');
@@ -240,8 +225,8 @@ async function fetchMissingPrevClose() {
       prevCloseCache.set(token, close);
       updated++;
 
-      /* Save to DB — write to a row for the current screener date.
-         If row doesn't exist yet, we still save on the next fetch-batch. */
+      /* Save to DB — NIFTY 50 has no row, so UPDATE is a no-op for it.
+         It stays in memory only. */
       db.query(
         `UPDATE angel_15m_candle SET prev_close=$1 WHERE date=$2 AND token=$3`,
         [close, date, token]
@@ -261,13 +246,9 @@ async function fetchMissingPrevClose() {
 let wsStarted = false;
 let wsConnectedTokens = 0;
 
-/* ---- Batched LTP DB writer ----
-   Instead of one UPDATE per WS tick (thousands/sec), we accumulate
-   LTPs in memory and flush to DB once every LTP_FLUSH_MS.
-   Cuts DB write load by ~1000x.
-   Env var LTP_FLUSH_MS overrides default (5 min). */
+/* ---- Batched LTP DB writer (PROTECTED) ---- */
 const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000);
-const ltpWriteQueue = new Map();   // token → { ltp, date }
+const ltpWriteQueue = new Map();
 let ltpWriteTimer = null;
 
 function queueLtpWrite(token, ltp, date) {
@@ -311,7 +292,7 @@ async function flushLtpWrites() {
 process.on('SIGTERM', async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
 process.on('SIGINT',  async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
 
-/* ---- SSE registry ---- */
+/* ---- SSE registry (PROTECTED) ---- */
 const sseClients = new Set();
 let ssePending = new Map();
 let sseFlushTimer = null;
@@ -338,6 +319,13 @@ function broadcastLTP(token, ltp) {
 
 /* ---- Called for every tick from WebSocket ---- */
 function handleTick(token, ltp) {
+  /* NIFTY 50 — special path (no ORB, no candles, just LTP broadcast) */
+  if (token === NIFTY50_TOKEN) {
+    setCachedLTP(token, ltp);
+    broadcastLTP(token, ltp);
+    return;
+  }
+
   const p = getScreenerPhase();
   if (p.phase !== 'ready' || !p.date) return;
 
@@ -401,7 +389,8 @@ function startWebSocketForReadyPhase() {
   const feedToken = getFeedToken();
   if (!feedToken) { console.log('⚠️  WS skipped — no feed token'); return; }
 
-  const tokens = STOCKS.map(s => String(s.token));
+  /* Include NIFTY 50 token in subscription (same exchangeType 1) */
+  const tokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
 
   try {
     startWS({
@@ -417,7 +406,7 @@ function startWebSocketForReadyPhase() {
     });
     wsStarted = true;
     wsConnectedTokens = tokens.length;
-    console.log(`🔌 WS started for ${tokens.length} tokens`);
+    console.log(`🔌 WS started for ${tokens.length} tokens (incl. NIFTY 50)`);
   } catch (e) {
     console.error('WS start failed:', e.message);
   }
@@ -527,7 +516,7 @@ function verifyTotpServer(secret, input) {
 
 
 /* ============================================================
-   SECTION 7 — AUTH ROUTES
+   SECTION 7 — AUTH ROUTES  (unchanged from v1.5)
    ============================================================ */
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
 
@@ -665,7 +654,7 @@ app.post('/api/logout', auth, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 8 — FORGOT PASSWORD
+   SECTION 8 — FORGOT PASSWORD  (unchanged)
    ============================================================ */
 app.post('/api/forgot-password/check', async (req, res) => {
   const { input } = req.body;
@@ -713,7 +702,7 @@ app.post('/api/forgot-password/reset', async (req, res) => {
 
 
 /* ============================================================
-   SECTION 9 — CHANGE PASSWORD + PROFILE
+   SECTION 9 — CHANGE PASSWORD + PROFILE  (unchanged)
    ============================================================ */
 app.post('/api/change-password', auth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
@@ -762,7 +751,7 @@ app.put('/api/me', auth, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 10 — USERS CRUD (admin)
+   SECTION 10 — USERS CRUD (admin)  (unchanged)
    ============================================================ */
 app.get('/api/users', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query(
@@ -860,7 +849,7 @@ app.delete('/api/users/:username', auth, adminOnly, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 11 — AUDIT + PRICES
+   SECTION 11 — AUDIT + PRICES  (unchanged)
    ============================================================ */
 app.get('/api/audit', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200');
@@ -888,7 +877,7 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 12 — TRADING HOLIDAYS (admin)
+   SECTION 12 — TRADING HOLIDAYS (admin)  (unchanged)
    ============================================================ */
 app.get('/api/admin/holidays', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT date::text AS date, reason FROM trading_holidays ORDER BY date ASC');
@@ -1031,8 +1020,8 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* Client polls this — reads from memory, no API calls.
-   Returns LTP + ORB state + prevClose for Change % calculation. */
+/* Client polls this — reads from memory.
+   Now also returns NIFTY 50 if requested. */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1064,7 +1053,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 14 — CLOSING PRICES (15:34 IST)
+   SECTION 14 — CLOSING PRICES (15:34 IST)  (unchanged)
    ============================================================ */
 async function fetchClosingPrices() {
   try {
@@ -1081,7 +1070,6 @@ async function fetchClosingPrices() {
     await flushLtpWrites();
     console.log(`✅ Closing prices: ${ok.length}/${tokens.length} (failed: ${failed.length})`);
 
-    /* After closing prices saved, refresh prevClose for tomorrow */
     console.log('🔁 Refreshing prevClose for next session...');
     await fetchMissingPrevClose();
   } catch (e) { console.error('Closing fetch failed:', e.message); }
@@ -1125,7 +1113,7 @@ function scheduleClosingFetch() {
 
 
 /* ============================================================
-   SECTION 15 — DB CACHE LOADER
+   SECTION 15 — DB CACHE LOADER  (unchanged)
    ============================================================ */
 async function loadScreenerCacheFromDB() {
   try {
@@ -1154,6 +1142,7 @@ app.listen(PORT, async () => {
   console.log(`✅ Server on port ${PORT}`);
   console.log(`📊 Strategy: ${STRATEGIES.advance_orb.name}`);
   console.log(`💾 LTP flush interval: ${LTP_FLUSH_MS / 1000}s`);
+  console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);
 
   try {
     await loginPlatform();
@@ -1164,7 +1153,6 @@ app.listen(PORT, async () => {
   await loadScreenerCacheFromDB();
   await loadPrevCloseFromDB();
 
-  /* Fetch missing prevClose in background (non-blocking) */
   fetchMissingPrevClose().catch(e => console.error('prevClose fetch err:', e.message));
 
   const nowIST = getIST();
@@ -1176,5 +1164,5 @@ app.listen(PORT, async () => {
   }
   scheduleClosingFetch();
 
-  console.log('ℹ️  Ready — manual fetch + live WS + SSE push + batched LTP writes + prevClose');
+  console.log('ℹ️  Ready — WS + SSE + batched LTP + NIFTY 50');
 });

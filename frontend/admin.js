@@ -1,12 +1,29 @@
 /* ============================================================
-   ADMIN.JS
+   ADMIN.JS  —  v1.1
    Config, API, TOTP, Auth, Admin panel, Profile, WhatsApp, Modals
+
+   CHANGELOG v1.1 (2026-10-05):
+    - Section 1: API URL auto-detects localhost vs production
+    - Section 12: Login flow now uses pendingToken + server-side
+      TOTP verification. Client no longer trusts its own TOTP check.
+      Compatible with server.js v1.1.
    ============================================================ */
 
 /* ============================================================
    SECTION 1 — CONFIG
    ============================================================ */
-const API = 'https://tradeedge-a5y0.onrender.com';
+/* API URL auto-detects environment:
+   - localhost / 127.0.0.1 / *.local → http://localhost:3000
+   - everything else                 → production (Render)
+   To override, set window.TRADEALGO_API before this script loads. */
+const API = window.TRADEALGO_API || (() => {
+  const h = window.location.hostname;
+  if (h === 'localhost' || h === '127.0.0.1' || h.endsWith('.local')) {
+    return 'http://localhost:3000';
+  }
+  return 'https://tradeedge-a5y0.onrender.com';
+})();
+
 const APP_URL = 'https://yousuf408.github.io/Tradeedge/frontend/';
 const GREEN = 'var(--success)';
 const RED = 'var(--danger)';
@@ -71,6 +88,8 @@ async function api(path, opts = {}) {
 
 /* ============================================================
    SECTION 4 — TOTP
+   (local helpers kept for QR generation; verification is now
+    done on the server. Do not rely on these for auth.)
    ============================================================ */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
@@ -99,6 +118,7 @@ async function totpAt(secret, counter) {
   return String(code % 1000000).padStart(6, '0');
 }
 
+/* Kept for optional client-side pre-check. NOT used for auth decisions. */
 async function verifyTotp(secret, input) {
   const step = Math.floor(Date.now() / 1000 / 30);
   for (const c of [step - 1, step, step + 1]) {
@@ -306,7 +326,7 @@ function updateUserPill() {
 
 
 /* ============================================================
-   SECTION 12 — LOGIN FLOW
+   SECTION 12 — LOGIN FLOW  (v1.1 — pendingToken + server TOTP)
    ============================================================ */
 function showLoginStep(step) {
   document.getElementById('loginStep1').style.display = step === 1 ? 'block' : 'none';
@@ -316,6 +336,8 @@ function showLoginStep(step) {
   document.getElementById('forgotStep2').style.display = 'none';
 }
 
+/* Step 1 — password only. Server returns pendingToken (5 min)
+   plus needsSetup flag. No TOTP secret is ever sent to client. */
 async function doLogin() {
   const input = document.getElementById('authUser').value.trim();
   const password = document.getElementById('authPass').value;
@@ -328,9 +350,23 @@ async function doLogin() {
       method: 'POST',
       body: JSON.stringify({ input, password })
     });
-    pendingLoginUser = r;
+
+    if (!r.pendingToken) {
+      err.textContent = 'Login failed. Please try again.';
+      return;
+    }
+
+    pendingLoginUser = {
+      pendingToken: r.pendingToken,
+      username: r.username,
+      name: r.name,
+      needsSetup: r.needsSetup,
+      newSecret: null
+    };
 
     if (r.needsSetup) {
+      /* First-time 2FA setup — generate secret locally, show QR,
+         but the code is verified by the SERVER on submit. */
       const secret = generateSecret();
       pendingLoginUser.newSecret = secret;
       const uri = `otpauth://totp/TradeAlgo:${r.username}?secret=${secret}&issuer=TradeAlgo`;
@@ -353,31 +389,46 @@ async function doLogin() {
   }
 }
 
+/* Step 2a — existing user enters 6-digit code.
+   Server verifies against stored secret; no local check. */
 async function verifyLoginTotp() {
   const code = document.getElementById('authTotp').value.trim();
   const err = document.getElementById('authTotpError');
+  err.textContent = '';
   if (!/^\d{6}$/.test(code)) { err.textContent = 'Enter 6 digits'; return; }
-  if (!await verifyTotp(pendingLoginUser.totpSecret, code)) {
-    err.textContent = 'Invalid code. Try again.';
+  if (!pendingLoginUser?.pendingToken) {
+    err.textContent = 'Session expired. Please sign in again.';
+    showLoginStep(1);
     return;
   }
-  await completeLogin({ username: pendingLoginUser.username });
-}
 
-async function confirmSetup() {
-  const code = document.getElementById('setupCode').value.trim();
-  const err = document.getElementById('setupError');
-  if (!/^\d{6}$/.test(code)) { err.textContent = 'Enter 6 digits'; return; }
-  if (!await verifyTotp(pendingLoginUser.newSecret, code)) {
-    err.textContent = 'Code did not match. Check your app.';
-    return;
-  }
   await completeLogin({
-    username: pendingLoginUser.username,
-    totpSecret: pendingLoginUser.newSecret
+    pendingToken: pendingLoginUser.pendingToken,
+    totpCode: code
   });
 }
 
+/* Step 2b — first-time setup. Send secret + code to server.
+   Server verifies code against newSecret, then stores it. */
+async function confirmSetup() {
+  const code = document.getElementById('setupCode').value.trim();
+  const err = document.getElementById('setupError');
+  err.textContent = '';
+  if (!/^\d{6}$/.test(code)) { err.textContent = 'Enter 6 digits'; return; }
+  if (!pendingLoginUser?.pendingToken || !pendingLoginUser?.newSecret) {
+    err.textContent = 'Session expired. Please sign in again.';
+    showLoginStep(1);
+    return;
+  }
+
+  await completeLogin({
+    pendingToken: pendingLoginUser.pendingToken,
+    totpSecret: pendingLoginUser.newSecret,
+    totpCode: code
+  });
+}
+
+/* Step 3 — exchange verified pending login for a session JWT. */
 async function completeLogin(payload) {
   try {
     const r = await api('/api/complete-login', {
@@ -398,7 +449,16 @@ async function completeLogin(payload) {
       }
     }
   } catch (e) {
-    showToast('⚠️ Login Error', e.message);
+    /* Route the error back to whichever step is showing */
+    if (pendingLoginUser?.needsSetup) {
+      document.getElementById('setupError').textContent = e.message;
+    } else {
+      document.getElementById('authTotpError').textContent = e.message;
+      if (e.status === 401 && /expired|session/i.test(e.message)) {
+        /* Pending token expired — send user back to step 1 */
+        setTimeout(() => { cancelTotp(); }, 1500);
+      }
+    }
   }
 }
 
@@ -411,7 +471,7 @@ function cancelTotp() {
 
 
 /* ============================================================
-   SECTION 13 — FORGOT PASSWORD
+   SECTION 13 — FORGOT PASSWORD  (unchanged — server verifies)
    ============================================================ */
 function showForgotStep(step) {
   document.getElementById('loginStep1').style.display = 'none';
@@ -1321,6 +1381,8 @@ async function deleteAllHolidays() {
   }
   showLogin();
 })();
+
+
 /* ============================================================
    SECTION 30 — PASSWORD TOGGLE HELPER
    ============================================================ */

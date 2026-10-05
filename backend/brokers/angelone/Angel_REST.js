@@ -1,5 +1,5 @@
 /* ============================================================
-   ANGEL_REST.js  —  v2.1
+   ANGEL_REST.js  —  v2.2
    ALL Angel One REST logic lives here:
    - Login (auto, platform creds)
    - 1-min candle aggregation (9:15-9:30 window)
@@ -7,6 +7,10 @@
    - LTP batch (50/call, market hours only)
    - Closing price via 15:30 candle (works 24/7)
    - Cache helpers (memory only — server.js persists to DB)
+
+   CHANGELOG v2.2 (2026-10-05):
+   - 403/429 cooldown reduced 8000ms → 3000ms (configurable)
+   - Everything else unchanged from v2.1
    ============================================================ */
 
 import crypto from 'crypto';
@@ -20,6 +24,7 @@ const TOTP_SECRET = process.env.ANGEL_TOTP_SECRET;
 const CANDLE_RATE_PER_MIN = Number(process.env.ANGEL_CANDLE_RATE_PER_MIN || 150);
 const CANDLE_CONCURRENCY  = Number(process.env.ANGEL_CANDLE_CONCURRENCY  || 5);
 const SLOT_INTERVAL_MS    = 60000 / CANDLE_RATE_PER_MIN;
+const COOLDOWN_ON_403_MS  = Number(process.env.ANGEL_COOLDOWN_403_MS || 3000);
 const LTP_TTL = 30000;
 
 const session = { jwtToken: null, feedToken: null, expiresAt: null, loginTime: null };
@@ -142,7 +147,7 @@ async function post(path, body, { retries = 2, baseBackoff = 1200 } = {}) {
     console.error(`⛔ non-JSON response HTTP ${res.status} from ${path}: "${snippet}"`);
 
     if (res.status === 403 || res.status === 429 || /access denied/i.test(text)) {
-      startCooldown(8000, `rate-limited on ${path}`);
+      startCooldown(COOLDOWN_ON_403_MS, `rate-limited on ${path}`);
       lastErr = new Error(`Rate limited (HTTP ${res.status}): ${snippet}`);
       continue;
     }

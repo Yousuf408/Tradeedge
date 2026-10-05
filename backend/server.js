@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v1.3
+   server.js — TradeAlgo Pro backend  |  v1.4
    ============================================================
 
    STRUCTURE:
@@ -8,6 +8,7 @@
     §3  Time / phases / holidays
     §4  ORB state (memory + DB sync)
     §5  WebSocket manager (tick → stages) + SSE broadcast
+        + batched LTP DB writer
     §6  Middleware + helpers
     §7  Auth routes
     §8  Forgot password
@@ -25,25 +26,24 @@
                 ↓
     Angel WS subscribes to all active tokens
                 ↓
-    Every tick → update ORB stages + LTP in DB
+    Every tick → update ORB stages (rare, instant) in DB
                 ↓
     Every tick → broadcastLTP() → SSE push to browsers
                 ↓
-    Client polls /api/screener/ltp every 30s (ORB stage backup)
-    Client receives /api/screener/stream via SSE (LTP real-time)
+    Every tick → queueLtpWrite() (in-memory queue)
+                ↓
+    Every 5 min → flushLtpWrites() batch UPDATE to DB
 
    SECURITY (v1.1):
     - /api/login returns a short-lived pendingToken (5 min JWT)
-      instead of leaking the user's totp_secret.
-    - /api/complete-login verifies TOTP on the SERVER before
-      issuing the session JWT. Client-side verification alone
-      is not trusted.
-    - Generated passwords include a random suffix.
+    - /api/complete-login verifies TOTP on the SERVER
+    - Generated passwords include a random suffix
 
-   CHANGELOG v1.3 (2026-10-05):
-    - Added SSE push: /api/screener/stream
-    - broadcastLTP() called from handleTick — 300ms batching
-    - No change to existing REST endpoints or WS logic
+   CHANGELOG v1.4 (2026-10-05):
+    - Batched LTP DB writer — flush every LTP_FLUSH_MS (default 5 min)
+    - handleTick no longer fires one UPDATE per tick
+    - DB pool max: 10 → 20
+    - Fixes login latency during market hours
    ============================================================ */
 
 import express from 'express';
@@ -83,7 +83,7 @@ app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 const db = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 10,
+  max: 20,
   idleTimeoutMillis: 30000
 });
 
@@ -204,12 +204,62 @@ const getOrbState = (token, date) => orbState.get(`${token}_${date}`) || {
 
 
 /* ============================================================
-   SECTION 5 — WEBSOCKET MANAGER + SSE BROADCAST
-   Live tick → updates ORB stages + LTP in real time,
-   then pushes LTP to all connected browsers via SSE.
+   SECTION 5 — WEBSOCKET MANAGER + SSE BROADCAST + LTP BATCH WRITER
    ============================================================ */
 let wsStarted = false;
 let wsConnectedTokens = 0;
+
+/* ---- Batched LTP DB writer ----
+   Instead of one UPDATE per WS tick (thousands/sec), we accumulate
+   LTPs in memory and flush to DB once every LTP_FLUSH_MS.
+   Cuts DB write load by ~1000x.
+   Env var LTP_FLUSH_MS overrides default (5 min). */
+const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000); // default 5 min
+const ltpWriteQueue = new Map();   // token → { ltp, date }
+let ltpWriteTimer = null;
+
+function queueLtpWrite(token, ltp, date) {
+  ltpWriteQueue.set(String(token), { ltp, date });
+  if (ltpWriteTimer) return;
+  ltpWriteTimer = setTimeout(flushLtpWrites, LTP_FLUSH_MS);
+}
+
+async function flushLtpWrites() {
+  ltpWriteTimer = null;
+  if (!ltpWriteQueue.size) return;
+
+  const entries = [...ltpWriteQueue.entries()];
+  ltpWriteQueue.clear();
+
+  /* Group by date (usually all same) */
+  const byDate = new Map();
+  for (const [token, { ltp, date }] of entries) {
+    if (!byDate.has(date)) byDate.set(date, []);
+    byDate.get(date).push([token, ltp]);
+  }
+
+  for (const [date, rows] of byDate) {
+    const tokens = rows.map(r => r[0]);
+    const prices = rows.map(r => r[1]);
+    try {
+      await db.query(
+        `UPDATE angel_15m_candle AS c
+         SET ltp = v.ltp, ltp_updated_at = NOW()
+         FROM (
+           SELECT unnest($1::text[])    AS token,
+                  unnest($2::numeric[]) AS ltp
+         ) AS v
+         WHERE c.date = $3 AND c.token = v.token`,
+        [tokens, prices, date]
+      );
+      console.log(`💾 LTP flushed: ${rows.length} tokens`);
+    } catch (e) { console.error('LTP flush failed:', e.message); }
+  }
+}
+
+/* Flush pending LTP writes on shutdown */
+process.on('SIGTERM', async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
+process.on('SIGINT',  async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
 
 /* ---- SSE (Server-Sent Events) registry ----
    Each browser that opens /api/screener/stream is added here.
@@ -297,17 +347,14 @@ function handleTick(token, ltp) {
 
   if (changed) orbState.set(key, state);
 
-  /* Always update LTP cache */
+  /* Always update LTP cache (memory) */
   setCachedLTP(token, ltp);
 
   /* Push to browsers in real time (~300ms batched) */
   broadcastLTP(token, ltp);
 
-  /* Persist LTP to DB (fire and forget) */
-  db.query(
-    `UPDATE angel_15m_candle SET ltp=$1, ltp_updated_at=NOW() WHERE date=$2 AND token=$3`,
-    [ltp, p.date, token]
-  ).catch(() => {});
+  /* Queue LTP for batched DB write (flush every LTP_FLUSH_MS) */
+  queueLtpWrite(token, ltp, p.date);
 }
 
 /* Start WS after 9:15 fetch is done and phase is 'ready' */
@@ -355,6 +402,8 @@ function stopWebSocketIfNeeded() {
     stopWS();
     wsStarted = false;
     wsConnectedTokens = 0;
+    /* Flush any remaining LTP writes before stopping */
+    flushLtpWrites().catch(() => {});
     console.log('🔌 WS stopped');
   }
 }
@@ -459,8 +508,7 @@ app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }))
 
 /* ---- POST /api/login ----------------------------------------
    Step 1 of 2. Verifies password + account state, then returns
-   a short-lived pendingToken. Does NOT leak the user's totp_secret.
-   Does NOT issue a session token (that's /api/complete-login). */
+   a short-lived pendingToken. Does NOT leak the user's totp_secret. */
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
   const clean = (input || '').trim().toLowerCase();
@@ -498,8 +546,6 @@ app.post('/api/login', async (req, res) => {
     return res.status(403).json({ error: 'Subscription expired', expired: true, expiresAt: user.expires_at });
   }
 
-  /* Issue short-lived pending token — client must come back to
-     /api/complete-login with a server-verifiable TOTP code. */
   const pendingToken = jwt.sign(
     { username: user.username, purpose: 'login-pending' },
     SECRET,
@@ -550,7 +596,6 @@ app.post('/api/complete-login', async (req, res) => {
   }
 
   if (!user.totp_secret) {
-    /* First-time setup: user is submitting a new secret */
     if (!totpSecret || typeof totpSecret !== 'string') {
       return res.status(400).json({ error: 'TOTP secret required for setup' });
     }
@@ -561,7 +606,6 @@ app.post('/api/complete-login', async (req, res) => {
     await db.query('UPDATE users SET totp_secret=$1 WHERE username=$2', [totpSecret, user.username]);
     await log(user.username, 'TOTP_ENABLED', `User: ${user.username}`, 'success');
   } else {
-    /* Existing user: verify against stored secret */
     if (!verifyTotpServer(user.totp_secret, code)) {
       await log(user.username, 'LOGIN_TOTP_FAILED', 'Bad TOTP code', 'danger');
       return res.status(401).json({ error: 'Invalid code' });
@@ -889,7 +933,6 @@ app.get('/api/screener/data', auth, (req, res) => {
 
   const allCandles = getCachedCandles(STOCKS.map(s => s.token), p.date);
 
-  /* Every token that already has a candle in memory (i.e. saved earlier) */
   const cachedTokens = allCandles
     .filter(c => Array.isArray(c.candle) && c.candle.length >= 5)
     .map(c => String(c.token));
@@ -919,17 +962,15 @@ app.get('/api/screener/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');   // disable proxy buffering (nginx/render)
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
   const client = { res };
   sseClients.add(client);
   console.log(`📡 SSE client connected (total: ${sseClients.size})`);
 
-  /* Greet immediately so browser knows stream is live */
   res.write(`event: hello\ndata: {"ok":true}\n\n`);
 
-  /* Keep connection alive through proxies */
   const keepAlive = setInterval(() => {
     try { res.write(': ping\n\n'); } catch {}
   }, 20000);
@@ -1017,9 +1058,10 @@ async function fetchClosingPrices() {
     const { ok, failed } = await fetchAllClosingPrices(tokens, p.date);
     for (const r of ok) {
       setCachedLTP(r.token, r.price);
-      db.query(`UPDATE angel_15m_candle SET ltp=$1, ltp_updated_at=NOW() WHERE date=$2 AND token=$3`,
-        [r.price, p.date, r.token]).catch(() => {});
+      queueLtpWrite(r.token, r.price, p.date);
     }
+    /* Force flush immediately so closing prices are saved before shutdown */
+    await flushLtpWrites();
     console.log(`✅ Closing prices: ${ok.length}/${tokens.length} (failed: ${failed.length})`);
   } catch (e) { console.error('Closing fetch failed:', e.message); }
 }
@@ -1034,9 +1076,9 @@ app.post('/api/admin/force-ltp', auth, adminOnly, async (req, res) => {
     for (const r of ok) {
       saved++;
       setCachedLTP(r.token, r.price);
-      await db.query(`UPDATE angel_15m_candle SET ltp=$1, ltp_updated_at=NOW() WHERE date=$2 AND token=$3`,
-        [r.price, p.date, r.token]);
+      queueLtpWrite(r.token, r.price, p.date);
     }
+    await flushLtpWrites();
     res.json({ ok: true, saved, failed: failed.length, total: tokens.length });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1090,6 +1132,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server on port ${PORT}`);
   console.log(`📊 Strategy: ${STRATEGIES.advance_orb.name}`);
+  console.log(`💾 LTP flush interval: ${LTP_FLUSH_MS / 1000}s`);
 
   try {
     await loginPlatform();
@@ -1099,7 +1142,6 @@ app.listen(PORT, async () => {
   await loadHolidaysFromDB();
   await loadScreenerCacheFromDB();
 
-  /* Late startup — if server restarts after 15:34 on a weekday, fetch closing now */
   const nowIST = getIST();
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
   const dow = nowIST.getUTCDay();
@@ -1109,5 +1151,5 @@ app.listen(PORT, async () => {
   }
   scheduleClosingFetch();
 
-  console.log('ℹ️  Ready — manual fetch + live WS + SSE push');
+  console.log('ℹ️  Ready — manual fetch + live WS + SSE push + batched LTP writes');
 });

@@ -71,7 +71,7 @@ body.logged-out .navbar, body.logged-out .container { display: none; }
 ::-webkit-scrollbar-thumb { background: var(--gradient-brand); border-radius: 12px; }
 
 /* ============================================================
-   AUTH SCREEN — always dark, white card (both themes)
+   AUTH SCREEN
    ============================================================ */
 .auth-screen {
   position: fixed; inset: 0;
@@ -435,20 +435,122 @@ body.impersonating .container { padding-top: 70px; }
 .toggle-status.active { color: var(--success); }
 
 /* ============================================================
-   TABLE
+   TABLE — with sticky header + sortable columns
    ============================================================ */
-.table-wrap { overflow-x: auto; }
-.table-modern { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 14px; }
-.table-modern th {
-  text-align: left; padding: 12px 16px; color: var(--text-muted); font-weight: 600;
-  font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px;
-  border-bottom: 2px solid var(--border-medium); white-space: nowrap;
+.table-wrap {
+  overflow-x: auto;
+  overflow-y: auto;
+  max-height: 75vh;
+  position: relative;
 }
-.table-modern td { padding: 12px 16px; border-bottom: 1px solid var(--border-medium); }
-.table-modern tr:hover td { background: rgba(108,92,231,0.04); }
+.table-modern {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 14px;
+}
+.table-modern thead th {
+  position: sticky; top: 0; z-index: 3;
+  background: var(--bg-secondary);
+  text-align: left;
+  padding: 12px 16px;
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  border-bottom: 2px solid var(--border-medium);
+  white-space: nowrap;
+}
+.table-modern td {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-medium);
+  vertical-align: top;
+}
+.table-modern tbody tr:hover td { background: rgba(108,92,231,0.04); }
 .table-modern tr:last-child td { border-bottom: none; }
 .row-disabled td { opacity: 0.45; }
 .actions-cell { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* Sortable header */
+.th-sortable { cursor: pointer; user-select: none; }
+.th-sortable:hover { color: var(--brand); }
+.th-sub {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.th-sub:hover { color: var(--brand); }
+
+/* Time cells — neutral, monospace */
+.cell-time {
+  color: var(--text-secondary);
+  font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* Entry-signal row highlight */
+.row-signal td {
+  background: linear-gradient(90deg, rgba(108,92,231,0.10) 0%, rgba(108,92,231,0.02) 100%);
+  border-left: 3px solid #6C5CE7;
+}
+.row-signal td:first-child { padding-left: 13px; }
+.row-signal:hover td {
+  background: linear-gradient(90deg, rgba(108,92,231,0.16) 0%, rgba(108,92,231,0.04) 100%) !important;
+}
+
+/* ============================================================
+   FILTER CHIPS (screener)
+   ============================================================ */
+.filter-chips {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--border-medium);
+  background: rgba(108,92,231,0.02);
+}
+.filter-chip {
+  padding: 7px 14px;
+  border-radius: 20px;
+  border: 1.5px solid var(--border-soft);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--t);
+  font-family: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.filter-chip:hover {
+  border-color: var(--brand);
+  color: var(--brand);
+  transform: translateY(-1px);
+}
+.filter-chip.active {
+  background: var(--gradient-brand);
+  color: #fff;
+  border-color: transparent;
+  box-shadow: 0 4px 12px rgba(108,92,231,0.25);
+}
+.chip-count {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(0,0,0,0.06);
+  color: inherit;
+}
+.filter-chip.active .chip-count { background: rgba(255,255,255,0.25); }
 
 /* ============================================================
    FORMS
@@ -667,4 +769,6 @@ body.impersonating .container { padding-top: 70px; }
   .user-form { grid-template-columns: 1fr; }
   .audit-row { flex-direction: column; gap: 4px; }
   .audit-time, .audit-actor { min-width: auto; }
+  .filter-chips { padding: 10px 16px; }
+  .filter-chip { padding: 6px 11px; font-size: 11px; }
 }

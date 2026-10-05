@@ -1,12 +1,12 @@
 /* ============================================================
-   SCREENER.JS  — v1.4
+   SCREENER.JS  — v1.5
    Multi-strategy + ORB + timestamps + cachedTokens + SSE
-   + Change % column (LTP vs prevClose) sorted descending
-   + NIFTY 50 live header
+   + Change % column (descending sort) + NIFTY 50 live header
+   + 9:15 Range column (H / L combined)
 
-   CHANGELOG v1.4 (2026-10-05):
-   - NIFTY 50 LTP shown in panel header (WS + SSE driven)
-   - Change % arrows removed — color alone indicates direction
+   CHANGELOG v1.5 (2026-10-05):
+   - 9:15 High + 9:15 Low merged into single "9:15 Range (H / L)" column
+   - colspan 14 → 13
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -122,7 +122,6 @@ function sortByChangePct(stocks) {
   });
 }
 
-/* Format price in Indian numbering (e.g. 22,554.70) */
 function formatPriceINR(v) {
   if (v === null || v === undefined) return '—';
   return v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -418,8 +417,7 @@ function renderScreenerTable() {
     <th>Stock / Company</th>
     <th>LTP</th>
     <th>Change %</th>
-    <th>9:15 H</th>
-    <th>9:15 L</th>
+    <th>9:15 Range (H / L)</th>
     <th>SL</th>
     <th>Target</th>
     <th>MAXQTY</th>
@@ -432,7 +430,7 @@ function renderScreenerTable() {
   </tr>`;
 
   if (!SCREENER_STOCKS.length) {
-    body.innerHTML = `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
+    body.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:60px;color:var(--text-muted)">
       No stocks match the strategy filter yet.<br>
       Click <strong>⚡ Fetch 9:15 Candles</strong> to load data.
     </td></tr>`;
@@ -472,8 +470,10 @@ function renderScreenerTable() {
       <td><strong>${s.sym}</strong><br><span style="font-size:11px;color:var(--text-muted)">${s.token}</span></td>
       <td style="font-weight:700">${ltp ? '₹' + ltp.toFixed(2) : '—'}</td>
       <td>${changeCell}</td>
-      <td style="color:var(--success);font-weight:600">₹${c.high.toFixed(2)}</td>
-      <td style="color:var(--danger);font-weight:600">₹${c.low.toFixed(2)}</td>
+      <td style="white-space:nowrap;line-height:1.4">
+        <div style="color:var(--success);font-weight:600">H: ₹${c.high.toFixed(2)}</div>
+        <div style="color:var(--danger);font-weight:600">L: ₹${c.low.toFixed(2)}</div>
+      </td>
       <td>₹${sl.toFixed(2)}</td>
       <td style="color:#6C5CE7;font-weight:600">₹${target.toFixed(2)}</td>
       <td style="font-weight:700;color:#6C5CE7">${maxQty}</td>

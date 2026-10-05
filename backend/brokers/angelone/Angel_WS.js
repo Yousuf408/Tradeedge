@@ -1,12 +1,11 @@
 /* ============================================================
-   Angel_WS.js — v1.2
+   Angel_WS.js — v1.3
    WebSocket live LTP feed — reconnects + gap backfill support
 
-   CHANGELOG v1.2 (2026-10-05):
-   - Handles Angel One 51-byte LTP packet format correctly
-   - Multi-candidate price parsing (float / double / int64)
-   - Hex diagnostic for first few ticks
-   - Cleaner heartbeat + pong handling
+   CHANGELOG v1.3 (2026-10-05):
+   - Confirmed Angel One 51-byte LTP packet format from live hex
+   - LTP = int64 little-endian at byte 43, in paise (÷100)
+   - Token = bytes 2-26 ASCII, null-trimmed
    ============================================================ */
 
 import WebSocket from 'ws';
@@ -20,15 +19,15 @@ let feedToken = null;
 let apiKey = null;
 let clientCode = null;
 let subscribedTokens = [];
-let onTick = null;                 // callback(token, ltp, ts)
-let onDisconnect = null;           // callback(gapStartMs, gapEndMs)
+let onTick = null;
+let onDisconnect = null;
 let heartbeatTimer = null;
 let reconnectTimer = null;
 let connectedAt = null;
 let shouldRun = false;
 let lastTickMs = null;
 
-/* ---- Public: start WebSocket ---- */
+/* ---- Public: start ---- */
 export function startWS({ apiKey: key, clientCode: code, feedToken: token, tokens, onTick: tickCb, onDisconnect: discCb }) {
   apiKey = key;
   clientCode = code;
@@ -40,7 +39,7 @@ export function startWS({ apiKey: key, clientCode: code, feedToken: token, token
   connect();
 }
 
-/* ---- Public: stop WebSocket ---- */
+/* ---- Public: stop ---- */
 export function stopWS() {
   shouldRun = false;
   clearTimers();
@@ -50,7 +49,7 @@ export function stopWS() {
   }
 }
 
-/* ---- Public: update token list (after new 9:15 fetch) ---- */
+/* ---- Public: resubscribe ---- */
 export function resubscribe(newTokens) {
   subscribedTokens = [...newTokens];
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -74,7 +73,7 @@ export function getWSStatus() {
    INTERNAL
    ============================================================ */
 let _hexLogged = 0;
-let _sizesLogged = new Set();
+const _sizesLogged = new Set();
 
 function connect() {
   if (!shouldRun) return;
@@ -99,14 +98,12 @@ function connect() {
   ws.on('message', (data) => {
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
 
-    /* Log each unique packet size once */
     if (!_sizesLogged.has(buf.length)) {
       _sizesLogged.add(buf.length);
       console.log(`🔍 WS packet size=${buf.length}`);
     }
 
-    /* Skip heartbeat / ack / small control frames */
-    if (buf.length < 30) return;
+    if (buf.length < 30) return;   // heartbeat / ack
 
     try {
       const tick = parseTick(buf);
@@ -149,16 +146,15 @@ function handleDrop() {
 function sendSubscribe() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   if (!subscribedTokens.length) return;
-  const msg = {
+  ws.send(JSON.stringify({
     action: 1,
     params: {
-      mode: 1,   // 1 = LTP mode
+      mode: 1,   // LTP mode
       tokenList: [
         { exchangeType: 1, tokens: subscribedTokens }   // 1 = NSE
       ]
     }
-  };
-  ws.send(JSON.stringify(msg));
+  }));
   console.log(`📡 Subscribed to ${subscribedTokens.length} tokens`);
 }
 
@@ -181,17 +177,13 @@ function clearTimers() {
 /* ============================================================
    PARSE BINARY TICK — Angel One LTP mode (51 bytes)
 
-   Confirmed layout from live packet:
-     [0]      subscription mode   (1 byte)
-     [1]      exchange type       (1 byte)
-     [2-26]   token               (25 bytes, ASCII, null-padded)
-     [27-34]  sequence number     (8 bytes)
-     [35-42]  exchange timestamp  (8 bytes)
-     [43-50]  LTP                 (8 bytes)
-
-   Angel's docs sometimes say float32 @43, sometimes double @43.
-   We try multiple interpretations and pick the first plausible
-   price (₹1 – ₹10,00,000).
+   Confirmed from live hex:
+     [0]      mode
+     [1]      exchange type
+     [2-26]   token (25 bytes ASCII, null-padded)
+     [27-34]  sequence (int64 LE)
+     [35-42]  exchange timestamp (int64 LE, epoch ms)
+     [43-50]  LTP (int64 LE, price × 100 in paise)
    ============================================================ */
 function parseTick(buffer) {
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
@@ -200,29 +192,15 @@ function parseTick(buffer) {
   const token = buf.slice(2, 27).toString('ascii').replace(/\0+$/, '').trim();
   if (!token) return null;
 
-  /* Hex diagnostic for first 3 ticks */
   if (_hexLogged < 3) {
     _hexLogged++;
     console.log(`🔬 tick hex [51]: ${buf.toString('hex')}`);
   }
 
-  const candidates = [
-    () => buf.readFloatBE(43),
-    () => buf.readDoubleBE(43),
-    () => buf.readFloatLE(43),
-    () => buf.readFloatBE(42),
-    () => buf.readFloatBE(41),
-    () => buf.readInt32BE(43) / 100,
-  ];
+  /* Price × 100, little-endian int64 at byte 43 */
+  const ltpPaise = buf.readBigInt64LE(43);
+  const ltp = Number(ltpPaise) / 100;
 
-  for (const fn of candidates) {
-    try {
-      const v = fn();
-      if (Number.isFinite(v) && v >= 1 && v <= 1000000) {
-        return { token, ltp: +v.toFixed(2) };
-      }
-    } catch {}
-  }
-
-  return null;
+  if (!Number.isFinite(ltp) || ltp <= 0 || ltp > 10000000) return null;
+  return { token, ltp: +ltp.toFixed(2) };
 }

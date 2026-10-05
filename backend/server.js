@@ -30,6 +30,14 @@
                 ↓
     15:30 → WS stops
     15:34 → closing prices saved
+
+   SECURITY (v1.1):
+    - /api/login returns a short-lived pendingToken (5 min JWT)
+      instead of leaking the user's totp_secret.
+    - /api/complete-login verifies TOTP on the SERVER before
+      issuing the session JWT. Client-side verification alone
+      is not trusted.
+    - Generated passwords now include a random suffix.
    ============================================================ */
 
 import express from 'express';
@@ -349,14 +357,22 @@ async function generateUsername(fullName, mobile) {
   }
 }
 
+/* ---- Password generator (v1.1 — random suffix) ----
+   Format:  {Name}@{last4}{special}{rand4}
+   Example: Ravi@3210#a7b2
+   Entropy: ~24 bits of randomness on top of user-known info. */
 const generatePassword = (fullName, mobile) => {
-  const first = (fullName || '').trim().split(/\s+/)[0];
-  const cap = first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
-  const last4 = (mobile || '').replace(/\D/g, '').slice(-4);
-  return `${cap}@${last4}!`;
+  const first = (fullName || '').trim().split(/\s+/)[0] || 'User';
+  const base = (first.charAt(0).toUpperCase() + first.slice(1).toLowerCase())
+    .replace(/[^A-Za-z]/g, '') || 'User';
+  const last4 = (mobile || '').replace(/\D/g, '').slice(-4) || '0000';
+  const specials = '!#%&*';
+  const sp = specials[crypto.randomInt(specials.length)];
+  const rand = crypto.randomBytes(3).toString('hex').slice(0, 4);
+  return `${base}@${last4}${sp}${rand}`;
 };
 
-/* ---- TOTP verification (for forgot-password) ---- */
+/* ---- TOTP verification (server-side) ---- */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 function base32Decode(str) {
@@ -396,6 +412,10 @@ function verifyTotpServer(secret, input) {
    ============================================================ */
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
 
+/* ---- POST /api/login ----------------------------------------
+   Step 1 of 2. Verifies password + account state, then returns
+   a short-lived pendingToken. Does NOT leak the user's totp_secret.
+   Does NOT issue a session token (that's /api/complete-login). */
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
   const clean = (input || '').trim().toLowerCase();
@@ -433,29 +453,83 @@ app.post('/api/login', async (req, res) => {
     return res.status(403).json({ error: 'Subscription expired', expired: true, expiresAt: user.expires_at });
   }
 
+  /* Issue short-lived pending token — client must come back to
+     /api/complete-login with a server-verifiable TOTP code. */
+  const pendingToken = jwt.sign(
+    { username: user.username, purpose: 'login-pending' },
+    SECRET,
+    { expiresIn: '5m' }
+  );
+
   res.json({
-    ok: true, username: user.username, name: user.name, role: user.role,
-    hasTotp: !!user.totp_secret, needsSetup: !user.totp_secret,
-    totpSecret: user.totp_secret || null
+    ok: true,
+    pendingToken,
+    username: user.username,
+    name: user.name,
+    needsSetup: !user.totp_secret,
+    hasTotp: !!user.totp_secret
+    /* NOTE: totp_secret is intentionally NOT returned */
   });
 });
 
+/* ---- POST /api/complete-login -------------------------------
+   Step 2 of 2. Requires the pendingToken from /api/login.
+   Verifies the 6-digit TOTP code against the SERVER-HELD secret
+   before issuing the session JWT.
+   - Existing user: send { pendingToken, totpCode }
+   - First-time setup: send { pendingToken, totpSecret, totpCode } */
 app.post('/api/complete-login', async (req, res) => {
-  const { username, totpSecret } = req.body;
-  const { rows } = await db.query('SELECT * FROM users WHERE username=$1', [username]);
+  const { pendingToken, totpCode, totpSecret } = req.body;
+
+  if (!pendingToken) return res.status(400).json({ error: 'Missing session token' });
+
+  let payload;
+  try {
+    payload = jwt.verify(pendingToken, SECRET);
+  } catch {
+    return res.status(401).json({ error: 'Login session expired. Please sign in again.' });
+  }
+  if (payload.purpose !== 'login-pending') {
+    return res.status(401).json({ error: 'Invalid session' });
+  }
+
+  const { rows } = await db.query('SELECT * FROM users WHERE username=$1', [payload.username]);
   const user = rows[0];
   if (!user) return res.status(404).json({ error: 'User not found' });
+  if (user.disabled) return res.status(403).json({ error: 'Account disabled' });
+  if (user.role !== 'admin' && user.expires_at && new Date(user.expires_at) < new Date()) {
+    return res.status(403).json({ error: 'Subscription expired', expired: true, expiresAt: user.expires_at });
+  }
 
-  if (totpSecret && !user.totp_secret) {
-    await db.query('UPDATE users SET totp_secret=$1 WHERE username=$2', [totpSecret, username]);
-    await log(username, 'TOTP_ENABLED', `User: ${username}`, 'success');
+  const code = String(totpCode || '').trim();
+  if (!/^\d{6}$/.test(code)) {
+    return res.status(400).json({ error: 'Enter a 6-digit code' });
+  }
+
+  if (!user.totp_secret) {
+    /* ---- First-time setup: user is submitting a new secret ---- */
+    if (!totpSecret || typeof totpSecret !== 'string') {
+      return res.status(400).json({ error: 'TOTP secret required for setup' });
+    }
+    if (!verifyTotpServer(totpSecret, code)) {
+      await log(user.username, 'TOTP_SETUP_FAILED', 'Bad code during setup', 'danger');
+      return res.status(401).json({ error: 'Code did not match. Check your authenticator app.' });
+    }
+    await db.query('UPDATE users SET totp_secret=$1 WHERE username=$2', [totpSecret, user.username]);
+    await log(user.username, 'TOTP_ENABLED', `User: ${user.username}`, 'success');
+  } else {
+    /* ---- Existing user: verify against stored secret ---- */
+    if (!verifyTotpServer(user.totp_secret, code)) {
+      await log(user.username, 'LOGIN_TOTP_FAILED', 'Bad TOTP code', 'danger');
+      return res.status(401).json({ error: 'Invalid code' });
+    }
   }
 
   const sessionId = crypto.randomUUID();
-  await db.query('UPDATE users SET session_id=$1, last_active=NOW() WHERE username=$2', [sessionId, username]);
+  await db.query('UPDATE users SET session_id=$1, last_active=NOW() WHERE username=$2', [sessionId, user.username]);
 
-  const token = jwt.sign({ username, role: user.role, sessionId }, SECRET, { expiresIn: '7h' });
-  await log(username, 'LOGIN_SUCCESS', `User: ${username}`, 'success');
+  const token = jwt.sign({ username: user.username, role: user.role, sessionId }, SECRET, { expiresIn: '7h' });
+  await log(user.username, 'LOGIN_SUCCESS', `User: ${user.username}`, 'success');
 
   res.json({
     ok: true, token,
@@ -827,11 +901,10 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
   const enriched = tokens.map(t => {
     const token = String(t);
     const state = getOrbState(token, p.date);
-    const candleArr = getCachedCandles([token], p.date)[0]?.candle;
-    const ltp = getCachedLTP(token);
+    const ltp = getCachedLTP(token);          /* ← fix #4: was hardcoded null */
     return {
       token,
-      ltp: null,     // filled by Angel_REST cache via getLTPForTokens if needed
+      ltp,                                     /* ← live price from memory cache */
       lowBroken: state.lowBroken,
       pullbackConfirmed: state.pullbackConfirmed,
       entrySignal: state.entrySignal,

@@ -66,7 +66,8 @@ import {
   getLTPForTokens,
   fetchAllClosingPrices,
   getSessionStatus,
-  getFeedToken
+  getFeedToken,
+  getFullQuotesForTokens
 } from './brokers/angelone/Angel_REST.js';
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 
@@ -909,6 +910,14 @@ app.delete('/api/admin/holidays/:date', auth, adminOnly, async (req, res) => {
    SECTION 13 — SCREENER ROUTES + SSE STREAM
    ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
+/* ---- TEMPORARY: test full quote for 1 token ---- */
+app.get('/api/admin/test-full-quote/:token', auth, adminOnly, async (req, res) => {
+  try {
+    const result = await getFullQuotesForTokens([req.params.token]);
+    const sym = SYM_BY_TOKEN[req.params.token] || '?';
+    res.json({ ok: true, token: req.params.token, sym, quote: result[0] || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
 app.get('/api/ws/status', auth, (req, res) => res.json(getWSStatus()));
 

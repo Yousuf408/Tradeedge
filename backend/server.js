@@ -845,6 +845,12 @@ app.get('/api/screener/data', auth, (req, res) => {
   if (p.phase === 'forming') return res.json({ ok: false, phase: 'forming' });
 
   const allCandles = getCachedCandles(STOCKS.map(s => s.token), p.date);
+
+  // Every token that already has a candle in memory (i.e. saved earlier)
+  const cachedTokens = allCandles
+    .filter(c => Array.isArray(c.candle) && c.candle.length >= 5)
+    .map(c => String(c.token));
+
   const passing = allCandles.filter(c => passesStrategy(c.candle, strategy));
   const passingTokens = new Set(passing.map(c => String(c.token)));
   const passingStocks = STOCKS.filter(s => passingTokens.has(String(s.token)));
@@ -853,7 +859,9 @@ app.get('/api/screener/data', auth, (req, res) => {
     ok: true, phase: p.phase, date: p.date,
     strategy: strategy.id, strategyName: strategy.name, filters: strategy.filters,
     filled: passing.length, total: STOCKS.length,
-    results: passing, stocks: passingStocks
+    cachedTokens,                 // ← NEW
+    results: passing,
+    stocks: passingStocks
   });
 });
 

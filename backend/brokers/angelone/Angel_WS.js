@@ -1,7 +1,13 @@
 /* ============================================================
-   Angel_WS.js
+   Angel_WS.js — v1.1
    WebSocket live LTP feed — reconnects + gap backfill support
    Uses feedToken from Angel_REST login
+
+   CHANGELOG v1.1 (2026-10-05):
+   - Handles both 51-byte and 52-byte LTP packets
+   - Logs unique packet sizes for diagnostics
+   - Logs parse errors instead of silently swallowing
+   - Logs heartbeat / ack frames
    ============================================================ */
 
 import WebSocket from 'ws';
@@ -81,6 +87,8 @@ function connect() {
     }
   });
 
+  ws._loggedSizes = new Set();   // diagnostic: track unique packet sizes
+
   ws.on('open', () => {
     connectedAt = Date.now();
     console.log(`🔌 WS connected (${subscribedTokens.length} tokens)`);
@@ -89,25 +97,41 @@ function connect() {
   });
 
   ws.on('message', (data) => {
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+
+    /* Diagnostic — log each unique packet size once */
+    if (!ws._loggedSizes.has(buf.length)) {
+      ws._loggedSizes.add(buf.length);
+      const preview = buf.slice(0, Math.min(20, buf.length)).toString('hex');
+      console.log(`🔍 WS packet size=${buf.length} hex=${preview}`);
+    }
+
+    /* Skip heartbeat / ack frames (very small) */
+    if (buf.length < 30) return;
+
     try {
-      const tick = parseTick(data);
+      const tick = parseTick(buf);
       if (tick && onTick) {
         lastTickMs = Date.now();
         onTick(tick.token, tick.ltp, lastTickMs);
       }
     } catch (e) {
-      // ignore parse errors
+      console.error('🔍 WS parse error:', e.message);
     }
   });
 
-  ws.on('close', () => {
-    console.log('🔌 WS closed');
+  ws.on('close', (code, reason) => {
+    console.log(`🔌 WS closed code=${code} reason=${reason?.toString() || ''}`);
     handleDrop();
   });
 
   ws.on('error', (e) => {
     console.log('🔌 WS error:', e.message);
     handleDrop();
+  });
+
+  ws.on('ping', () => {
+    try { ws.pong(); } catch {}
   });
 }
 
@@ -126,7 +150,7 @@ function handleDrop() {
 function sendSubscribe() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   if (!subscribedTokens.length) return;
-  ws.send(JSON.stringify({
+  const msg = {
     action: 1,
     params: {
       mode: 1,   // LTP mode
@@ -134,7 +158,9 @@ function sendSubscribe() {
         { exchangeType: 1, tokens: subscribedTokens }   // 1 = NSE
       ]
     }
-  }));
+  };
+  ws.send(JSON.stringify(msg));
+  console.log(`📡 Subscribed to ${subscribedTokens.length} tokens`);
 }
 
 function startHeartbeat() {
@@ -155,21 +181,41 @@ function clearTimers() {
 
 /* ============================================================
    PARSE BINARY TICK (LTP mode)
-   Format:
-     [0-1]   subscription mode (2 bytes)
-     [2]     exchange type (1 byte)
-     [3-27]  token (25 bytes, null-padded ASCII)
-     [28-35] sequence number (8 bytes)
-     [36-43] exchange timestamp (8 bytes)
-     [44-51] LTP (8 bytes double, big-endian)
+   Angel One sends 51-byte OR 52-byte packets depending on SDK.
+
+   Layout (52-byte):
+     [0]     subscription mode (1 byte)
+     [1]     exchange type (1 byte)
+     [2-26]  token (25 bytes, null-padded ASCII)
+     [27-34] sequence number (8 bytes)
+     [35-42] exchange timestamp (8 bytes)
+     [43-50] LTP (8 bytes double, big-endian)
+
+   Layout (51-byte):
+     [0]     subscription mode (1 byte)
+     [1]     exchange type (1 byte)
+     [2-26]  token (25 bytes, null-padded ASCII)
+     [27-34] sequence number (8 bytes)
+     [35-42] exchange timestamp (8 bytes)
+     [43-50] LTP (8 bytes double, big-endian)  ← same
+   NOTE: The token offset shifts by 1 byte between versions.
    ============================================================ */
 function parseTick(buffer) {
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
-  if (buf.length < 52) return null;
 
-  const token = buf.slice(3, 28).toString('ascii').replace(/\0+$/, '');
-  const ltp = buf.readDoubleBE(44);
+  if (buf.length !== 51 && buf.length !== 52) {
+    return null;
+  }
 
-  if (!token || !ltp) return null;
+  /* Token starts at byte 2 for 52-byte, byte 1 for 51-byte.
+     Slice generously and trim nulls — safe for both. */
+  const tokenStart = buf.length === 52 ? 2 : 1;
+  const token = buf.slice(tokenStart, tokenStart + 25).toString('ascii').replace(/\0+$/, '').trim();
+  if (!token) return null;
+
+  /* LTP is always last 8 bytes (big-endian double) */
+  const ltp = buf.readDoubleBE(buf.length - 8);
+  if (!ltp || isNaN(ltp) || ltp <= 0) return null;
+
   return { token, ltp };
 }

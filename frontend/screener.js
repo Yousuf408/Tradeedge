@@ -1,15 +1,12 @@
 /* ============================================================
-   SCREENER.JS  — v1.3
-   Multi-strategy + ORB stage tracking + timestamps
-   + cachedTokens tracking (survives browser crash)
-   + SSE real-time LTP push
-   + Change % column (LTP vs previous close) with descending sort
+   SCREENER.JS  — v1.4
+   Multi-strategy + ORB + timestamps + cachedTokens + SSE
+   + Change % column (LTP vs prevClose) sorted descending
+   + NIFTY 50 live header
 
-   CHANGELOG v1.3 (2026-10-05):
-   - Added SCREENER_PREV_CLOSE map
-   - Added "Change %" column (right after LTP)
-   - Rows sorted by Change % descending (highest on top)
-   - prevClose consumed from /api/screener/ltp response
+   CHANGELOG v1.4 (2026-10-05):
+   - NIFTY 50 LTP shown in panel header (WS + SSE driven)
+   - Change % arrows removed — color alone indicates direction
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -17,12 +14,14 @@ let SCREENER_STOCKS = [];
 let SCREENER_ALL_CANDLES = {};
 let SCREENER_CACHED_TOKENS = new Set();
 let SCREENER_LTP = {};
-let SCREENER_PREV_CLOSE = {};   // token → previous trading day close
+let SCREENER_PREV_CLOSE = {};
 let SCREENER_ORB = {};
 let SCREENER_INIT_DONE = false;
 let SCREENER_LTP_TIMER = null;
 let SCREENER_SSE = null;
 let FETCHING = false;
+
+const NIFTY50_TOKEN = '99926000';
 
 const CURRENT_STRATEGY = 'advance_orb';
 const STRATEGY_FILTER = { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 };
@@ -112,17 +111,55 @@ function computeChangePct(token) {
   return ((ltp - prevClose) / prevClose) * 100;
 }
 
-/* Sort stocks by Change % descending (highest on top).
-   Stocks without change % go to the bottom. */
 function sortByChangePct(stocks) {
   return [...stocks].sort((a, b) => {
     const aPct = computeChangePct(a.token);
     const bPct = computeChangePct(b.token);
     if (aPct === null && bPct === null) return 0;
-    if (aPct === null) return 1;    // a goes below
-    if (bPct === null) return -1;   // b goes below
-    return bPct - aPct;              // descending
+    if (aPct === null) return 1;
+    if (bPct === null) return -1;
+    return bPct - aPct;
   });
+}
+
+/* Format price in Indian numbering (e.g. 22,554.70) */
+function formatPriceINR(v) {
+  if (v === null || v === undefined) return '—';
+  return v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+/* ============================================================
+   SECTION 3.2 — NIFTY 50 HEADER
+   ============================================================ */
+function updateNiftyHeader() {
+  const ltpEl = document.getElementById('niftyLtp');
+  const chgEl = document.getElementById('niftyChange');
+  if (!ltpEl || !chgEl) return;
+
+  const ltp = SCREENER_LTP[NIFTY50_TOKEN];
+  const prev = SCREENER_PREV_CLOSE[NIFTY50_TOKEN];
+
+  if (!ltp) {
+    ltpEl.textContent = '—';
+    chgEl.textContent = '—';
+    chgEl.style.color = 'var(--text-muted)';
+    return;
+  }
+
+  ltpEl.textContent = formatPriceINR(ltp);
+
+  if (prev && prev > 0) {
+    const diff = ltp - prev;
+    const pct = (diff / prev) * 100;
+    const isPos = diff >= 0;
+    const color = isPos ? 'var(--success)' : 'var(--danger)';
+    const sign = isPos ? '+' : '';
+    chgEl.textContent = `${sign}${diff.toFixed(2)} (${sign}${pct.toFixed(2)}%)`;
+    chgEl.style.color = color;
+  } else {
+    chgEl.textContent = '—';
+    chgEl.style.color = 'var(--text-muted)';
+  }
 }
 
 /* ============================================================
@@ -264,36 +301,41 @@ function updateProgress(done, total) {
    SECTION 6 — LTP + ORB state (REST poll, 30s backup)
    ============================================================ */
 async function loadLTP() {
-  if (!SCREENER_STOCKS.length) return;
+  const tokens = SCREENER_STOCKS.map(s => s.token);
+  /* Always include NIFTY 50 for the header */
+  if (!tokens.includes(NIFTY50_TOKEN)) tokens.push(NIFTY50_TOKEN);
+
   try {
     const r = await fetch(API + '/api/screener/ltp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
-      body: JSON.stringify({ tokens: SCREENER_STOCKS.map(s => s.token) })
+      body: JSON.stringify({ tokens })
     });
     const d = await r.json();
     if (d.results) {
       for (const item of d.results) {
         if (item.ltp) SCREENER_LTP[item.token] = item.ltp;
         if (item.prevClose) SCREENER_PREV_CLOSE[item.token] = item.prevClose;
-        SCREENER_ORB[item.token] = {
-          lowBroken: !!item.lowBroken,
-          pullbackConfirmed: !!item.pullbackConfirmed,
-          entrySignal: !!item.entrySignal,
-          newLowAt: item.newLowAt || null,
-          pullbackAt: item.pullbackAt || null,
-          breakoutAt: item.breakoutAt || null,
-          serverTime: item.serverTime || null
-        };
+        if (item.token !== NIFTY50_TOKEN) {
+          SCREENER_ORB[item.token] = {
+            lowBroken: !!item.lowBroken,
+            pullbackConfirmed: !!item.pullbackConfirmed,
+            entrySignal: !!item.entrySignal,
+            newLowAt: item.newLowAt || null,
+            pullbackAt: item.pullbackAt || null,
+            breakoutAt: item.breakoutAt || null,
+            serverTime: item.serverTime || null
+          };
+        }
       }
     }
+    updateNiftyHeader();
     renderScreenerTable();
   } catch (e) { console.error('LTP failed:', e); }
 }
 
 function startLTPRefresh() {
   if (SCREENER_LTP_TIMER) clearInterval(SCREENER_LTP_TIMER);
-  /* ORB stage sync only — LTP now comes via SSE in real-time */
   SCREENER_LTP_TIMER = setInterval(() => loadLTP(), 30000);
 }
 
@@ -314,10 +356,13 @@ function startSSE() {
       const msg = JSON.parse(e.data);
       if (msg.type === 'ltp' && msg.ticks) {
         let any = false;
+        let niftyTouched = false;
         for (const [token, price] of Object.entries(msg.ticks)) {
           SCREENER_LTP[token] = price;
           any = true;
+          if (token === NIFTY50_TOKEN) niftyTouched = true;
         }
+        if (niftyTouched) updateNiftyHeader();
         if (any) renderScreenerTable();
       }
     } catch {}
@@ -395,7 +440,6 @@ function renderScreenerTable() {
     return;
   }
 
-  /* Sort by Change % descending */
   const sorted = sortByChangePct(SCREENER_STOCKS);
 
   body.innerHTML = sorted.map(s => {
@@ -416,8 +460,7 @@ function renderScreenerTable() {
     } else {
       const isPos = changePct >= 0;
       const color = isPos ? 'var(--success)' : 'var(--danger)';
-      const arrow = isPos ? '▲' : '▼';
-      changeCell = `<span style="color:${color};font-weight:700">${arrow} ${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
+      changeCell = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
     }
 
     const newLowTime    = formatTimeIST(orb.newLowAt);

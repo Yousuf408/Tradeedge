@@ -1,12 +1,13 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend
+   server.js — TradeAlgo Pro backend  |  v1.3
+   ============================================================
 
    STRUCTURE:
     §1  Imports
     §2  Config (env, DB, stock list, strategy)
     §3  Time / phases / holidays
     §4  ORB state (memory + DB sync)
-    §5  WebSocket manager (tick → stages)
+    §5  WebSocket manager (tick → stages) + SSE broadcast
     §6  Middleware + helpers
     §7  Auth routes
     §8  Forgot password
@@ -14,7 +15,7 @@
     §10 Users CRUD (admin)
     §11 Audit + prices
     §12 Trading holidays (admin)
-    §13 Screener routes
+    §13 Screener routes + SSE stream
     §14 Closing prices (15:34 IST)
     §15 DB cache loader
     §16 Start
@@ -22,14 +23,14 @@
    DATA FLOW:
     9:15 fetch → candles cached (memory + DB)
                 ↓
-    WS subscribes to all active tokens
+    Angel WS subscribes to all active tokens
                 ↓
     Every tick → update ORB stages + LTP in DB
                 ↓
-    Client polls /api/screener/ltp → gets stage data
+    Every tick → broadcastLTP() → SSE push to browsers
                 ↓
-    15:30 → WS stops
-    15:34 → closing prices saved
+    Client polls /api/screener/ltp every 30s (ORB stage backup)
+    Client receives /api/screener/stream via SSE (LTP real-time)
 
    SECURITY (v1.1):
     - /api/login returns a short-lived pendingToken (5 min JWT)
@@ -37,7 +38,12 @@
     - /api/complete-login verifies TOTP on the SERVER before
       issuing the session JWT. Client-side verification alone
       is not trusted.
-    - Generated passwords now include a random suffix.
+    - Generated passwords include a random suffix.
+
+   CHANGELOG v1.3 (2026-10-05):
+    - Added SSE push: /api/screener/stream
+    - broadcastLTP() called from handleTick — 300ms batching
+    - No change to existing REST endpoints or WS logic
    ============================================================ */
 
 import express from 'express';
@@ -198,13 +204,48 @@ const getOrbState = (token, date) => orbState.get(`${token}_${date}`) || {
 
 
 /* ============================================================
-   SECTION 5 — WEBSOCKET MANAGER
-   Live tick → updates ORB stages + LTP in real time
+   SECTION 5 — WEBSOCKET MANAGER + SSE BROADCAST
+   Live tick → updates ORB stages + LTP in real time,
+   then pushes LTP to all connected browsers via SSE.
    ============================================================ */
 let wsStarted = false;
 let wsConnectedTokens = 0;
 
-/* Called for every tick from WebSocket */
+/* ---- SSE (Server-Sent Events) registry ----
+   Each browser that opens /api/screener/stream is added here.
+   When a WS tick arrives, we push the price to all of them.
+   Batching: we accumulate ticks in `ssePending` for 300ms and
+   send one combined message per interval — prevents flooding
+   the browser with 387 individual events per second. */
+const sseClients = new Set();
+let ssePending = new Map();
+let sseFlushTimer = null;
+
+function broadcastLTP(token, ltp) {
+  if (!sseClients.size) return;
+  ssePending.set(String(token), ltp);
+
+  /* Already scheduled — the pending buffer will flush soon */
+  if (sseFlushTimer) return;
+
+  sseFlushTimer = setTimeout(() => {
+    sseFlushTimer = null;
+    if (!ssePending.size) return;
+
+    const payload = `data: ${JSON.stringify({
+      type: 'ltp',
+      ticks: Object.fromEntries(ssePending)
+    })}\n\n`;
+    ssePending.clear();
+
+    for (const c of sseClients) {
+      try { c.res.write(payload); }
+      catch { sseClients.delete(c); }
+    }
+  }, 300);
+}
+
+/* ---- Called for every tick from WebSocket ---- */
 function handleTick(token, ltp) {
   const p = getScreenerPhase();
   if (p.phase !== 'ready' || !p.date) return;
@@ -256,8 +297,13 @@ function handleTick(token, ltp) {
 
   if (changed) orbState.set(key, state);
 
-  /* Always update LTP */
+  /* Always update LTP cache */
   setCachedLTP(token, ltp);
+
+  /* Push to browsers in real time (~300ms batched) */
+  broadcastLTP(token, ltp);
+
+  /* Persist LTP to DB (fire and forget) */
   db.query(
     `UPDATE angel_15m_candle SET ltp=$1, ltp_updated_at=NOW() WHERE date=$2 AND token=$3`,
     [ltp, p.date, token]
@@ -304,7 +350,7 @@ function stopWebSocketIfNeeded() {
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
   const dow = ist.getUTCDay();
 
-  // Stop after 15:30 or on non-trading days
+  /* Stop after 15:30 or on non-trading days */
   if (dow === 0 || dow === 6 || !isTradingDay(ist) || mins >= 930) {
     stopWS();
     wsStarted = false;
@@ -359,8 +405,7 @@ async function generateUsername(fullName, mobile) {
 
 /* ---- Password generator (v1.1 — random suffix) ----
    Format:  {Name}@{last4}{special}{rand4}
-   Example: Ravi@3210#a7b2
-   Entropy: ~24 bits of randomness on top of user-known info. */
+   Example: Ravi@3210#a7b2  */
 const generatePassword = (fullName, mobile) => {
   const first = (fullName || '').trim().split(/\s+/)[0] || 'User';
   const base = (first.charAt(0).toUpperCase() + first.slice(1).toLowerCase())
@@ -475,9 +520,7 @@ app.post('/api/login', async (req, res) => {
 /* ---- POST /api/complete-login -------------------------------
    Step 2 of 2. Requires the pendingToken from /api/login.
    Verifies the 6-digit TOTP code against the SERVER-HELD secret
-   before issuing the session JWT.
-   - Existing user: send { pendingToken, totpCode }
-   - First-time setup: send { pendingToken, totpSecret, totpCode } */
+   before issuing the session JWT. */
 app.post('/api/complete-login', async (req, res) => {
   const { pendingToken, totpCode, totpSecret } = req.body;
 
@@ -507,7 +550,7 @@ app.post('/api/complete-login', async (req, res) => {
   }
 
   if (!user.totp_secret) {
-    /* ---- First-time setup: user is submitting a new secret ---- */
+    /* First-time setup: user is submitting a new secret */
     if (!totpSecret || typeof totpSecret !== 'string') {
       return res.status(400).json({ error: 'TOTP secret required for setup' });
     }
@@ -518,7 +561,7 @@ app.post('/api/complete-login', async (req, res) => {
     await db.query('UPDATE users SET totp_secret=$1 WHERE username=$2', [totpSecret, user.username]);
     await log(user.username, 'TOTP_ENABLED', `User: ${user.username}`, 'success');
   } else {
-    /* ---- Existing user: verify against stored secret ---- */
+    /* Existing user: verify against stored secret */
     if (!verifyTotpServer(user.totp_secret, code)) {
       await log(user.username, 'LOGIN_TOTP_FAILED', 'Bad TOTP code', 'danger');
       return res.status(401).json({ error: 'Invalid code' });
@@ -819,7 +862,7 @@ app.delete('/api/admin/holidays/:date', auth, adminOnly, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 13 — SCREENER ROUTES
+   SECTION 13 — SCREENER ROUTES + SSE STREAM
    ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
@@ -846,7 +889,7 @@ app.get('/api/screener/data', auth, (req, res) => {
 
   const allCandles = getCachedCandles(STOCKS.map(s => s.token), p.date);
 
-  // Every token that already has a candle in memory (i.e. saved earlier)
+  /* Every token that already has a candle in memory (i.e. saved earlier) */
   const cachedTokens = allCandles
     .filter(c => Array.isArray(c.candle) && c.candle.length >= 5)
     .map(c => String(c.token));
@@ -859,9 +902,42 @@ app.get('/api/screener/data', auth, (req, res) => {
     ok: true, phase: p.phase, date: p.date,
     strategy: strategy.id, strategyName: strategy.name, filters: strategy.filters,
     filled: passing.length, total: STOCKS.length,
-    cachedTokens,                 // ← NEW
+    cachedTokens,
     results: passing,
     stocks: passingStocks
+  });
+});
+
+/* ---- SSE stream — real-time LTP push -----------------------
+   Browser opens this once; server pushes each tick (batched 300ms).
+   Auth via ?token=<jwt> because EventSource can't set headers. */
+app.get('/api/screener/stream', (req, res) => {
+  const token = req.query.token;
+  if (!token) return res.status(401).end();
+  try { jwt.verify(token, SECRET); } catch { return res.status(401).end(); }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');   // disable proxy buffering (nginx/render)
+  res.flushHeaders();
+
+  const client = { res };
+  sseClients.add(client);
+  console.log(`📡 SSE client connected (total: ${sseClients.size})`);
+
+  /* Greet immediately so browser knows stream is live */
+  res.write(`event: hello\ndata: {"ok":true}\n\n`);
+
+  /* Keep connection alive through proxies */
+  const keepAlive = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch {}
+  }, 20000);
+
+  req.on('close', () => {
+    clearInterval(keepAlive);
+    sseClients.delete(client);
+    console.log(`📡 SSE client disconnected (total: ${sseClients.size})`);
   });
 });
 
@@ -898,7 +974,8 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* Client polls this — reads from memory, no API calls */
+/* Client polls this — reads from memory, no API calls.
+   Kept as fallback for ORB stage sync (SSE handles LTP). */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -909,10 +986,10 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
   const enriched = tokens.map(t => {
     const token = String(t);
     const state = getOrbState(token, p.date);
-    const ltp = getCachedLTP(token);          /* ← fix #4: was hardcoded null */
+    const ltp = getCachedLTP(token);
     return {
       token,
-      ltp,                                     /* ← live price from memory cache */
+      ltp,
       lowBroken: state.lowBroken,
       pullbackConfirmed: state.pullbackConfirmed,
       entrySignal: state.entrySignal,
@@ -1022,7 +1099,7 @@ app.listen(PORT, async () => {
   await loadHolidaysFromDB();
   await loadScreenerCacheFromDB();
 
-  // Late startup — if server restarts after 15:34 on a weekday, fetch closing now
+  /* Late startup — if server restarts after 15:34 on a weekday, fetch closing now */
   const nowIST = getIST();
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
   const dow = nowIST.getUTCDay();
@@ -1032,5 +1109,5 @@ app.listen(PORT, async () => {
   }
   scheduleClosingFetch();
 
-  console.log('ℹ️  Ready — manual fetch + live WS');
+  console.log('ℹ️  Ready — manual fetch + live WS + SSE push');
 });

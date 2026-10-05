@@ -1,16 +1,14 @@
 /* ============================================================
-   SCREENER.JS  — v1.7
+   SCREENER.JS  — v1.8
    ORB + timestamps + cachedTokens + SSE + NIFTY 50 header
-   + Combined columns + Filter chips + Column sort
-   + Entry-signal row highlight + Professional color palette
+   + Filter chips + Column sort + Entry-signal row highlight
+   + Compact controls (no Ready pill, no range hint)
 
-   CHANGELOG v1.7 (2026-10-05):
-   - Filter chips: All / Entry Signal / Low Broken / Waiting
-   - Column header click-to-sort (change, ltp, range, stage)
-   - Entry-signal rows highlighted (row-signal class)
-   - Times column: neutral color (removed orange/yellow/purple)
-   - Only 3 accent colors: green (positive), red (negative),
-     purple (actionable: target, maxqty, entry)
+   CHANGELOG v1.8 (2026-10-05):
+   - Removed "Ready" status pill (redundant)
+   - Removed "Range ≤ …" hint text
+   - NIFTY header: arrow ▲ ▼ between LTP and change
+   - NIFTY color matches direction (whole row colored)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -25,10 +23,9 @@ let SCREENER_LTP_TIMER = null;
 let SCREENER_SSE = null;
 let FETCHING = false;
 
-/* Filter + sort state */
-let SCREENER_STAGE_FILTER = 'all';   // all | entry | lowbrok | waiting
-let SCREENER_SORT_BY = 'change';      // change | ltp | range | stage
-let SCREENER_SORT_DIR = 'desc';       // desc | asc
+let SCREENER_STAGE_FILTER = 'all';
+let SCREENER_SORT_BY = 'change';
+let SCREENER_SORT_DIR = 'desc';
 
 const NIFTY50_TOKEN = '99926000';
 
@@ -69,21 +66,16 @@ function setupControls() {
   });
   controls.querySelectorAll('button, label').forEach(el => el.style.display = 'none');
 
+  /* Compact control bar — Ready pill and Range hint removed */
   controls.innerHTML = `
     <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
-    <span id="screenerStatusPill"
-          style="font-size:12px;font-weight:600;color:var(--text-muted);padding:6px 14px;
-                 background:rgba(108,92,231,0.06);border-radius:20px;margin-left:12px">Ready</span>
-    <span style="font-size:11px;color:var(--text-muted);margin-left:12px">
-      Range ≤ ${STRATEGY_FILTER.maxRangePct}% · ₹${STRATEGY_FILTER.minPrice}–${STRATEGY_FILTER.maxPrice}
-    </span>
-    <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:16px">Per-Trade ₹</label>
+    <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">Per-Trade ₹</label>
     <input id="perTradeInput" type="number" value="10000" min="100"
-           style="width:120px;padding:8px 12px;border:2px solid rgba(0,0,0,0.06);border-radius:10px;
-                  font-size:13px;font-family:inherit"
+           style="width:110px;padding:7px 12px;border:1.5px solid var(--border-soft);border-radius:8px;
+                  font-size:13px;font-family:inherit;background:var(--bg-secondary);color:var(--text-primary)"
            onchange="onPerTradeChange()" />
-    <div id="progressBar" style="display:none;width:100%;margin-top:12px">
-      <div style="background:rgba(0,0,0,0.06);border-radius:10px;height:8px;overflow:hidden">
+    <div id="progressBar" style="display:none;width:100%;margin-top:8px">
+      <div style="background:rgba(0,0,0,0.06);border-radius:10px;height:6px;overflow:hidden">
         <div id="progressFill" style="background:var(--gradient-brand);height:100%;width:0%;transition:width 0.3s"></div>
       </div>
       <div id="progressText" style="font-size:11px;color:var(--text-muted);margin-top:4px;text-align:center">0 / 0</div>
@@ -229,6 +221,7 @@ function formatPriceINR(v) {
 
 /* ============================================================
    SECTION 3.2 — NIFTY 50 HEADER
+   Format:  22,555.75  ▲ +133.80 (+0.60%)  — whole row colored
    ============================================================ */
 function updateNiftyHeader() {
   const ltpEl = document.getElementById('niftyLtp');
@@ -240,24 +233,29 @@ function updateNiftyHeader() {
 
   if (!ltp) {
     ltpEl.textContent = '—';
-    chgEl.textContent = '—';
-    chgEl.style.color = 'var(--text-muted)';
+    ltpEl.style.color = 'var(--text-primary)';
+    chgEl.textContent = '';
     return;
   }
 
-  ltpEl.textContent = formatPriceINR(ltp);
+  const ltpText = formatPriceINR(ltp);
 
   if (prev && prev > 0) {
     const diff = ltp - prev;
     const pct = (diff / prev) * 100;
     const isPos = diff >= 0;
     const color = isPos ? 'var(--success)' : 'var(--danger)';
+    const arrow = isPos ? '▲' : '▼';
     const sign = isPos ? '+' : '';
-    chgEl.textContent = `${sign}${diff.toFixed(2)} (${sign}${pct.toFixed(2)}%)`;
+
+    ltpEl.textContent = ltpText;
+    ltpEl.style.color = color;
+    chgEl.textContent = `${arrow} ${sign}${diff.toFixed(2)} (${sign}${pct.toFixed(2)}%)`;
     chgEl.style.color = color;
   } else {
-    chgEl.textContent = '—';
-    chgEl.style.color = 'var(--text-muted)';
+    ltpEl.textContent = ltpText;
+    ltpEl.style.color = 'var(--text-primary)';
+    chgEl.textContent = '';
   }
 }
 
@@ -325,7 +323,6 @@ async function startFetch() {
   const missing = allTokens.filter(t => !SCREENER_CACHED_TOKENS.has(String(t)));
 
   if (!missing.length) {
-    setPill('✅ Already cached', 'var(--success)');
     updateProgress(total, total);
     FETCHING = false;
     btn.disabled = false;
@@ -336,7 +333,6 @@ async function startFetch() {
     return;
   }
 
-  setPill(`⏳ Fetching 0 / ${missing.length}...`, '#f39c12');
   updateProgress(total - missing.length, total);
 
   const alreadyCached = total - missing.length;
@@ -368,7 +364,6 @@ async function startFetch() {
     }
 
     const done = alreadyCached + i + batch.length;
-    setPill(`⏳ Fetching ${done} / ${total}...`, '#f39c12');
     recomputeFilteredStocks();
     renderScreenerTable();
     updateProgress(done, total);
@@ -378,7 +373,6 @@ async function startFetch() {
     }
   }
 
-  setPill(`✅ Done — new:${ok} · failed:${failed} · passing:${SCREENER_STOCKS.length}`, 'var(--success)');
   FETCHING = false;
   btn.disabled = false;
   btn.textContent = '⚡ Refresh';
@@ -537,13 +531,11 @@ function renderScreenerTable() {
     return;
   }
 
-  /* Apply stage filter */
   let filtered = SCREENER_STOCKS;
   if (SCREENER_STAGE_FILTER !== 'all') {
     filtered = filtered.filter(s => categorizeStock(s) === SCREENER_STAGE_FILTER);
   }
 
-  /* Sort */
   const sorted = sortStocks(filtered);
 
   if (!sorted.length) {
@@ -584,25 +576,25 @@ function renderScreenerTable() {
     const rowClass = orb.entrySignal ? 'row-signal' : '';
 
     return `<tr class="${rowClass}">
-      <td><strong>${s.sym}</strong><br><span style="font-size:11px;color:var(--text-muted)">${s.token}</span></td>
-      <td style="white-space:nowrap;line-height:1.4">
-        <div style="font-weight:700">${ltp ? '₹' + ltp.toFixed(2) : '—'}</div>
-        <div>${changeLine}</div>
+      <td><span class="sym">${s.sym}</span><span class="tok">${s.token}</span></td>
+      <td style="white-space:nowrap">
+        <span class="cell-primary">${ltp ? '₹' + ltp.toFixed(2) : '—'}</span>
+        <span class="cell-sub">${changeLine}</span>
       </td>
-      <td style="white-space:nowrap;line-height:1.4">
-        <div style="color:var(--success);font-weight:600">H: ₹${c.high.toFixed(2)}</div>
-        <div style="color:var(--danger);font-weight:600">L: ₹${c.low.toFixed(2)}</div>
+      <td style="white-space:nowrap">
+        <span class="cell-primary" style="color:var(--success)">H: ₹${c.high.toFixed(2)}</span>
+        <span class="cell-sub" style="color:var(--danger)">L: ₹${c.low.toFixed(2)}</span>
       </td>
-      <td style="white-space:nowrap;line-height:1.4">
-        <div style="color:#6C5CE7;font-weight:600">T: ₹${target.toFixed(2)}</div>
-        <div style="color:var(--text-secondary);font-weight:600">SL: ₹${sl.toFixed(2)}</div>
+      <td style="white-space:nowrap">
+        <span class="cell-primary" style="color:#6C5CE7">T: ₹${target.toFixed(2)}</span>
+        <span class="cell-sub" style="color:var(--text-secondary)">SL: ₹${sl.toFixed(2)}</span>
       </td>
       <td style="font-weight:700;color:#6C5CE7">${maxQty}</td>
       <td class="cell-time">${newLowTime}</td>
       <td class="cell-time">${pullbackTime}</td>
       <td class="cell-time">${breakoutTime}</td>
-      <td style="color:var(--text-muted);font-size:11px;font-family:monospace">${lastUpdate}</td>
-      <td style="color:${stage.color};font-weight:${stage.weight};font-size:12px">${stage.label}</td>
+      <td style="color:var(--text-muted);font-size:11px;font-family:ui-monospace,monospace">${lastUpdate}</td>
+      <td style="color:${stage.color};font-weight:${stage.weight};font-size:11px">${stage.label}</td>
       <td>${orb.entrySignal
         ? `<button class="btn btn-success btn-sm" onclick="placeOrder('${s.sym}')">Buy</button>`
         : '<span style="color:var(--text-muted);font-size:11px">—</span>'}</td>

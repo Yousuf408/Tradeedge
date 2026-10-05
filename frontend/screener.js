@@ -1,7 +1,14 @@
 /* ============================================================
-   SCREENER.JS  — v1.1
+   SCREENER.JS  — v1.2
    Multi-strategy + ORB stage tracking + timestamps
    + cachedTokens tracking (survives browser crash)
+   + SSE real-time LTP push (replaces 15s polling)
+
+   CHANGELOG v1.2 (2026-10-05):
+   - SSE stream replaces fast polling for LTP
+   - Polling now runs every 30s — syncs ORB stage only
+   - Batch size 20 for frequent progress updates
+   - cachedTokens tracking from /api/screener/data
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -12,14 +19,15 @@ let SCREENER_LTP = {};
 let SCREENER_ORB = {};
 let SCREENER_INIT_DONE = false;
 let SCREENER_LTP_TIMER = null;
+let SCREENER_SSE = null;
 let FETCHING = false;
 
 const CURRENT_STRATEGY = 'advance_orb';
 const STRATEGY_FILTER = { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 };
 
 let PER_TRADE = 10000;
-const BATCH_SIZE = 20;      // was 50 — fewer round trips
-const BATCH_DELAY = 150;     // was 500
+const BATCH_SIZE = 20;       // smaller batches → frequent progress updates
+const BATCH_DELAY = 150;
 
 /* ============================================================
    SECTION 1 — INIT
@@ -28,12 +36,14 @@ async function initScreener() {
   if (SCREENER_INIT_DONE) {
     renderScreenerTable();
     if (!SCREENER_LTP_TIMER) startLTPRefresh();
+    startSSE();
     return;
   }
   setupControls();
   await loadStockList();
   await loadCachedData();
   SCREENER_INIT_DONE = true;
+  startSSE();
 }
 
 /* ============================================================
@@ -108,7 +118,7 @@ async function loadCachedData() {
     const d = await r.json();
     if (!d.ok) return;
 
-    // Load cached candles (only the passing ones come back here — that's fine)
+    /* Load cached candles that passed the strategy */
     SCREENER_ALL_CANDLES = {};
     if (d.results) {
       for (const item of d.results) {
@@ -121,12 +131,12 @@ async function loadCachedData() {
       }
     }
 
-    // Track which tokens are already saved on the server
+    /* Track which tokens are already saved on the server */
     if (Array.isArray(d.cachedTokens)) {
       d.cachedTokens.forEach(t => SCREENER_CACHED_TOKENS.add(String(t)));
     }
 
-    // Do NOT overwrite SCREENER_ALL_STOCKS — /api/stocks already has the full list
+    /* Do NOT overwrite SCREENER_ALL_STOCKS — /api/stocks already has the full list */
     recomputeFilteredStocks();
     renderScreenerTable();
 
@@ -154,7 +164,7 @@ async function startFetch() {
   const total = allTokens.length;
   let ok = 0, failed = 0;
 
-  // Only fetch what we haven't already saved on the server
+  /* Only fetch what we haven't already saved on the server */
   const missing = allTokens.filter(t => !SCREENER_CACHED_TOKENS.has(String(t)));
 
   if (!missing.length) {
@@ -165,14 +175,14 @@ async function startFetch() {
     btn.textContent = '⚡ Refresh';
     await loadLTP();
     startLTPRefresh();
+    startSSE();
     return;
   }
 
   setPill(`⏳ Fetching 0 / ${missing.length}...`, '#f39c12');
-  updateProgress(0, total);
+  updateProgress(total - missing.length, total);
 
   const alreadyCached = total - missing.length;
-  let done = alreadyCached;
 
   for (let i = 0; i < missing.length; i += BATCH_SIZE) {
     const batch = missing.slice(i, i + BATCH_SIZE);
@@ -191,7 +201,7 @@ async function startFetch() {
             SCREENER_ALL_CANDLES[item.token] = {
               open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5] || 0
             };
-            SCREENER_CACHED_TOKENS.add(String(item.token));   // remember it
+            SCREENER_CACHED_TOKENS.add(String(item.token));
             ok++;
           } else failed++;
         }
@@ -200,7 +210,7 @@ async function startFetch() {
       failed += batch.length;
     }
 
-    done = alreadyCached + i + batch.length;
+    const done = alreadyCached + i + batch.length;
     setPill(`⏳ Fetching ${done} / ${total}...`, '#f39c12');
     recomputeFilteredStocks();
     renderScreenerTable();
@@ -218,6 +228,7 @@ async function startFetch() {
 
   await loadLTP();
   startLTPRefresh();
+  startSSE();
 }
 
 function updateProgress(done, total) {
@@ -229,7 +240,7 @@ function updateProgress(done, total) {
 }
 
 /* ============================================================
-   SECTION 6 — LTP + ORB state
+   SECTION 6 — LTP + ORB state (REST poll, 30s backup)
    ============================================================ */
 async function loadLTP() {
   if (!SCREENER_STOCKS.length) return;
@@ -260,7 +271,48 @@ async function loadLTP() {
 
 function startLTPRefresh() {
   if (SCREENER_LTP_TIMER) clearInterval(SCREENER_LTP_TIMER);
-  SCREENER_LTP_TIMER = setInterval(() => loadLTP(), 15000);
+  /* ORB stage sync only — LTP now comes via SSE in real-time */
+  SCREENER_LTP_TIMER = setInterval(() => loadLTP(), 30000);
+}
+
+/* ============================================================
+   SECTION 6.1 — SSE real-time LTP push
+   Server batches ticks every 300ms and pushes here.
+   ============================================================ */
+function startSSE() {
+  if (SCREENER_SSE) return;
+  const url = API + '/api/screener/stream?token=' + encodeURIComponent(getToken());
+  SCREENER_SSE = new EventSource(url);
+
+  SCREENER_SSE.addEventListener('hello', () => {
+    console.log('📡 SSE connected');
+  });
+
+  SCREENER_SSE.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'ltp' && msg.ticks) {
+        let any = false;
+        for (const [token, price] of Object.entries(msg.ticks)) {
+          SCREENER_LTP[token] = price;
+          any = true;
+        }
+        if (any) renderScreenerTable();
+      }
+    } catch {}
+  };
+
+  SCREENER_SSE.onerror = () => {
+    /* EventSource auto-reconnects — just log */
+    console.warn('📡 SSE dropped — reconnecting...');
+  };
+}
+
+function stopSSE() {
+  if (SCREENER_SSE) {
+    SCREENER_SSE.close();
+    SCREENER_SSE = null;
+  }
 }
 
 /* ============================================================
@@ -269,7 +321,7 @@ function startLTPRefresh() {
 function resolveOrbStage(token, candle, ltp) {
   const orb = SCREENER_ORB[token] || { lowBroken: false, pullbackConfirmed: false, entrySignal: false };
 
-  if (orb.entrySignal)      return { label: '🎯 ENTRY SIGNAL', color: '#6C5CE7', weight: 700 };
+  if (orb.entrySignal)       return { label: '🎯 ENTRY SIGNAL', color: '#6C5CE7', weight: 700 };
   if (orb.pullbackConfirmed) return { label: '↩️ Pullback confirmed', color: '#f39c12', weight: 600 };
   if (orb.lowBroken)         return { label: '⬇️ Low Broken', color: '#f39c12', weight: 600 };
   if (ltp && candle) {

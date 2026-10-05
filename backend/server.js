@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v1.4
+   server.js — TradeAlgo Pro backend  |  v1.5
    ============================================================
 
    STRUCTURE:
@@ -18,32 +18,15 @@
     §12 Trading holidays (admin)
     §13 Screener routes + SSE stream
     §14 Closing prices (15:34 IST)
-    §15 DB cache loader
+    §15 DB cache loader + previous close loader
     §16 Start
 
-   DATA FLOW:
-    9:15 fetch → candles cached (memory + DB)
-                ↓
-    Angel WS subscribes to all active tokens
-                ↓
-    Every tick → update ORB stages (rare, instant) in DB
-                ↓
-    Every tick → broadcastLTP() → SSE push to browsers
-                ↓
-    Every tick → queueLtpWrite() (in-memory queue)
-                ↓
-    Every 5 min → flushLtpWrites() batch UPDATE to DB
-
-   SECURITY (v1.1):
-    - /api/login returns a short-lived pendingToken (5 min JWT)
-    - /api/complete-login verifies TOTP on the SERVER
-    - Generated passwords include a random suffix
-
-   CHANGELOG v1.4 (2026-10-05):
-    - Batched LTP DB writer — flush every LTP_FLUSH_MS (default 5 min)
-    - handleTick no longer fires one UPDATE per tick
-    - DB pool max: 10 → 20
-    - Fixes login latency during market hours
+   CHANGELOG v1.5 (2026-10-05):
+    - Added prevCloseCache + loadPrevCloseFromDB()
+    - Added fetchMissingPrevClose() — FULL quote batch (50/call)
+    - /api/screener/ltp now returns prevClose per token
+    - Daily refresh: after closing fetch, prevClose is updated
+    - Removed temporary test-full-quote endpoint
    ============================================================ */
 
 import express from 'express';
@@ -205,6 +188,74 @@ const getOrbState = (token, date) => orbState.get(`${token}_${date}`) || {
 
 
 /* ============================================================
+   SECTION 4.1 — PREVIOUS CLOSE (memory + DB + FULL quote fallback)
+   ============================================================ */
+/* prevCloseCache: token → previous trading session close price.
+   Populated from DB on boot. Missing tokens filled via Angel FULL quote. */
+const prevCloseCache = new Map();
+
+async function loadPrevCloseFromDB() {
+  try {
+    const activeTokens = STOCKS.map(s => String(s.token));
+    /* Grab the latest non-null prev_close for each token, from any date */
+    const { rows } = await db.query(
+      `SELECT DISTINCT ON (token) token, prev_close
+       FROM angel_15m_candle
+       WHERE prev_close IS NOT NULL AND token = ANY($1)
+       ORDER BY token, date DESC`,
+      [activeTokens]
+    );
+    for (const r of rows) {
+      prevCloseCache.set(String(r.token), +r.prev_close);
+    }
+    console.log(`💾 Loaded prevClose for ${rows.length} tokens from DB`);
+  } catch (e) { console.error('prevClose load failed:', e.message); }
+}
+
+async function fetchMissingPrevClose() {
+  const missing = STOCKS
+    .map(s => String(s.token))
+    .filter(t => !prevCloseCache.has(t));
+
+  if (!missing.length) {
+    console.log('✅ prevClose: nothing missing');
+    return;
+  }
+
+  console.log(`📥 prevClose: fetching ${missing.length} via FULL quote...`);
+
+  try {
+    const quotes = await getFullQuotesForTokens(missing);
+    let updated = 0;
+
+    const p = getScreenerPhase();
+    const date = p.date || new Date().toISOString().split('T')[0];
+
+    for (const q of quotes) {
+      if (!q || !q.close) continue;
+      const token = String(q.token);
+      const close = +q.close;
+      if (!Number.isFinite(close) || close <= 0) continue;
+
+      prevCloseCache.set(token, close);
+      updated++;
+
+      /* Save to DB — write to a row for the current screener date.
+         If row doesn't exist yet, we still save on the next fetch-batch. */
+      db.query(
+        `UPDATE angel_15m_candle SET prev_close=$1 WHERE date=$2 AND token=$3`,
+        [close, date, token]
+      ).catch(() => {});
+    }
+
+    console.log(`✅ prevClose: ${updated}/${missing.length} updated`);
+  } catch (e) {
+    console.error('prevClose fetch failed:', e.message);
+  }
+}
+
+
+/* ============================================================
    SECTION 5 — WEBSOCKET MANAGER + SSE BROADCAST + LTP BATCH WRITER
    ============================================================ */
 let wsStarted = false;
@@ -215,7 +266,7 @@ let wsConnectedTokens = 0;
    LTPs in memory and flush to DB once every LTP_FLUSH_MS.
    Cuts DB write load by ~1000x.
    Env var LTP_FLUSH_MS overrides default (5 min). */
-const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000); // default 5 min
+const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000);
 const ltpWriteQueue = new Map();   // token → { ltp, date }
 let ltpWriteTimer = null;
 
@@ -232,7 +283,6 @@ async function flushLtpWrites() {
   const entries = [...ltpWriteQueue.entries()];
   ltpWriteQueue.clear();
 
-  /* Group by date (usually all same) */
   const byDate = new Map();
   for (const [token, { ltp, date }] of entries) {
     if (!byDate.has(date)) byDate.set(date, []);
@@ -258,16 +308,10 @@ async function flushLtpWrites() {
   }
 }
 
-/* Flush pending LTP writes on shutdown */
 process.on('SIGTERM', async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
 process.on('SIGINT',  async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
 
-/* ---- SSE (Server-Sent Events) registry ----
-   Each browser that opens /api/screener/stream is added here.
-   When a WS tick arrives, we push the price to all of them.
-   Batching: we accumulate ticks in `ssePending` for 300ms and
-   send one combined message per interval — prevents flooding
-   the browser with 387 individual events per second. */
+/* ---- SSE registry ---- */
 const sseClients = new Set();
 let ssePending = new Map();
 let sseFlushTimer = null;
@@ -275,20 +319,16 @@ let sseFlushTimer = null;
 function broadcastLTP(token, ltp) {
   if (!sseClients.size) return;
   ssePending.set(String(token), ltp);
-
-  /* Already scheduled — the pending buffer will flush soon */
   if (sseFlushTimer) return;
 
   sseFlushTimer = setTimeout(() => {
     sseFlushTimer = null;
     if (!ssePending.size) return;
-
     const payload = `data: ${JSON.stringify({
       type: 'ltp',
       ticks: Object.fromEntries(ssePending)
     })}\n\n`;
     ssePending.clear();
-
     for (const c of sseClients) {
       try { c.res.write(payload); }
       catch { sseClients.delete(c); }
@@ -310,7 +350,6 @@ function handleTick(token, ltp) {
   const state = getOrbState(token, p.date);
   let changed = false;
 
-  /* Stage 1 — Low broken */
   if (!state.lowBroken && ltp < low) {
     state.lowBroken = true;
     state.firstLowBreakAt = new Date().toISOString();
@@ -322,7 +361,6 @@ function handleTick(token, ltp) {
     changed = true;
   }
 
-  /* Stage 2 — Pullback confirmed (price returned inside range) */
   if (state.lowBroken && !state.pullbackConfirmed && ltp > low && ltp < high) {
     state.pullbackConfirmed = true;
     state.firstPullbackAt = new Date().toISOString();
@@ -334,7 +372,6 @@ function handleTick(token, ltp) {
     changed = true;
   }
 
-  /* Stage 3 — Entry (high broken after pullback) */
   if (state.pullbackConfirmed && !state.entrySignal && ltp > high) {
     state.entrySignal = true;
     state.firstEntryAt = new Date().toISOString();
@@ -348,17 +385,11 @@ function handleTick(token, ltp) {
 
   if (changed) orbState.set(key, state);
 
-  /* Always update LTP cache (memory) */
   setCachedLTP(token, ltp);
-
-  /* Push to browsers in real time (~300ms batched) */
   broadcastLTP(token, ltp);
-
-  /* Queue LTP for batched DB write (flush every LTP_FLUSH_MS) */
   queueLtpWrite(token, ltp, p.date);
 }
 
-/* Start WS after 9:15 fetch is done and phase is 'ready' */
 function startWebSocketForReadyPhase() {
   if (wsStarted) return;
   const p = getScreenerPhase();
@@ -398,18 +429,15 @@ function stopWebSocketIfNeeded() {
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
   const dow = ist.getUTCDay();
 
-  /* Stop after 15:30 or on non-trading days */
   if (dow === 0 || dow === 6 || !isTradingDay(ist) || mins >= 930) {
     stopWS();
     wsStarted = false;
     wsConnectedTokens = 0;
-    /* Flush any remaining LTP writes before stopping */
     flushLtpWrites().catch(() => {});
     console.log('🔌 WS stopped');
   }
 }
 
-/* Watchdog: start/stop WS every 60s based on phase */
 setInterval(() => {
   const p = getScreenerPhase();
   if (p.phase === 'ready') startWebSocketForReadyPhase();
@@ -453,9 +481,6 @@ async function generateUsername(fullName, mobile) {
   }
 }
 
-/* ---- Password generator (v1.1 — random suffix) ----
-   Format:  {Name}@{last4}{special}{rand4}
-   Example: Ravi@3210#a7b2  */
 const generatePassword = (fullName, mobile) => {
   const first = (fullName || '').trim().split(/\s+/)[0] || 'User';
   const base = (first.charAt(0).toUpperCase() + first.slice(1).toLowerCase())
@@ -467,7 +492,6 @@ const generatePassword = (fullName, mobile) => {
   return `${base}@${last4}${sp}${rand}`;
 };
 
-/* ---- TOTP verification (server-side) ---- */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
 function base32Decode(str) {
@@ -507,9 +531,6 @@ function verifyTotpServer(secret, input) {
    ============================================================ */
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
 
-/* ---- POST /api/login ----------------------------------------
-   Step 1 of 2. Verifies password + account state, then returns
-   a short-lived pendingToken. Does NOT leak the user's totp_secret. */
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
   const clean = (input || '').trim().toLowerCase();
@@ -560,17 +581,11 @@ app.post('/api/login', async (req, res) => {
     name: user.name,
     needsSetup: !user.totp_secret,
     hasTotp: !!user.totp_secret
-    /* NOTE: totp_secret is intentionally NOT returned */
   });
 });
 
-/* ---- POST /api/complete-login -------------------------------
-   Step 2 of 2. Requires the pendingToken from /api/login.
-   Verifies the 6-digit TOTP code against the SERVER-HELD secret
-   before issuing the session JWT. */
 app.post('/api/complete-login', async (req, res) => {
   const { pendingToken, totpCode, totpSecret } = req.body;
-
   if (!pendingToken) return res.status(400).json({ error: 'Missing session token' });
 
   let payload;
@@ -910,14 +925,6 @@ app.delete('/api/admin/holidays/:date', auth, adminOnly, async (req, res) => {
    SECTION 13 — SCREENER ROUTES + SSE STREAM
    ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
-/* ---- TEMPORARY: test full quote for 1 token ---- */
-app.get('/api/admin/test-full-quote/:token', auth, adminOnly, async (req, res) => {
-  try {
-    const result = await getFullQuotesForTokens([req.params.token]);
-    const sym = SYM_BY_TOKEN[req.params.token] || '?';
-    res.json({ ok: true, token: req.params.token, sym, quote: result[0] || null });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
 app.get('/api/broker/status', auth, (req, res) => res.json(getSessionStatus()));
 app.get('/api/ws/status', auth, (req, res) => res.json(getWSStatus()));
 
@@ -960,9 +967,6 @@ app.get('/api/screener/data', auth, (req, res) => {
   });
 });
 
-/* ---- SSE stream — real-time LTP push -----------------------
-   Browser opens this once; server pushes each tick (batched 300ms).
-   Auth via ?token=<jwt> because EventSource can't set headers. */
 app.get('/api/screener/stream', (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(401).end();
@@ -1004,13 +1008,16 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
     for (const r of results) {
       const c = r.candle;
       if (Array.isArray(c) && c.length >= 5) {
+        const prevClose = prevCloseCache.get(String(r.token)) || null;
         db.query(
-          `INSERT INTO angel_15m_candle (date, token, sym, open, high, low, close, volume, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+          `INSERT INTO angel_15m_candle (date, token, sym, open, high, low, close, volume, prev_close, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
            ON CONFLICT (date, token) DO UPDATE SET
              sym=EXCLUDED.sym, open=EXCLUDED.open, high=EXCLUDED.high,
-             low=EXCLUDED.low, close=EXCLUDED.close, volume=EXCLUDED.volume, updated_at=NOW()`,
-          [p.date, r.token, SYM_BY_TOKEN[r.token] || '?', c[1], c[2], c[3], c[4], c[5] || 0]
+             low=EXCLUDED.low, close=EXCLUDED.close, volume=EXCLUDED.volume,
+             prev_close=COALESCE(EXCLUDED.prev_close, angel_15m_candle.prev_close),
+             updated_at=NOW()`,
+          [p.date, r.token, SYM_BY_TOKEN[r.token] || '?', c[1], c[2], c[3], c[4], c[5] || 0, prevClose]
         ).catch(() => {});
         if (!orbState.has(`${r.token}_${p.date}`)) {
           orbState.set(`${r.token}_${p.date}`, {
@@ -1025,7 +1032,7 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
 });
 
 /* Client polls this — reads from memory, no API calls.
-   Kept as fallback for ORB stage sync (SSE handles LTP). */
+   Returns LTP + ORB state + prevClose for Change % calculation. */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1037,9 +1044,11 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const token = String(t);
     const state = getOrbState(token, p.date);
     const ltp = getCachedLTP(token);
+    const prevClose = prevCloseCache.get(token) || null;
     return {
       token,
       ltp,
+      prevClose,
       lowBroken: state.lowBroken,
       pullbackConfirmed: state.pullbackConfirmed,
       entrySignal: state.entrySignal,
@@ -1069,9 +1078,12 @@ async function fetchClosingPrices() {
       setCachedLTP(r.token, r.price);
       queueLtpWrite(r.token, r.price, p.date);
     }
-    /* Force flush immediately so closing prices are saved before shutdown */
     await flushLtpWrites();
     console.log(`✅ Closing prices: ${ok.length}/${tokens.length} (failed: ${failed.length})`);
+
+    /* After closing prices saved, refresh prevClose for tomorrow */
+    console.log('🔁 Refreshing prevClose for next session...');
+    await fetchMissingPrevClose();
   } catch (e) { console.error('Closing fetch failed:', e.message); }
 }
 
@@ -1150,6 +1162,10 @@ app.listen(PORT, async () => {
 
   await loadHolidaysFromDB();
   await loadScreenerCacheFromDB();
+  await loadPrevCloseFromDB();
+
+  /* Fetch missing prevClose in background (non-blocking) */
+  fetchMissingPrevClose().catch(e => console.error('prevClose fetch err:', e.message));
 
   const nowIST = getIST();
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
@@ -1160,5 +1176,5 @@ app.listen(PORT, async () => {
   }
   scheduleClosingFetch();
 
-  console.log('ℹ️  Ready — manual fetch + live WS + SSE push + batched LTP writes');
+  console.log('ℹ️  Ready — manual fetch + live WS + SSE push + batched LTP writes + prevClose');
 });

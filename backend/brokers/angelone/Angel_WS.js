@@ -203,18 +203,19 @@ function clearTimers() {
 function parseTick(buffer) {
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
 
-  if (buf.length !== 51 && buf.length !== 52) {
-    return null;
-  }
+  /* Angel One LTP mode = 51 bytes exactly:
+       [0]     mode
+       [1]     exchange type
+       [2-26]  token (25 bytes, null-padded ASCII)
+       [27-34] sequence
+       [35-42] timestamp
+       [43-50] LTP (big-endian double) */
+  if (buf.length !== 51) return null;
 
-  /* Token starts at byte 2 for 52-byte, byte 1 for 51-byte.
-     Slice generously and trim nulls — safe for both. */
-  const tokenStart = buf.length === 52 ? 2 : 1;
-  const token = buf.slice(tokenStart, tokenStart + 25).toString('ascii').replace(/\0+$/, '').trim();
+  const token = buf.slice(2, 27).toString('ascii').replace(/\0+$/, '').trim();
   if (!token) return null;
 
-  /* LTP is always last 8 bytes (big-endian double) */
-  const ltp = buf.readDoubleBE(buf.length - 8);
+  const ltp = buf.readDoubleBE(43);
   if (!ltp || isNaN(ltp) || ltp <= 0) return null;
 
   return { token, ltp };

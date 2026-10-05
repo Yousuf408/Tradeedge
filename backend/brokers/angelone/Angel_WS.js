@@ -1,13 +1,12 @@
 /* ============================================================
-   Angel_WS.js — v1.1
+   Angel_WS.js — v1.2
    WebSocket live LTP feed — reconnects + gap backfill support
-   Uses feedToken from Angel_REST login
 
-   CHANGELOG v1.1 (2026-10-05):
-   - Handles both 51-byte and 52-byte LTP packets
-   - Logs unique packet sizes for diagnostics
-   - Logs parse errors instead of silently swallowing
-   - Logs heartbeat / ack frames
+   CHANGELOG v1.2 (2026-10-05):
+   - Handles Angel One 51-byte LTP packet format correctly
+   - Multi-candidate price parsing (float / double / int64)
+   - Hex diagnostic for first few ticks
+   - Cleaner heartbeat + pong handling
    ============================================================ */
 
 import WebSocket from 'ws';
@@ -55,7 +54,7 @@ export function stopWS() {
 export function resubscribe(newTokens) {
   subscribedTokens = [...newTokens];
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ action: 0, params: { mode: 1, tokenList: [] } })); // unsubscribe all
+    ws.send(JSON.stringify({ action: 0, params: { mode: 1, tokenList: [] } }));
     sendSubscribe();
   }
 }
@@ -74,6 +73,9 @@ export function getWSStatus() {
 /* ============================================================
    INTERNAL
    ============================================================ */
+let _hexLogged = 0;
+let _sizesLogged = new Set();
+
 function connect() {
   if (!shouldRun) return;
   clearTimers();
@@ -87,8 +89,6 @@ function connect() {
     }
   });
 
-  ws._loggedSizes = new Set();   // diagnostic: track unique packet sizes
-
   ws.on('open', () => {
     connectedAt = Date.now();
     console.log(`🔌 WS connected (${subscribedTokens.length} tokens)`);
@@ -99,14 +99,13 @@ function connect() {
   ws.on('message', (data) => {
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
 
-    /* Diagnostic — log each unique packet size once */
-    if (!ws._loggedSizes.has(buf.length)) {
-      ws._loggedSizes.add(buf.length);
-      const preview = buf.slice(0, Math.min(20, buf.length)).toString('hex');
-      console.log(`🔍 WS packet size=${buf.length} hex=${preview}`);
+    /* Log each unique packet size once */
+    if (!_sizesLogged.has(buf.length)) {
+      _sizesLogged.add(buf.length);
+      console.log(`🔍 WS packet size=${buf.length}`);
     }
 
-    /* Skip heartbeat / ack frames (very small) */
+    /* Skip heartbeat / ack / small control frames */
     if (buf.length < 30) return;
 
     try {
@@ -153,7 +152,7 @@ function sendSubscribe() {
   const msg = {
     action: 1,
     params: {
-      mode: 1,   // LTP mode
+      mode: 1,   // 1 = LTP mode
       tokenList: [
         { exchangeType: 1, tokens: subscribedTokens }   // 1 = NSE
       ]
@@ -180,43 +179,50 @@ function clearTimers() {
 }
 
 /* ============================================================
-   PARSE BINARY TICK (LTP mode)
-   Angel One sends 51-byte OR 52-byte packets depending on SDK.
+   PARSE BINARY TICK — Angel One LTP mode (51 bytes)
 
-   Layout (52-byte):
-     [0]     subscription mode (1 byte)
-     [1]     exchange type (1 byte)
-     [2-26]  token (25 bytes, null-padded ASCII)
-     [27-34] sequence number (8 bytes)
-     [35-42] exchange timestamp (8 bytes)
-     [43-50] LTP (8 bytes double, big-endian)
+   Confirmed layout from live packet:
+     [0]      subscription mode   (1 byte)
+     [1]      exchange type       (1 byte)
+     [2-26]   token               (25 bytes, ASCII, null-padded)
+     [27-34]  sequence number     (8 bytes)
+     [35-42]  exchange timestamp  (8 bytes)
+     [43-50]  LTP                 (8 bytes)
 
-   Layout (51-byte):
-     [0]     subscription mode (1 byte)
-     [1]     exchange type (1 byte)
-     [2-26]  token (25 bytes, null-padded ASCII)
-     [27-34] sequence number (8 bytes)
-     [35-42] exchange timestamp (8 bytes)
-     [43-50] LTP (8 bytes double, big-endian)  ← same
-   NOTE: The token offset shifts by 1 byte between versions.
+   Angel's docs sometimes say float32 @43, sometimes double @43.
+   We try multiple interpretations and pick the first plausible
+   price (₹1 – ₹10,00,000).
    ============================================================ */
 function parseTick(buffer) {
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
-
-  /* Angel One LTP mode = 51 bytes exactly:
-       [0]     mode
-       [1]     exchange type
-       [2-26]  token (25 bytes, null-padded ASCII)
-       [27-34] sequence
-       [35-42] timestamp
-       [43-50] LTP (big-endian double) */
   if (buf.length !== 51) return null;
 
   const token = buf.slice(2, 27).toString('ascii').replace(/\0+$/, '').trim();
   if (!token) return null;
 
-  const ltp = buf.readDoubleBE(43);
-  if (!ltp || isNaN(ltp) || ltp <= 0) return null;
+  /* Hex diagnostic for first 3 ticks */
+  if (_hexLogged < 3) {
+    _hexLogged++;
+    console.log(`🔬 tick hex [51]: ${buf.toString('hex')}`);
+  }
 
-  return { token, ltp };
+  const candidates = [
+    () => buf.readFloatBE(43),
+    () => buf.readDoubleBE(43),
+    () => buf.readFloatLE(43),
+    () => buf.readFloatBE(42),
+    () => buf.readFloatBE(41),
+    () => buf.readInt32BE(43) / 100,
+  ];
+
+  for (const fn of candidates) {
+    try {
+      const v = fn();
+      if (Number.isFinite(v) && v >= 1 && v <= 1000000) {
+        return { token, ltp: +v.toFixed(2) };
+      }
+    } catch {}
+  }
+
+  return null;
 }

@@ -1,11 +1,13 @@
 /* ============================================================
-   SCREENER.JS
+   SCREENER.JS  — v1.1
    Multi-strategy + ORB stage tracking + timestamps
+   + cachedTokens tracking (survives browser crash)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
 let SCREENER_STOCKS = [];
 let SCREENER_ALL_CANDLES = {};
+let SCREENER_CACHED_TOKENS = new Set();   // tokens already saved server-side
 let SCREENER_LTP = {};
 let SCREENER_ORB = {};
 let SCREENER_INIT_DONE = false;
@@ -16,8 +18,8 @@ const CURRENT_STRATEGY = 'advance_orb';
 const STRATEGY_FILTER = { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 };
 
 let PER_TRADE = 10000;
-const BATCH_SIZE = 50;
-const BATCH_DELAY = 500;
+const BATCH_SIZE = 100;      // was 50 — fewer round trips
+const BATCH_DELAY = 250;     // was 500
 
 /* ============================================================
    SECTION 1 — INIT
@@ -106,6 +108,7 @@ async function loadCachedData() {
     const d = await r.json();
     if (!d.ok) return;
 
+    // Load cached candles (only the passing ones come back here — that's fine)
     SCREENER_ALL_CANDLES = {};
     if (d.results) {
       for (const item of d.results) {
@@ -117,7 +120,13 @@ async function loadCachedData() {
         }
       }
     }
-    if (d.stocks) SCREENER_ALL_STOCKS = d.stocks.length ? d.stocks : SCREENER_ALL_STOCKS;
+
+    // Track which tokens are already saved on the server
+    if (Array.isArray(d.cachedTokens)) {
+      d.cachedTokens.forEach(t => SCREENER_CACHED_TOKENS.add(String(t)));
+    }
+
+    // Do NOT overwrite SCREENER_ALL_STOCKS — /api/stocks already has the full list
     recomputeFilteredStocks();
     renderScreenerTable();
 
@@ -145,7 +154,8 @@ async function startFetch() {
   const total = allTokens.length;
   let ok = 0, failed = 0;
 
-  const missing = allTokens.filter(t => !SCREENER_ALL_CANDLES[t]);
+  // Only fetch what we haven't already saved on the server
+  const missing = allTokens.filter(t => !SCREENER_CACHED_TOKENS.has(String(t)));
 
   if (!missing.length) {
     setPill('✅ Already cached', 'var(--success)');
@@ -158,9 +168,14 @@ async function startFetch() {
     return;
   }
 
+  setPill(`⏳ Fetching 0 / ${missing.length}...`, '#f39c12');
+  updateProgress(0, total);
+
+  const alreadyCached = total - missing.length;
+  let done = alreadyCached;
+
   for (let i = 0; i < missing.length; i += BATCH_SIZE) {
     const batch = missing.slice(i, i + BATCH_SIZE);
-    setPill(`⏳ Fetching ${i + batch.length} / ${missing.length}...`, '#f39c12');
 
     try {
       const r = await fetch(API + '/api/screener/fetch-batch', {
@@ -176,21 +191,27 @@ async function startFetch() {
             SCREENER_ALL_CANDLES[item.token] = {
               open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5] || 0
             };
+            SCREENER_CACHED_TOKENS.add(String(item.token));   // remember it
             ok++;
           } else failed++;
         }
       }
-      recomputeFilteredStocks();
-      renderScreenerTable();
-      updateProgress(total - missing.length + i + batch.length, total);
-    } catch (e) { failed += batch.length; }
+    } catch (e) {
+      failed += batch.length;
+    }
+
+    done = alreadyCached + i + batch.length;
+    setPill(`⏳ Fetching ${done} / ${total}...`, '#f39c12');
+    recomputeFilteredStocks();
+    renderScreenerTable();
+    updateProgress(done, total);
 
     if (i + BATCH_SIZE < missing.length) {
       await new Promise(r => setTimeout(r, BATCH_DELAY));
     }
   }
 
-  setPill(`✅ Done — ok:${ok} · passing:${SCREENER_STOCKS.length}`, 'var(--success)');
+  setPill(`✅ Done — new:${ok} · failed:${failed} · passing:${SCREENER_STOCKS.length}`, 'var(--success)');
   FETCHING = false;
   btn.disabled = false;
   btn.textContent = '⚡ Refresh';

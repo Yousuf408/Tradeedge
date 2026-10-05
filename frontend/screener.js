@@ -18,8 +18,8 @@ const CURRENT_STRATEGY = 'advance_orb';
 const STRATEGY_FILTER = { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 };
 
 let PER_TRADE = 10000;
-const BATCH_SIZE = 100;      // was 50 — fewer round trips
-const BATCH_DELAY = 250;     // was 500
+const BATCH_SIZE = 20;      // was 50 — fewer round trips
+const BATCH_DELAY = 150;     // was 500
 
 /* ============================================================
    SECTION 1 — INIT

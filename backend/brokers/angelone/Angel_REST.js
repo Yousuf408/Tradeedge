@@ -445,3 +445,43 @@ export function getCachedLTP(token) {
 }
 
 export function getFeedToken() { return session.feedToken; }
+
+/* ============================================================
+   FULL QUOTE — batch (50/call)
+   Returns LTP, OHLC and previous close for each token.
+   Previous close = last completed trading session's close
+   (Angel handles weekends/holidays automatically).
+   ============================================================ */
+export async function getFullQuotesForTokens(tokens) {
+  const ok = await ensureLoggedIn();
+  if (!ok) return [];
+
+  const out = [];
+
+  for (let i = 0; i < tokens.length; i += 50) {
+    const batch = tokens.slice(i, i + 50).map(String);
+    try {
+      const r = await post('/rest/secure/angelbroking/market/v1/quote', {
+        mode: 'FULL',
+        exchangeTokens: { NSE: batch }
+      });
+      if (r.status && r.data?.fetched) {
+        for (const q of r.data.fetched) {
+          out.push({
+            token: String(q.symbolToken),
+            ltp: q.ltp,
+            open: q.open,
+            high: q.high,
+            low: q.low,
+            close: q.close           // ← previous trading session close
+          });
+        }
+      }
+    } catch (e) {
+      console.error('FULL quote batch failed:', e.message);
+    }
+    if (i + 50 < tokens.length) await sleep(400);
+  }
+
+  return out;
+}

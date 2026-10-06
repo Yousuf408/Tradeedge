@@ -419,11 +419,25 @@ function handleTick(token, ltp) {
   const p = getScreenerPhase();
   if (p.phase !== 'ready' || !p.date) return;
 
+   /* Baseline source priority:
+     1. REST 9:15 candle (preferred — accurate)
+     2. Quote H/L (fallback — if REST missing)
+     3. Skip tick (neither available) */
+  let low, high;
   const candleArr = getCachedCandles([token], p.date)[0]?.candle;
-  if (!Array.isArray(candleArr) || candleArr.length < 5) return;
-
-  const low = +candleArr[3];
-  const high = +candleArr[2];
+  if (Array.isArray(candleArr) && candleArr.length >= 5) {
+    low = +candleArr[3];
+    high = +candleArr[2];
+  } else {
+    const q = quoteCache.get(token);
+    if (q && Number.isFinite(q.high) && Number.isFinite(q.low) && q.high > 0 && q.low > 0) {
+      low = q.low;
+      high = q.high;
+    } else {
+      return;   // neither source available — skip this tick
+    }
+  }
+   
   const key = `${token}_${p.date}`;
   const state = getOrbState(token, p.date);
   let changed = false;

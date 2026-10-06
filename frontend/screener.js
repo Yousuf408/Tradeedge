@@ -1,15 +1,7 @@
 /* ============================================================
-   SCREENER.JS  — v2.1
-   + Auto-quote SSE handling (type: 'quote')
-   + ORB state SSE handling (type: 'orb')
-   + Price display in NEW LOW / PULLBACK / BREAKOUT
-   + Green tick / red cross for Target / SL hit
-
-   CHANGELOG v2.1 (2026-10-06):
-   - SSE 'orb' event → instant ORB state update (no 30s wait)
-   - SSE 'quote' event → instant quote H/L update
-   - NEW LOW / PULLBACK / BREAKOUT show TIME + PRICE
-   - Target / SL cell shows ✓ (hit) or ✗ (SL hit)
+   SCREENER.JS  — v2.2
+   + Strategy dropdown (Advance ORB / Momentum)
+   + Momentum columns ready (logic tomorrow)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -29,6 +21,7 @@ let QUOTE_FETCHING = false;
 let SCREENER_STAGE_FILTER = 'all';
 let SCREENER_SORT_BY = 'change';
 let SCREENER_SORT_DIR = 'desc';
+let SCREENER_ACTIVE_STRATEGY = 'advance_orb';
 
 const NIFTY50_TOKEN = '99926000';
 
@@ -70,6 +63,13 @@ function setupControls() {
   controls.querySelectorAll('button, label').forEach(el => el.style.display = 'none');
 
   controls.innerHTML = `
+    <select id="strategyDropdown" onchange="onStrategyChange(this.value)"
+            style="padding:7px 14px;border:1.5px solid var(--border-soft);border-radius:8px;
+                   font-size:13px;font-weight:600;font-family:inherit;
+                   background:var(--bg-secondary);color:var(--text-primary);cursor:pointer">
+      <option value="advance_orb">🔍 Advance ORB</option>
+      <option value="momentum">🚀 Momentum</option>
+    </select>
     <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
     <button id="fetchQuoteBtn" class="btn btn-outline" onclick="startQuoteFetch()">📊 Fetch Quote H/L</button>
     <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">Per-Trade ₹</label>
@@ -84,6 +84,10 @@ function setupControls() {
       <div id="progressText" style="font-size:11px;color:var(--text-muted);margin-top:4px;text-align:center">0 / 0</div>
     </div>`;
 
+  /* Sync dropdown to active strategy */
+  const dd = document.getElementById('strategyDropdown');
+  if (dd) dd.value = SCREENER_ACTIVE_STRATEGY;
+
   const panelGlass = controls.closest('.panel-glass');
   if (panelGlass && !document.getElementById('stageChips')) {
     const chips = document.createElement('div');
@@ -96,6 +100,11 @@ function setupControls() {
 
 function onPerTradeChange() {
   PER_TRADE = +document.getElementById('perTradeInput').value || 10000;
+  renderScreenerTable();
+}
+
+function onStrategyChange(value) {
+  SCREENER_ACTIVE_STRATEGY = value;
   renderScreenerTable();
 }
 
@@ -311,7 +320,6 @@ function updateLTPCells(ticks) {
 
 /* ============================================================
    SECTION 3.4 — ORB ROW FAST UPDATE (SSE 'orb' path)
-   Only updates the row that changed — no full re-render.
    ============================================================ */
 function updateORBRow(token, state) {
   SCREENER_ORB[token] = {
@@ -331,12 +339,8 @@ function updateORBRow(token, state) {
   };
 
   const row = document.querySelector(`#screenerBody tr[data-token="${token}"]`);
-  if (!row) {
-    /* Row not visible right now (maybe filtered out) — full render next poll */
-    return;
-  }
+  if (!row) return;
 
-  /* Update NEW LOW cell */
   const nlCell = row.querySelector('.cell-newlow');
   if (nlCell) {
     nlCell.innerHTML = state.lowBroken
@@ -344,7 +348,6 @@ function updateORBRow(token, state) {
       : '—';
   }
 
-  /* Update PULLBACK cell */
   const pbCell = row.querySelector('.cell-pullback');
   if (pbCell) {
     pbCell.innerHTML = state.pullbackConfirmed
@@ -352,7 +355,6 @@ function updateORBRow(token, state) {
       : '—';
   }
 
-  /* Update BREAKOUT cell */
   const boCell = row.querySelector('.cell-breakout');
   if (boCell) {
     boCell.innerHTML = state.entrySignal
@@ -360,7 +362,6 @@ function updateORBRow(token, state) {
       : '—';
   }
 
-  /* Update ORB STAGE cell */
   const stageCell = row.querySelector('.cell-stage');
   if (stageCell) {
     const stage = resolveOrbStage(token, SCREENER_ALL_CANDLES[token], SCREENER_LTP[token]);
@@ -369,18 +370,15 @@ function updateORBRow(token, state) {
     stageCell.textContent = stage.label;
   }
 
-  /* Update Target/SL cell (tick / cross) */
   const tslCell = row.querySelector('.cell-targetsl');
   if (tslCell && SCREENER_ALL_CANDLES[token]) {
     const c = SCREENER_ALL_CANDLES[token];
     tslCell.innerHTML = renderTargetSL(c, SCREENER_ORB[token]);
   }
 
-  /* Add/remove row-signal highlight */
   if (state.entrySignal) row.classList.add('row-signal');
   else row.classList.remove('row-signal');
 
-  /* Update ACTION cell (buy button) */
   const actionCell = row.querySelector('.cell-action');
   if (actionCell) {
     actionCell.innerHTML = state.entrySignal
@@ -389,7 +387,6 @@ function updateORBRow(token, state) {
   }
 }
 
-/* Helper: render time + price stacked */
 function renderTimePrice(isoStr, price) {
   if (!isoStr) return '—';
   const t = formatTimeIST(isoStr);
@@ -398,7 +395,6 @@ function renderTimePrice(isoStr, price) {
          (p ? `<span style="display:block;font-size:10px;color:var(--text-muted);font-family:ui-monospace,monospace">${p}</span>` : '');
 }
 
-/* Helper: render Target / SL with hit indicator */
 function renderTargetSL(c, orb) {
   const target = c.high * 1.01;
   const sl = c.low;
@@ -664,7 +660,6 @@ function startLTPRefresh() {
 
 /* ============================================================
    SECTION 6.1 — SSE real-time push
-   Handles: 'ltp', 'orb', 'quote'
    ============================================================ */
 function startSSE() {
   if (SCREENER_SSE) return;
@@ -679,7 +674,6 @@ function startSSE() {
     try {
       const msg = JSON.parse(e.data);
 
-      /* --- LTP tick --- */
       if (msg.type === 'ltp' && msg.ticks) {
         if (msg.ticks[NIFTY50_TOKEN] !== undefined) {
           SCREENER_LTP[NIFTY50_TOKEN] = msg.ticks[NIFTY50_TOKEN];
@@ -687,20 +681,15 @@ function startSSE() {
         }
         updateLTPCells(msg.ticks);
       }
-
-      /* --- ORB stage change --- */
       else if (msg.type === 'orb' && msg.token && msg.state) {
         updateORBRow(msg.token, msg.state);
       }
-
-      /* --- Quote H/L update (auto or manual) --- */
       else if (msg.type === 'quote' && msg.quotes) {
         for (const [token, q] of Object.entries(msg.quotes)) {
           SCREENER_QUOTE[token] = { high: q.high, low: q.low, fetchedAt: q.fetchedAt };
         }
         renderScreenerTable();
       }
-
     } catch {}
   };
 
@@ -740,6 +729,40 @@ function renderScreenerTable() {
   const body = document.getElementById('screenerBody');
   const count = document.getElementById('screenerCount');
   if (!head || !body) return;
+
+  /* ============================================================
+     MOMENTUM STRATEGY — columns ready, logic tomorrow
+     ============================================================ */
+  if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
+    head.innerHTML = `<tr>
+      <th>Stock / Company</th>
+      <th>LTP / Chg %</th>
+      <th>Pivot</th>
+      <th>20 EMA</th>
+      <th>9:15 Range (H / L)</th>
+      <th>Target / SL</th>
+      <th>MAXQTY</th>
+      <th>BREAKOUT</th>
+      <th>LAST UPDATE</th>
+      <th>STAGE</th>
+      <th>ACTION</th>
+    </tr>`;
+    body.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:60px;color:var(--text-muted);line-height:1.9">
+      🚀 <strong>Momentum strategy</strong> — columns ready<br>
+      <span style="font-size:12px">Logic will be implemented soon.</span><br>
+      <span style="font-size:11px;opacity:0.7">Switch back to <strong>🔍 Advance ORB</strong> to continue.</span>
+    </td></tr>`;
+    if (count) count.textContent = `Momentum — columns ready`;
+    const chips = document.getElementById('stageChips');
+    if (chips) chips.style.display = 'none';
+    return;
+  }
+
+  /* ============================================================
+     ADVANCE ORB — existing logic (unchanged)
+     ============================================================ */
+  const chipsEl = document.getElementById('stageChips');
+  if (chipsEl) chipsEl.style.display = '';
 
   head.innerHTML = `<tr>
     <th>Stock / Company</th>
@@ -816,7 +839,6 @@ function renderScreenerTable() {
       quoteCell = '<span style="color:var(--text-muted)">—</span>';
     }
 
-    /* NEW LOW / PULLBACK / BREAKOUT — time + price */
     const newLowCell    = orb.lowBroken ? renderTimePrice(orb.newLowAt, orb.lowBreakPrice) : '—';
     const pullbackCell  = orb.pullbackConfirmed ? renderTimePrice(orb.pullbackAt, orb.pullbackPrice) : '—';
     const breakoutCell  = orb.entrySignal ? renderTimePrice(orb.breakoutAt, orb.entryPrice) : '—';

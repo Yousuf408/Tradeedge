@@ -92,6 +92,10 @@ STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
 
 const NIFTY50_TOKEN = '99926000';
 
+/* Entry signal cutoff — 14:45 IST (885 min).
+   After this, no new entry signals are generated. */
+const ENTRY_CUTOFF_MINS = Number(process.env.ENTRY_CUTOFF_MINS || 885);
+
 const STRATEGIES = {
   advance_orb: {
     id: 'advance_orb',
@@ -470,18 +474,24 @@ function handleTick(token, ltp) {
     changed = true;
   }
 
-  /* Stage 3 — Entry signal (breakout) */
+    /* Stage 3 — Entry signal (breakout)
+     Skipped after ENTRY_CUTOFF_MINS (14:45 IST) */
   if (state.pullbackConfirmed && !state.entrySignal && ltp > high) {
-    state.entrySignal = true;
-    state.firstEntryAt = new Date().toISOString();
-    state.firstEntryPrice = ltp;
-    db.query(
-      `UPDATE angel_15m_candle
-       SET entry_signal=true, first_entry_at=NOW(), first_entry_price=$3
-       WHERE date=$1 AND token=$2 AND entry_signal=false`,
-      [p.date, token, ltp]
-    ).catch(() => {});
-    changed = true;
+    const ist = getIST();
+    const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+    if (mins < ENTRY_CUTOFF_MINS) {
+      state.entrySignal = true;
+      state.firstEntryAt = new Date().toISOString();
+      state.firstEntryPrice = ltp;
+      db.query(
+        `UPDATE angel_15m_candle
+         SET entry_signal=true, first_entry_at=NOW(), first_entry_price=$3
+         WHERE date=$1 AND token=$2 AND entry_signal=false`,
+        [p.date, token, ltp]
+      ).catch(() => {});
+      changed = true;
+    }
+    /* After cutoff — silently ignore. No DB write, no UI update. */
   }
 
   /* Stage 4 — Target / SL hit (only after entry, once) */

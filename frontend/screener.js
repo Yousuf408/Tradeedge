@@ -1,14 +1,15 @@
 /* ============================================================
-   SCREENER.JS  — v1.8
+   SCREENER.JS  — v1.9
    ORB + timestamps + cachedTokens + SSE + NIFTY 50 header
    + Filter chips + Column sort + Entry-signal row highlight
-   + Compact controls (no Ready pill, no range hint)
+   + Compact controls
+   + Quote H/L column (parallel to REST 9:15 for testing)
 
-   CHANGELOG v1.8 (2026-10-05):
-   - Removed "Ready" status pill (redundant)
-   - Removed "Range ≤ …" hint text
-   - NIFTY header: arrow ▲ ▼ between LTP and change
-   - NIFTY color matches direction (whole row colored)
+   CHANGELOG v1.9 (2026-10-06):
+   - New button: "📊 Fetch Quote H/L" (FULL quote, parallel method)
+   - New column: "Quote H/L" next to 9:15 Range
+   - SCREENER_QUOTE map stores quote data per token
+   - Existing REST 9:15 fetch + button — UNTOUCHED
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -17,11 +18,13 @@ let SCREENER_ALL_CANDLES = {};
 let SCREENER_CACHED_TOKENS = new Set();
 let SCREENER_LTP = {};
 let SCREENER_PREV_CLOSE = {};
+let SCREENER_QUOTE = {};          // token → { high, low, fetchedAt }
 let SCREENER_ORB = {};
 let SCREENER_INIT_DONE = false;
 let SCREENER_LTP_TIMER = null;
 let SCREENER_SSE = null;
 let FETCHING = false;
+let QUOTE_FETCHING = false;
 
 let SCREENER_STAGE_FILTER = 'all';
 let SCREENER_SORT_BY = 'change';
@@ -66,9 +69,9 @@ function setupControls() {
   });
   controls.querySelectorAll('button, label').forEach(el => el.style.display = 'none');
 
-  /* Compact control bar — Ready pill and Range hint removed */
   controls.innerHTML = `
     <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
+    <button id="fetchQuoteBtn" class="btn btn-outline" onclick="startQuoteFetch()">📊 Fetch Quote H/L</button>
     <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">Per-Trade ₹</label>
     <input id="perTradeInput" type="number" value="10000" min="100"
            style="width:110px;padding:7px 12px;border:1.5px solid var(--border-soft);border-radius:8px;
@@ -81,7 +84,6 @@ function setupControls() {
       <div id="progressText" style="font-size:11px;color:var(--text-muted);margin-top:4px;text-align:center">0 / 0</div>
     </div>`;
 
-  /* Inject filter chips container between panel-head and table-wrap */
   const panelGlass = controls.closest('.panel-glass');
   if (panelGlass && !document.getElementById('stageChips')) {
     const chips = document.createElement('div');
@@ -205,7 +207,7 @@ function recomputeFilteredStocks() {
 }
 
 /* ============================================================
-   SECTION 3.1 — CHANGE % HELPERS
+   SECTION 3.1 — HELPERS
    ============================================================ */
 function computeChangePct(token) {
   const ltp = SCREENER_LTP[token];
@@ -219,9 +221,17 @@ function formatPriceINR(v) {
   return v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+function formatTimeOnly(d) {
+  if (!d) return '';
+  try {
+    const dt = new Date(d);
+    const ist = new Date(dt.getTime() + 5.5 * 3600 * 1000);
+    return ist.toISOString().slice(11, 16);
+  } catch { return ''; }
+}
+
 /* ============================================================
    SECTION 3.2 — NIFTY 50 HEADER
-   Format:  22,555.75  ▲ +133.80 (+0.60%)  — whole row colored
    ============================================================ */
 function updateNiftyHeader() {
   const ltpEl = document.getElementById('niftyLtp');
@@ -293,6 +303,13 @@ async function loadCachedData() {
       d.cachedTokens.forEach(t => SCREENER_CACHED_TOKENS.add(String(t)));
     }
 
+    /* Load quote H/L if present */
+    if (d.quotes) {
+      for (const [token, q] of Object.entries(d.quotes)) {
+        SCREENER_QUOTE[token] = { high: q.high, low: q.low, fetchedAt: q.fetchedAt };
+      }
+    }
+
     recomputeFilteredStocks();
     renderScreenerTable();
 
@@ -304,7 +321,7 @@ async function loadCachedData() {
 }
 
 /* ============================================================
-   SECTION 5 — FETCH
+   SECTION 5 — FETCH 9:15 (REST, EXISTING — UNTOUCHED)
    ============================================================ */
 async function startFetch() {
   if (FETCHING) return;
@@ -334,7 +351,6 @@ async function startFetch() {
   }
 
   updateProgress(total - missing.length, total);
-
   const alreadyCached = total - missing.length;
 
   for (let i = 0; i < missing.length; i += BATCH_SIZE) {
@@ -359,9 +375,7 @@ async function startFetch() {
           } else failed++;
         }
       }
-    } catch (e) {
-      failed += batch.length;
-    }
+    } catch (e) { failed += batch.length; }
 
     const done = alreadyCached + i + batch.length;
     recomputeFilteredStocks();
@@ -380,6 +394,63 @@ async function startFetch() {
   await loadLTP();
   startLTPRefresh();
   startSSE();
+}
+
+/* ============================================================
+   SECTION 5.1 — FETCH QUOTE H/L (FULL quote, parallel method)
+   ============================================================ */
+async function startQuoteFetch() {
+  if (QUOTE_FETCHING) return;
+  if (!SCREENER_ALL_STOCKS.length) { showToast('⚠️ No stocks', ''); return; }
+
+  QUOTE_FETCHING = true;
+  const btn = document.getElementById('fetchQuoteBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Quote fetch...';
+  document.getElementById('progressBar').style.display = 'block';
+
+  const allTokens = SCREENER_ALL_STOCKS.map(s => String(s.token));
+  const total = allTokens.length;
+  let ok = 0, failed = 0;
+
+  /* FULL quote: 50 tokens per call internally (server handles batching) */
+  const QUOTE_BATCH = 50;
+
+  for (let i = 0; i < allTokens.length; i += QUOTE_BATCH) {
+    const batch = allTokens.slice(i, i + QUOTE_BATCH);
+
+    try {
+      const r = await fetch(API + '/api/screener/fetch-quote-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
+        body: JSON.stringify({ tokens: batch })
+      });
+      const d = await r.json();
+      if (d.results) {
+        for (const item of d.results) {
+          SCREENER_QUOTE[String(item.token)] = {
+            high: item.high,
+            low: item.low,
+            fetchedAt: d.fetchedAt
+          };
+          ok++;
+        }
+        failed += (batch.length - (d.results?.length || 0));
+      } else {
+        failed += batch.length;
+      }
+    } catch (e) { failed += batch.length; }
+
+    renderScreenerTable();
+    updateProgress(i + batch.length, total);
+  }
+
+  QUOTE_FETCHING = false;
+  btn.disabled = false;
+  btn.textContent = '📊 Refresh Quote';
+
+  const ts = formatTimeOnly(new Date().toISOString());
+  showToast('📊 Quote Done', `${ok} fetched · ${failed} failed · at ${ts} IST`);
 }
 
 function updateProgress(done, total) {
@@ -408,6 +479,13 @@ async function loadLTP() {
       for (const item of d.results) {
         if (item.ltp) SCREENER_LTP[item.token] = item.ltp;
         if (item.prevClose) SCREENER_PREV_CLOSE[item.token] = item.prevClose;
+        if (item.highQuote) {
+          SCREENER_QUOTE[item.token] = {
+            high: item.highQuote,
+            low: item.lowQuote,
+            fetchedAt: item.quoteFetchedAt
+          };
+        }
         if (item.token !== NIFTY50_TOKEN) {
           SCREENER_ORB[item.token] = {
             lowBroken: !!item.lowBroken,
@@ -432,7 +510,7 @@ function startLTPRefresh() {
 }
 
 /* ============================================================
-   SECTION 6.1 — SSE real-time LTP push
+   SECTION 6.1 — SSE real-time LTP push (UNTOUCHED)
    ============================================================ */
 function startSSE() {
   if (SCREENER_SSE) return;
@@ -511,6 +589,7 @@ function renderScreenerTable() {
     <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
         <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
     <th class="th-sortable" onclick="setSort('range')">9:15 Range (H / L) ${sortIndicator('range')}</th>
+    <th>Quote H / L</th>
     <th>Target / SL</th>
     <th>MAXQTY</th>
     <th>NEW LOW</th>
@@ -522,7 +601,7 @@ function renderScreenerTable() {
   </tr>`;
 
   if (!SCREENER_STOCKS.length) {
-    body.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:60px;color:var(--text-muted)">
+    body.innerHTML = `<tr><td colspan="12" style="text-align:center;padding:60px;color:var(--text-muted)">
       No stocks match the strategy filter yet.<br>
       Click <strong>⚡ Fetch 9:15 Candles</strong> to load data.
     </td></tr>`;
@@ -539,7 +618,7 @@ function renderScreenerTable() {
   const sorted = sortStocks(filtered);
 
   if (!sorted.length) {
-    body.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:40px;color:var(--text-muted)">
+    body.innerHTML = `<tr><td colspan="12" style="text-align:center;padding:40px;color:var(--text-muted)">
       No stocks in this category.
     </td></tr>`;
     if (count) count.textContent = `${SCREENER_STOCKS.length} / ${SCREENER_ALL_STOCKS.length} match filter`;
@@ -551,6 +630,7 @@ function renderScreenerTable() {
     const c = SCREENER_ALL_CANDLES[s.token];
     const ltp = SCREENER_LTP[s.token];
     const orb = SCREENER_ORB[s.token] || {};
+    const quote = SCREENER_QUOTE[s.token];
 
     const sl = c.low;
     const target = c.high * 1.01;
@@ -566,6 +646,17 @@ function renderScreenerTable() {
       const isPos = changePct >= 0;
       const color = isPos ? 'var(--success)' : 'var(--danger)';
       changeLine = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
+    }
+
+    let quoteCell;
+    if (quote) {
+      const qt = formatTimeOnly(quote.fetchedAt);
+      quoteCell = `
+        <span class="cell-primary" style="color:var(--success)">H: ₹${(+quote.high).toFixed(2)}</span>
+        <span class="cell-sub" style="color:var(--danger)">L: ₹${(+quote.low).toFixed(2)}</span>
+        <span style="display:block;font-size:9px;color:var(--text-muted);margin-top:2px;font-family:ui-monospace,monospace">${qt}</span>`;
+    } else {
+      quoteCell = '<span style="color:var(--text-muted)">—</span>';
     }
 
     const newLowTime    = formatTimeIST(orb.newLowAt);
@@ -585,6 +676,7 @@ function renderScreenerTable() {
         <span class="cell-primary" style="color:var(--success)">H: ₹${c.high.toFixed(2)}</span>
         <span class="cell-sub" style="color:var(--danger)">L: ₹${c.low.toFixed(2)}</span>
       </td>
+      <td style="white-space:nowrap">${quoteCell}</td>
       <td style="white-space:nowrap">
         <span class="cell-primary" style="color:#6C5CE7">T: ₹${target.toFixed(2)}</span>
         <span class="cell-sub" style="color:var(--text-secondary)">SL: ₹${sl.toFixed(2)}</span>

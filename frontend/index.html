@@ -9,12 +9,12 @@
 <script>
   // Apply saved theme before page renders (avoids flash)
   (function() {
-    const saved = localStorage.getItem('ta_theme') || 'dark';
+    const saved = localStorage.getItem('ta_theme') || 'light';
     document.documentElement.setAttribute('data-theme', saved);
   })();
 </script>
 </head>
-<body class="logged-out" data-theme="dark">
+<body class="logged-out" data-theme="light">
 
 <!-- ============================================================
      SECTION 1 — AUTH SCREEN
@@ -22,6 +22,7 @@
 <div id="authScreen" class="auth-screen">
   <div class="auth-card">
 
+    <!-- Shared header with organic wave curve -->
     <div class="auth-header">
       <div class="auth-brand">
         <div class="auth-brand-icon">📊</div>
@@ -255,14 +256,28 @@
     <div class="panel-glass">
       <div class="panel-head">
         <div id="niftyHeader" style="display:flex;flex-direction:column;gap:2px;min-width:220px">
-          <div style="font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1.2px;text-transform:uppercase">NIFTY 50</div>
-          <div style="display:flex;align-items:baseline;gap:10px">
-            <span id="niftyLtp" style="font-size:20px;font-weight:800;letter-spacing:-0.5px;line-height:1.1">—</span>
-            <span id="niftyChange" style="font-size:12px;font-weight:700">—</span>
-          </div>
-        </div>
+  <div style="font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1.2px;text-transform:uppercase">NIFTY 50</div>
+  <div style="display:flex;align-items:baseline;gap:10px">
+    <span id="niftyLtp" style="font-size:20px;font-weight:800;letter-spacing:-0.5px;line-height:1.1">—</span>
+    <span id="niftyChange" style="font-size:12px;font-weight:700">—</span>
+  </div>
+</div>
         <div class="screener-controls">
+          <label>Strategy:</label>
+          <select id="strategySelect" onchange="onStrategyChange()">
+            <option value="advanceorb">📈 Advance ORB</option>
+            <option value="smartmoney">💰 SmartMoney</option>
+            <option value="bigplayers">🏢 Big Players</option>
+          </select>
           <button class="btn btn-primary" onclick="runScreener(event)">🔄 Run Screener</button>
+          <div class="toggle-wrapper">
+            <span class="toggle-label">Auto Buy</span>
+            <label class="toggle-switch">
+              <input type="checkbox" id="autoBuyToggle" onchange="toggleAutoBuyMode()" />
+              <span class="toggle-slider"></span>
+            </label>
+            <span class="toggle-status" id="toggleStatus">OFF</span>
+          </div>
         </div>
       </div>
       <div class="table-wrap">

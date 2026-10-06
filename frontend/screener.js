@@ -1,15 +1,15 @@
 /* ============================================================
-   SCREENER.JS  — v2.0
-   ORB + timestamps + cachedTokens + SSE + NIFTY 50 header
-   + Filter chips + Column sort + Entry-signal row highlight
-   + Compact controls + Quote H/L column
-   + SSE LTP cell updates (no full re-render)
+   SCREENER.JS  — v2.1
+   + Auto-quote SSE handling (type: 'quote')
+   + ORB state SSE handling (type: 'orb')
+   + Price display in NEW LOW / PULLBACK / BREAKOUT
+   + Green tick / red cross for Target / SL hit
 
-   CHANGELOG v2.0 (2026-10-06):
-   - updateLTPCells() — SSE tick pe sirf LTP + Change % cells update
-   - Full table re-render happens on 30s poll / sort / filter / fetch
-   - Row carries data-token attr for fast DOM lookup
-   - SSE batching dropped to 100ms (server.js side)
+   CHANGELOG v2.1 (2026-10-06):
+   - SSE 'orb' event → instant ORB state update (no 30s wait)
+   - SSE 'quote' event → instant quote H/L update
+   - NEW LOW / PULLBACK / BREAKOUT show TIME + PRICE
+   - Target / SL cell shows ✓ (hit) or ✗ (SL hit)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -230,6 +230,15 @@ function formatTimeOnly(d) {
   } catch { return ''; }
 }
 
+function formatTimeIST(isoStr) {
+  if (!isoStr) return '—';
+  try {
+    const d = new Date(isoStr);
+    const ist = new Date(d.getTime() + 5.5 * 3600 * 1000);
+    return ist.toISOString().slice(11, 19);
+  } catch { return '—'; }
+}
+
 /* ============================================================
    SECTION 3.2 — NIFTY 50 HEADER
    ============================================================ */
@@ -270,21 +279,16 @@ function updateNiftyHeader() {
 }
 
 /* ============================================================
-   SECTION 3.3 — FAST CELL UPDATE (SSE path)
-   Updates only LTP + Change % text in existing DOM rows.
-   No structural re-render, no sorting — that's the 30s poll's job.
+   SECTION 3.3 — FAST CELL UPDATE (SSE LTP path)
    ============================================================ */
 function updateLTPCells(ticks) {
-  /* Build a token → row map once per SSE message */
   const rows = document.querySelectorAll('#screenerBody tr[data-token]');
   if (!rows.length) return;
   const rowMap = {};
   rows.forEach(r => { rowMap[r.dataset.token] = r; });
 
   for (const [token, price] of Object.entries(ticks)) {
-    /* Always keep memory fresh, even if row not visible */
     SCREENER_LTP[token] = price;
-
     const row = rowMap[token];
     if (!row) continue;
 
@@ -303,6 +307,114 @@ function updateLTPCells(ticks) {
       }
     }
   }
+}
+
+/* ============================================================
+   SECTION 3.4 — ORB ROW FAST UPDATE (SSE 'orb' path)
+   Only updates the row that changed — no full re-render.
+   ============================================================ */
+function updateORBRow(token, state) {
+  SCREENER_ORB[token] = {
+    lowBroken: state.lowBroken,
+    pullbackConfirmed: state.pullbackConfirmed,
+    entrySignal: state.entrySignal,
+    newLowAt: state.firstLowBreakAt,
+    pullbackAt: state.firstPullbackAt,
+    breakoutAt: state.firstEntryAt,
+    lowBreakPrice: state.firstLowBreakPrice,
+    pullbackPrice: state.firstPullbackPrice,
+    entryPrice: state.firstEntryPrice,
+    targetHit: state.targetHit,
+    targetHitAt: state.targetHitAt,
+    slHit: state.slHit,
+    slHitAt: state.slHitAt
+  };
+
+  const row = document.querySelector(`#screenerBody tr[data-token="${token}"]`);
+  if (!row) {
+    /* Row not visible right now (maybe filtered out) — full render next poll */
+    return;
+  }
+
+  /* Update NEW LOW cell */
+  const nlCell = row.querySelector('.cell-newlow');
+  if (nlCell) {
+    nlCell.innerHTML = state.lowBroken
+      ? renderTimePrice(state.firstLowBreakAt, state.firstLowBreakPrice)
+      : '—';
+  }
+
+  /* Update PULLBACK cell */
+  const pbCell = row.querySelector('.cell-pullback');
+  if (pbCell) {
+    pbCell.innerHTML = state.pullbackConfirmed
+      ? renderTimePrice(state.firstPullbackAt, state.firstPullbackPrice)
+      : '—';
+  }
+
+  /* Update BREAKOUT cell */
+  const boCell = row.querySelector('.cell-breakout');
+  if (boCell) {
+    boCell.innerHTML = state.entrySignal
+      ? renderTimePrice(state.firstEntryAt, state.firstEntryPrice)
+      : '—';
+  }
+
+  /* Update ORB STAGE cell */
+  const stageCell = row.querySelector('.cell-stage');
+  if (stageCell) {
+    const stage = resolveOrbStage(token, SCREENER_ALL_CANDLES[token], SCREENER_LTP[token]);
+    stageCell.style.color = stage.color;
+    stageCell.style.fontWeight = stage.weight;
+    stageCell.textContent = stage.label;
+  }
+
+  /* Update Target/SL cell (tick / cross) */
+  const tslCell = row.querySelector('.cell-targetsl');
+  if (tslCell && SCREENER_ALL_CANDLES[token]) {
+    const c = SCREENER_ALL_CANDLES[token];
+    tslCell.innerHTML = renderTargetSL(c, SCREENER_ORB[token]);
+  }
+
+  /* Add/remove row-signal highlight */
+  if (state.entrySignal) row.classList.add('row-signal');
+  else row.classList.remove('row-signal');
+
+  /* Update ACTION cell (buy button) */
+  const actionCell = row.querySelector('.cell-action');
+  if (actionCell) {
+    actionCell.innerHTML = state.entrySignal
+      ? `<button class="btn btn-success btn-sm" onclick="placeOrder('${SCREENER_ALL_STOCKS.find(s=>s.token==token)?.sym || token}')">Buy</button>`
+      : '<span style="color:var(--text-muted);font-size:11px">—</span>';
+  }
+}
+
+/* Helper: render time + price stacked */
+function renderTimePrice(isoStr, price) {
+  if (!isoStr) return '—';
+  const t = formatTimeIST(isoStr);
+  const p = (price !== null && price !== undefined) ? '₹' + (+price).toFixed(2) : '';
+  return `<span class="cell-time" style="display:block">${t}</span>` +
+         (p ? `<span style="display:block;font-size:10px;color:var(--text-muted);font-family:ui-monospace,monospace">${p}</span>` : '');
+}
+
+/* Helper: render Target / SL with hit indicator */
+function renderTargetSL(c, orb) {
+  const target = c.high * 1.01;
+  const sl = c.low;
+
+  let targetLine = `<span class="cell-primary" style="color:#6C5CE7">T: ₹${target.toFixed(2)}</span>`;
+  let slLine = `<span class="cell-sub" style="color:var(--text-secondary)">SL: ₹${sl.toFixed(2)}</span>`;
+
+  if (orb?.targetHit) {
+    targetLine = `<span class="cell-primary" style="color:var(--success)">T: ₹${target.toFixed(2)} <span style="font-size:13px">✓</span></span>`;
+    slLine = `<span class="cell-sub" style="color:var(--text-muted);text-decoration:line-through">SL: ₹${sl.toFixed(2)}</span>`;
+  } else if (orb?.slHit) {
+    targetLine = `<span class="cell-primary" style="color:var(--text-muted);text-decoration:line-through">T: ₹${target.toFixed(2)}</span>`;
+    slLine = `<span class="cell-sub" style="color:var(--danger)">SL: ₹${sl.toFixed(2)} <span style="font-size:13px">✗</span></span>`;
+  }
+
+  return targetLine + slLine;
 }
 
 /* ============================================================
@@ -497,7 +609,6 @@ function updateProgress(done, total) {
 
 /* ============================================================
    SECTION 6 — LTP + ORB state (REST poll, 30s backup)
-   Full render happens here — sorts, stages, quotes sync.
    ============================================================ */
 async function loadLTP() {
   const tokens = SCREENER_STOCKS.map(s => s.token);
@@ -529,6 +640,13 @@ async function loadLTP() {
             newLowAt: item.newLowAt || null,
             pullbackAt: item.pullbackAt || null,
             breakoutAt: item.breakoutAt || null,
+            lowBreakPrice: item.lowBreakPrice ?? null,
+            pullbackPrice: item.pullbackPrice ?? null,
+            entryPrice: item.entryPrice ?? null,
+            targetHit: !!item.targetHit,
+            targetHitAt: item.targetHitAt || null,
+            slHit: !!item.slHit,
+            slHitAt: item.slHitAt || null,
             serverTime: item.serverTime || null
           };
         }
@@ -545,8 +663,8 @@ function startLTPRefresh() {
 }
 
 /* ============================================================
-   SECTION 6.1 — SSE real-time LTP push
-   Fast path: only LTP + Change % cells updated (no full render).
+   SECTION 6.1 — SSE real-time push
+   Handles: 'ltp', 'orb', 'quote'
    ============================================================ */
 function startSSE() {
   if (SCREENER_SSE) return;
@@ -560,15 +678,29 @@ function startSSE() {
   SCREENER_SSE.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
+
+      /* --- LTP tick --- */
       if (msg.type === 'ltp' && msg.ticks) {
-        /* NIFTY 50 header update (cheap) */
         if (msg.ticks[NIFTY50_TOKEN] !== undefined) {
           SCREENER_LTP[NIFTY50_TOKEN] = msg.ticks[NIFTY50_TOKEN];
           updateNiftyHeader();
         }
-        /* Fast cell update — no full table re-render */
         updateLTPCells(msg.ticks);
       }
+
+      /* --- ORB stage change --- */
+      else if (msg.type === 'orb' && msg.token && msg.state) {
+        updateORBRow(msg.token, msg.state);
+      }
+
+      /* --- Quote H/L update (auto or manual) --- */
+      else if (msg.type === 'quote' && msg.quotes) {
+        for (const [token, q] of Object.entries(msg.quotes)) {
+          SCREENER_QUOTE[token] = { high: q.high, low: q.low, fetchedAt: q.fetchedAt };
+        }
+        renderScreenerTable();
+      }
+
     } catch {}
   };
 
@@ -585,7 +717,7 @@ function stopSSE() {
 }
 
 /* ============================================================
-   SECTION 7 — ORB STAGE + TIME HELPERS
+   SECTION 7 — ORB STAGE RESOLVE
    ============================================================ */
 function resolveOrbStage(token, candle, ltp) {
   const orb = SCREENER_ORB[token] || { lowBroken: false, pullbackConfirmed: false, entrySignal: false };
@@ -598,15 +730,6 @@ function resolveOrbStage(token, candle, ltp) {
     return { label: '⏸️ Inside Range', color: 'var(--text-muted)', weight: 500 };
   }
   return { label: '— waiting —', color: 'var(--text-muted)', weight: 500 };
-}
-
-function formatTimeIST(isoStr) {
-  if (!isoStr) return '—';
-  try {
-    const d = new Date(isoStr);
-    const ist = new Date(d.getTime() + 5.5 * 3600 * 1000);
-    return ist.toISOString().slice(11, 19);
-  } catch { return '—'; }
 }
 
 /* ============================================================
@@ -693,11 +816,12 @@ function renderScreenerTable() {
       quoteCell = '<span style="color:var(--text-muted)">—</span>';
     }
 
-    const newLowTime    = formatTimeIST(orb.newLowAt);
-    const pullbackTime  = formatTimeIST(orb.pullbackAt);
-    const breakoutTime  = formatTimeIST(orb.breakoutAt);
-    const lastUpdate    = formatTimeIST(orb.serverTime);
+    /* NEW LOW / PULLBACK / BREAKOUT — time + price */
+    const newLowCell    = orb.lowBroken ? renderTimePrice(orb.newLowAt, orb.lowBreakPrice) : '—';
+    const pullbackCell  = orb.pullbackConfirmed ? renderTimePrice(orb.pullbackAt, orb.pullbackPrice) : '—';
+    const breakoutCell  = orb.entrySignal ? renderTimePrice(orb.breakoutAt, orb.entryPrice) : '—';
 
+    const lastUpdate = formatTimeIST(orb.serverTime);
     const rowClass = orb.entrySignal ? 'row-signal' : '';
 
     return `<tr class="${rowClass}" data-token="${s.token}">
@@ -711,17 +835,14 @@ function renderScreenerTable() {
         <span class="cell-sub" style="color:var(--danger)">L: ₹${c.low.toFixed(2)}</span>
       </td>
       <td style="white-space:nowrap">${quoteCell}</td>
-      <td style="white-space:nowrap">
-        <span class="cell-primary" style="color:#6C5CE7">T: ₹${target.toFixed(2)}</span>
-        <span class="cell-sub" style="color:var(--text-secondary)">SL: ₹${sl.toFixed(2)}</span>
-      </td>
+      <td style="white-space:nowrap" class="cell-targetsl">${renderTargetSL(c, orb)}</td>
       <td style="font-weight:700;color:#6C5CE7">${maxQty}</td>
-      <td class="cell-time">${newLowTime}</td>
-      <td class="cell-time">${pullbackTime}</td>
-      <td class="cell-time">${breakoutTime}</td>
+      <td class="cell-newlow">${newLowCell}</td>
+      <td class="cell-pullback">${pullbackCell}</td>
+      <td class="cell-breakout">${breakoutCell}</td>
       <td style="color:var(--text-muted);font-size:11px;font-family:ui-monospace,monospace">${lastUpdate}</td>
-      <td style="color:${stage.color};font-weight:${stage.weight};font-size:11px">${stage.label}</td>
-      <td>${orb.entrySignal
+      <td class="cell-stage" style="color:${stage.color};font-weight:${stage.weight};font-size:11px">${stage.label}</td>
+      <td class="cell-action">${orb.entrySignal
         ? `<button class="btn btn-success btn-sm" onclick="placeOrder('${s.sym}')">Buy</button>`
         : '<span style="color:var(--text-muted);font-size:11px">—</span>'}</td>
     </tr>`;

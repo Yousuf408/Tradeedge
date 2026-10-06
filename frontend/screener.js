@@ -1,15 +1,15 @@
 /* ============================================================
-   SCREENER.JS  — v1.9
+   SCREENER.JS  — v2.0
    ORB + timestamps + cachedTokens + SSE + NIFTY 50 header
    + Filter chips + Column sort + Entry-signal row highlight
-   + Compact controls
-   + Quote H/L column (parallel to REST 9:15 for testing)
+   + Compact controls + Quote H/L column
+   + SSE LTP cell updates (no full re-render)
 
-   CHANGELOG v1.9 (2026-10-06):
-   - New button: "📊 Fetch Quote H/L" (FULL quote, parallel method)
-   - New column: "Quote H/L" next to 9:15 Range
-   - SCREENER_QUOTE map stores quote data per token
-   - Existing REST 9:15 fetch + button — UNTOUCHED
+   CHANGELOG v2.0 (2026-10-06):
+   - updateLTPCells() — SSE tick pe sirf LTP + Change % cells update
+   - Full table re-render happens on 30s poll / sort / filter / fetch
+   - Row carries data-token attr for fast DOM lookup
+   - SSE batching dropped to 100ms (server.js side)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -18,7 +18,7 @@ let SCREENER_ALL_CANDLES = {};
 let SCREENER_CACHED_TOKENS = new Set();
 let SCREENER_LTP = {};
 let SCREENER_PREV_CLOSE = {};
-let SCREENER_QUOTE = {};          // token → { high, low, fetchedAt }
+let SCREENER_QUOTE = {};
 let SCREENER_ORB = {};
 let SCREENER_INIT_DONE = false;
 let SCREENER_LTP_TIMER = null;
@@ -270,6 +270,42 @@ function updateNiftyHeader() {
 }
 
 /* ============================================================
+   SECTION 3.3 — FAST CELL UPDATE (SSE path)
+   Updates only LTP + Change % text in existing DOM rows.
+   No structural re-render, no sorting — that's the 30s poll's job.
+   ============================================================ */
+function updateLTPCells(ticks) {
+  /* Build a token → row map once per SSE message */
+  const rows = document.querySelectorAll('#screenerBody tr[data-token]');
+  if (!rows.length) return;
+  const rowMap = {};
+  rows.forEach(r => { rowMap[r.dataset.token] = r; });
+
+  for (const [token, price] of Object.entries(ticks)) {
+    /* Always keep memory fresh, even if row not visible */
+    SCREENER_LTP[token] = price;
+
+    const row = rowMap[token];
+    if (!row) continue;
+
+    const ltpEl = row.querySelector('.ltp-cell');
+    if (ltpEl) ltpEl.textContent = '₹' + (+price).toFixed(2);
+
+    const chgEl = row.querySelector('.change-cell');
+    if (chgEl) {
+      const pct = computeChangePct(token);
+      if (pct === null) {
+        chgEl.innerHTML = '<span style="color:var(--text-muted)">—</span>';
+      } else {
+        const isPos = pct >= 0;
+        const color = isPos ? 'var(--success)' : 'var(--danger)';
+        chgEl.innerHTML = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${pct.toFixed(2)}%</span>`;
+      }
+    }
+  }
+}
+
+/* ============================================================
    SECTION 4 — LOAD STOCK LIST + CACHED DATA
    ============================================================ */
 async function loadStockList() {
@@ -303,7 +339,6 @@ async function loadCachedData() {
       d.cachedTokens.forEach(t => SCREENER_CACHED_TOKENS.add(String(t)));
     }
 
-    /* Load quote H/L if present */
     if (d.quotes) {
       for (const [token, q] of Object.entries(d.quotes)) {
         SCREENER_QUOTE[token] = { high: q.high, low: q.low, fetchedAt: q.fetchedAt };
@@ -321,7 +356,7 @@ async function loadCachedData() {
 }
 
 /* ============================================================
-   SECTION 5 — FETCH 9:15 (REST, EXISTING — UNTOUCHED)
+   SECTION 5 — FETCH 9:15 (REST)
    ============================================================ */
 async function startFetch() {
   if (FETCHING) return;
@@ -397,7 +432,7 @@ async function startFetch() {
 }
 
 /* ============================================================
-   SECTION 5.1 — FETCH QUOTE H/L (FULL quote, parallel method)
+   SECTION 5.1 — FETCH QUOTE H/L
    ============================================================ */
 async function startQuoteFetch() {
   if (QUOTE_FETCHING) return;
@@ -413,7 +448,6 @@ async function startQuoteFetch() {
   const total = allTokens.length;
   let ok = 0, failed = 0;
 
-  /* FULL quote: 50 tokens per call internally (server handles batching) */
   const QUOTE_BATCH = 50;
 
   for (let i = 0; i < allTokens.length; i += QUOTE_BATCH) {
@@ -463,6 +497,7 @@ function updateProgress(done, total) {
 
 /* ============================================================
    SECTION 6 — LTP + ORB state (REST poll, 30s backup)
+   Full render happens here — sorts, stages, quotes sync.
    ============================================================ */
 async function loadLTP() {
   const tokens = SCREENER_STOCKS.map(s => s.token);
@@ -510,7 +545,8 @@ function startLTPRefresh() {
 }
 
 /* ============================================================
-   SECTION 6.1 — SSE real-time LTP push (UNTOUCHED)
+   SECTION 6.1 — SSE real-time LTP push
+   Fast path: only LTP + Change % cells updated (no full render).
    ============================================================ */
 function startSSE() {
   if (SCREENER_SSE) return;
@@ -525,15 +561,13 @@ function startSSE() {
     try {
       const msg = JSON.parse(e.data);
       if (msg.type === 'ltp' && msg.ticks) {
-        let any = false;
-        let niftyTouched = false;
-        for (const [token, price] of Object.entries(msg.ticks)) {
-          SCREENER_LTP[token] = price;
-          any = true;
-          if (token === NIFTY50_TOKEN) niftyTouched = true;
+        /* NIFTY 50 header update (cheap) */
+        if (msg.ticks[NIFTY50_TOKEN] !== undefined) {
+          SCREENER_LTP[NIFTY50_TOKEN] = msg.ticks[NIFTY50_TOKEN];
+          updateNiftyHeader();
         }
-        if (niftyTouched) updateNiftyHeader();
-        if (any) renderScreenerTable();
+        /* Fast cell update — no full table re-render */
+        updateLTPCells(msg.ticks);
       }
     } catch {}
   };
@@ -666,11 +700,11 @@ function renderScreenerTable() {
 
     const rowClass = orb.entrySignal ? 'row-signal' : '';
 
-    return `<tr class="${rowClass}">
+    return `<tr class="${rowClass}" data-token="${s.token}">
       <td><span class="sym">${s.sym}</span><span class="tok">${s.token}</span></td>
       <td style="white-space:nowrap">
-        <span class="cell-primary">${ltp ? '₹' + ltp.toFixed(2) : '—'}</span>
-        <span class="cell-sub">${changeLine}</span>
+        <span class="cell-primary ltp-cell">${ltp ? '₹' + (+ltp).toFixed(2) : '—'}</span>
+        <span class="cell-sub change-cell">${changeLine}</span>
       </td>
       <td style="white-space:nowrap">
         <span class="cell-primary" style="color:var(--success)">H: ₹${c.high.toFixed(2)}</span>

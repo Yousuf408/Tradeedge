@@ -1,15 +1,34 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v1.6
+   server.js — TradeAlgo Pro backend  |  v1.7
    ============================================================
 
-   STRUCTURE: (unchanged — see v1.5 header)
+   STRUCTURE:
+    §1  Imports
+    §2  Config (env, DB, stock list, strategy)
+    §3  Time / phases / holidays
+    §4  ORB state (memory + DB sync)
+    §4.1 Previous close (memory + DB + FULL quote fallback)
+    §4.2 Quote-based High/Low (parallel to REST 9:15)
+    §5  WebSocket manager (tick → stages) + SSE broadcast
+        + batched LTP DB writer
+    §6  Middleware + helpers
+    §7  Auth routes
+    §8  Forgot password
+    §9  Change password + profile
+    §10 Users CRUD (admin)
+    §11 Audit + prices
+    §12 Trading holidays (admin)
+    §13 Screener routes + SSE stream + quote fetch
+    §14 Closing prices (15:34 IST)
+    §15 DB cache loader
+    §16 Start
 
-   CHANGELOG v1.6 (2026-10-05):
-    - Added NIFTY50_TOKEN (99926000) — streamed via same WS
-    - WS subscribes to NIFTY 50 + all NSE equities (exchangeType 1)
-    - handleTick: NIFTY 50 path caches LTP + broadcasts via SSE
-    - prevClose also fetched for NIFTY 50 (FULL quote batch)
-    - NIFTY 50 excluded from ORB / screener / fetch-batch logic
+   CHANGELOG v1.7 (2026-10-06):
+    - Added §4.2 quoteCache + loadQuoteCacheFromDB()
+    - Added POST /api/screener/fetch-quote-batch (FULL quote)
+    - /api/screener/ltp now returns highQuote, lowQuote, quoteFetchedAt
+    - /api/screener/data now returns quotes{} for cached tokens
+    - WS / SSE / LTP batching pipeline — UNTOUCHED
    ============================================================ */
 
 import express from 'express';
@@ -181,7 +200,6 @@ const prevCloseCache = new Map();
 
 async function loadPrevCloseFromDB() {
   try {
-    /* Include NIFTY 50 in the fetch list */
     const activeTokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
     const { rows } = await db.query(
       `SELECT DISTINCT ON (token) token, prev_close
@@ -198,7 +216,6 @@ async function loadPrevCloseFromDB() {
 }
 
 async function fetchMissingPrevClose() {
-  /* Include NIFTY 50 */
   const allTokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
   const missing = allTokens.filter(t => !prevCloseCache.has(t));
 
@@ -225,8 +242,6 @@ async function fetchMissingPrevClose() {
       prevCloseCache.set(token, close);
       updated++;
 
-      /* Save to DB — NIFTY 50 has no row, so UPDATE is a no-op for it.
-         It stays in memory only. */
       db.query(
         `UPDATE angel_15m_candle SET prev_close=$1 WHERE date=$2 AND token=$3`,
         [close, date, token]
@@ -241,12 +256,44 @@ async function fetchMissingPrevClose() {
 
 
 /* ============================================================
+   SECTION 4.2 — QUOTE-BASED HIGH/LOW (parallel to REST 9:15)
+   FULL quote se day high/low fetch karke DB mein save.
+   Frontend parallel column dikha sakta hai comparison ke liye.
+   WS / ORB logic isse touch nahi hota — separate channel.
+   ============================================================ */
+const quoteCache = new Map();   // token → { high, low, fetchedAt }
+
+async function loadQuoteCacheFromDB() {
+  try {
+    const p = getScreenerPhase();
+    if (!p.date) return;
+    const activeTokens = STOCKS.map(s => String(s.token));
+    const { rows } = await db.query(
+      `SELECT token, high_quote, low_quote, quote_fetched_at
+       FROM angel_15m_candle
+       WHERE date=$1 AND token = ANY($2) AND high_quote IS NOT NULL`,
+      [p.date, activeTokens]
+    );
+    for (const r of rows) {
+      quoteCache.set(String(r.token), {
+        high: +r.high_quote,
+        low: +r.low_quote,
+        fetchedAt: r.quote_fetched_at
+      });
+    }
+    console.log(`📊 Loaded quote H/L for ${rows.length} tokens from DB`);
+  } catch (e) { console.error('quoteCache load failed:', e.message); }
+}
+
+
+/* ============================================================
    SECTION 5 — WEBSOCKET MANAGER + SSE BROADCAST + LTP BATCH WRITER
+   ⚠️  PROTECTED ZONE — DO NOT MODIFY WITHOUT EXPLICIT REQUEST
    ============================================================ */
 let wsStarted = false;
 let wsConnectedTokens = 0;
 
-/* ---- Batched LTP DB writer (PROTECTED) ---- */
+/* ---- Batched LTP DB writer ---- */
 const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000);
 const ltpWriteQueue = new Map();
 let ltpWriteTimer = null;
@@ -292,7 +339,7 @@ async function flushLtpWrites() {
 process.on('SIGTERM', async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
 process.on('SIGINT',  async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
 
-/* ---- SSE registry (PROTECTED) ---- */
+/* ---- SSE registry ---- */
 const sseClients = new Set();
 let ssePending = new Map();
 let sseFlushTimer = null;
@@ -389,7 +436,6 @@ function startWebSocketForReadyPhase() {
   const feedToken = getFeedToken();
   if (!feedToken) { console.log('⚠️  WS skipped — no feed token'); return; }
 
-  /* Include NIFTY 50 token in subscription (same exchangeType 1) */
   const tokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
 
   try {
@@ -516,7 +562,7 @@ function verifyTotpServer(secret, input) {
 
 
 /* ============================================================
-   SECTION 7 — AUTH ROUTES  (unchanged from v1.5)
+   SECTION 7 — AUTH ROUTES
    ============================================================ */
 app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend' }));
 
@@ -654,7 +700,7 @@ app.post('/api/logout', auth, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 8 — FORGOT PASSWORD  (unchanged)
+   SECTION 8 — FORGOT PASSWORD
    ============================================================ */
 app.post('/api/forgot-password/check', async (req, res) => {
   const { input } = req.body;
@@ -702,7 +748,7 @@ app.post('/api/forgot-password/reset', async (req, res) => {
 
 
 /* ============================================================
-   SECTION 9 — CHANGE PASSWORD + PROFILE  (unchanged)
+   SECTION 9 — CHANGE PASSWORD + PROFILE
    ============================================================ */
 app.post('/api/change-password', auth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
@@ -751,7 +797,7 @@ app.put('/api/me', auth, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 10 — USERS CRUD (admin)  (unchanged)
+   SECTION 10 — USERS CRUD (admin)
    ============================================================ */
 app.get('/api/users', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query(
@@ -849,7 +895,7 @@ app.delete('/api/users/:username', auth, adminOnly, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 11 — AUDIT + PRICES  (unchanged)
+   SECTION 11 — AUDIT + PRICES
    ============================================================ */
 app.get('/api/audit', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200');
@@ -877,7 +923,7 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 12 — TRADING HOLIDAYS (admin)  (unchanged)
+   SECTION 12 — TRADING HOLIDAYS (admin)
    ============================================================ */
 app.get('/api/admin/holidays', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT date::text AS date, reason FROM trading_holidays ORDER BY date ASC');
@@ -946,16 +992,25 @@ app.get('/api/screener/data', auth, (req, res) => {
   const passingTokens = new Set(passing.map(c => String(c.token)));
   const passingStocks = STOCKS.filter(s => passingTokens.has(String(s.token)));
 
+  /* Attach quote H/L for cached tokens */
+  const quotes = {};
+  for (const t of cachedTokens) {
+    const q = quoteCache.get(t);
+    if (q) quotes[t] = { high: q.high, low: q.low, fetchedAt: q.fetchedAt };
+  }
+
   res.json({
     ok: true, phase: p.phase, date: p.date,
     strategy: strategy.id, strategyName: strategy.name, filters: strategy.filters,
     filled: passing.length, total: STOCKS.length,
     cachedTokens,
+    quotes,
     results: passing,
     stocks: passingStocks
   });
 });
 
+/* ---- SSE stream — real-time LTP push ---- */
 app.get('/api/screener/stream', (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(401).end();
@@ -982,6 +1037,40 @@ app.get('/api/screener/stream', (req, res) => {
     sseClients.delete(client);
     console.log(`📡 SSE client disconnected (total: ${sseClients.size})`);
   });
+});
+
+/* ---- FULL quote fetch (parallel to REST 9:15 fetch) ---- */
+app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
+  const { tokens } = req.body;
+  if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
+  const p = getScreenerPhase();
+  if (!p.date) return res.status(400).json({ error: 'No trading date' });
+
+  try {
+    const quotes = await getFullQuotesForTokens(tokens);
+    const fetchedAt = new Date();
+    const results = [];
+
+    for (const q of quotes) {
+      if (!q || !q.token) continue;
+      const high = +q.high;
+      const low = +q.low;
+      if (!Number.isFinite(high) || !Number.isFinite(low) || high <= 0 || low <= 0) continue;
+
+      const token = String(q.token);
+      quoteCache.set(token, { high, low, fetchedAt });
+
+      db.query(
+        `UPDATE angel_15m_candle SET high_quote=$1, low_quote=$2, quote_fetched_at=$3 WHERE date=$4 AND token=$5`,
+        [high, low, fetchedAt, p.date, token]
+      ).catch(() => {});
+
+      results.push({ token, high, low });
+    }
+
+    console.log(`📊 Quote H/L fetched: ${results.length}/${tokens.length} at ${fetchedAt.toISOString()}`);
+    res.json({ ok: true, date: p.date, fetchedAt, results });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/screener/fetch-batch', auth, async (req, res) => {
@@ -1021,7 +1110,7 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
 });
 
 /* Client polls this — reads from memory.
-   Now also returns NIFTY 50 if requested. */
+   Returns LTP + ORB state + prevClose + quote H/L. */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1034,10 +1123,14 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const state = getOrbState(token, p.date);
     const ltp = getCachedLTP(token);
     const prevClose = prevCloseCache.get(token) || null;
+    const quote = quoteCache.get(token) || null;
     return {
       token,
       ltp,
       prevClose,
+      highQuote: quote?.high ?? null,
+      lowQuote: quote?.low ?? null,
+      quoteFetchedAt: quote?.fetchedAt ?? null,
       lowBroken: state.lowBroken,
       pullbackConfirmed: state.pullbackConfirmed,
       entrySignal: state.entrySignal,
@@ -1053,7 +1146,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 14 — CLOSING PRICES (15:34 IST)  (unchanged)
+   SECTION 14 — CLOSING PRICES (15:34 IST)
    ============================================================ */
 async function fetchClosingPrices() {
   try {
@@ -1113,7 +1206,7 @@ function scheduleClosingFetch() {
 
 
 /* ============================================================
-   SECTION 15 — DB CACHE LOADER  (unchanged)
+   SECTION 15 — DB CACHE LOADER
    ============================================================ */
 async function loadScreenerCacheFromDB() {
   try {
@@ -1152,6 +1245,7 @@ app.listen(PORT, async () => {
   await loadHolidaysFromDB();
   await loadScreenerCacheFromDB();
   await loadPrevCloseFromDB();
+  await loadQuoteCacheFromDB();
 
   fetchMissingPrevClose().catch(e => console.error('prevClose fetch err:', e.message));
 
@@ -1164,5 +1258,5 @@ app.listen(PORT, async () => {
   }
   scheduleClosingFetch();
 
-  console.log('ℹ️  Ready — WS + SSE + batched LTP + NIFTY 50');
+  console.log('ℹ️  Ready — WS + SSE + batched LTP + NIFTY 50 + quote H/L');
 });

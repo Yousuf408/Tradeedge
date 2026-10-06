@@ -364,8 +364,10 @@ function broadcastLTP(token, ltp) {
   }, 100);
 }
 
-/* ---- Called for every tick from WebSocket ---- */
 function handleTick(token, ltp) {
+  /* Reject absurd LTPs (garbage packets, parse errors, etc.) */
+  if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
+
   /* NIFTY 50 — special path (no ORB, no candles, just LTP broadcast) */
   if (token === NIFTY50_TOKEN) {
     setCachedLTP(token, ltp);
@@ -375,7 +377,7 @@ function handleTick(token, ltp) {
 
   const p = getScreenerPhase();
   if (p.phase !== 'ready' || !p.date) return;
-
+   
   const candleArr = getCachedCandles([token], p.date)[0]?.candle;
   if (!Array.isArray(candleArr) || candleArr.length < 5) return;
 

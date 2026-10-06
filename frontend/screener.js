@@ -1,15 +1,11 @@
 /* ============================================================
-   SCREENER.JS  — v2.1
-   + Auto-quote SSE handling (type: 'quote')
-   + ORB state SSE handling (type: 'orb')
-   + Price display in NEW LOW / PULLBACK / BREAKOUT
-   + Green tick / red cross for Target / SL hit
+   SCREENER.JS  — v2.2
+   + Pivot column (from NSE Bhavcopy)
 
-   CHANGELOG v2.1 (2026-10-06):
-   - SSE 'orb' event → instant ORB state update (no 30s wait)
-   - SSE 'quote' event → instant quote H/L update
-   - NEW LOW / PULLBACK / BREAKOUT show TIME + PRICE
-   - Target / SL cell shows ✓ (hit) or ✗ (SL hit)
+   CHANGELOG v2.2 (2026-10-06):
+   - Added SCREENER_PIVOT map
+   - Added "Pivot" column (after Change %)
+   - Color: LTP > Pivot = green ▲, LTP < Pivot = red ▼
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -19,6 +15,7 @@ let SCREENER_CACHED_TOKENS = new Set();
 let SCREENER_LTP = {};
 let SCREENER_PREV_CLOSE = {};
 let SCREENER_QUOTE = {};
+let SCREENER_PIVOT = {};
 let SCREENER_ORB = {};
 let SCREENER_INIT_DONE = false;
 let SCREENER_LTP_TIMER = null;
@@ -306,12 +303,21 @@ function updateLTPCells(ticks) {
         chgEl.innerHTML = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${pct.toFixed(2)}%</span>`;
       }
     }
+
+    /* Pivot cell color update (LTP vs Pivot) */
+    const pivotEl = row.querySelector('.pivot-cell');
+    if (pivotEl && SCREENER_PIVOT[token]) {
+      const pivot = SCREENER_PIVOT[token];
+      const above = (+price) >= pivot;
+      const color = above ? 'var(--success)' : 'var(--danger)';
+      const arrow = above ? '▲' : '▼';
+      pivotEl.innerHTML = `<span style="color:${color};font-weight:700">${arrow} ₹${pivot.toFixed(2)}</span>`;
+    }
   }
 }
 
 /* ============================================================
-   SECTION 3.4 — ORB ROW FAST UPDATE (SSE 'orb' path)
-   Only updates the row that changed — no full re-render.
+   SECTION 3.4 — ORB ROW FAST UPDATE (SSE 'orb')
    ============================================================ */
 function updateORBRow(token, state) {
   SCREENER_ORB[token] = {
@@ -331,36 +337,17 @@ function updateORBRow(token, state) {
   };
 
   const row = document.querySelector(`#screenerBody tr[data-token="${token}"]`);
-  if (!row) {
-    /* Row not visible right now (maybe filtered out) — full render next poll */
-    return;
-  }
+  if (!row) return;
 
-  /* Update NEW LOW cell */
   const nlCell = row.querySelector('.cell-newlow');
-  if (nlCell) {
-    nlCell.innerHTML = state.lowBroken
-      ? renderTimePrice(state.firstLowBreakAt, state.firstLowBreakPrice)
-      : '—';
-  }
+  if (nlCell) nlCell.innerHTML = state.lowBroken ? renderTimePrice(state.firstLowBreakAt, state.firstLowBreakPrice) : '—';
 
-  /* Update PULLBACK cell */
   const pbCell = row.querySelector('.cell-pullback');
-  if (pbCell) {
-    pbCell.innerHTML = state.pullbackConfirmed
-      ? renderTimePrice(state.firstPullbackAt, state.firstPullbackPrice)
-      : '—';
-  }
+  if (pbCell) pbCell.innerHTML = state.pullbackConfirmed ? renderTimePrice(state.firstPullbackAt, state.firstPullbackPrice) : '—';
 
-  /* Update BREAKOUT cell */
   const boCell = row.querySelector('.cell-breakout');
-  if (boCell) {
-    boCell.innerHTML = state.entrySignal
-      ? renderTimePrice(state.firstEntryAt, state.firstEntryPrice)
-      : '—';
-  }
+  if (boCell) boCell.innerHTML = state.entrySignal ? renderTimePrice(state.firstEntryAt, state.firstEntryPrice) : '—';
 
-  /* Update ORB STAGE cell */
   const stageCell = row.querySelector('.cell-stage');
   if (stageCell) {
     const stage = resolveOrbStage(token, SCREENER_ALL_CANDLES[token], SCREENER_LTP[token]);
@@ -369,27 +356,23 @@ function updateORBRow(token, state) {
     stageCell.textContent = stage.label;
   }
 
-  /* Update Target/SL cell (tick / cross) */
   const tslCell = row.querySelector('.cell-targetsl');
   if (tslCell && SCREENER_ALL_CANDLES[token]) {
-    const c = SCREENER_ALL_CANDLES[token];
-    tslCell.innerHTML = renderTargetSL(c, SCREENER_ORB[token]);
+    tslCell.innerHTML = renderTargetSL(SCREENER_ALL_CANDLES[token], SCREENER_ORB[token]);
   }
 
-  /* Add/remove row-signal highlight */
   if (state.entrySignal) row.classList.add('row-signal');
   else row.classList.remove('row-signal');
 
-  /* Update ACTION cell (buy button) */
   const actionCell = row.querySelector('.cell-action');
   if (actionCell) {
+    const stock = SCREENER_ALL_STOCKS.find(s => String(s.token) === String(token));
     actionCell.innerHTML = state.entrySignal
-      ? `<button class="btn btn-success btn-sm" onclick="placeOrder('${SCREENER_ALL_STOCKS.find(s=>s.token==token)?.sym || token}')">Buy</button>`
+      ? `<button class="btn btn-success btn-sm" onclick="placeOrder('${stock?.sym || token}')">Buy</button>`
       : '<span style="color:var(--text-muted);font-size:11px">—</span>';
   }
 }
 
-/* Helper: render time + price stacked */
 function renderTimePrice(isoStr, price) {
   if (!isoStr) return '—';
   const t = formatTimeIST(isoStr);
@@ -398,7 +381,6 @@ function renderTimePrice(isoStr, price) {
          (p ? `<span style="display:block;font-size:10px;color:var(--text-muted);font-family:ui-monospace,monospace">${p}</span>` : '');
 }
 
-/* Helper: render Target / SL with hit indicator */
 function renderTargetSL(c, orb) {
   const target = c.high * 1.01;
   const sl = c.low;
@@ -559,12 +541,10 @@ async function startQuoteFetch() {
   const allTokens = SCREENER_ALL_STOCKS.map(s => String(s.token));
   const total = allTokens.length;
   let ok = 0, failed = 0;
-
   const QUOTE_BATCH = 50;
 
   for (let i = 0; i < allTokens.length; i += QUOTE_BATCH) {
     const batch = allTokens.slice(i, i + QUOTE_BATCH);
-
     try {
       const r = await fetch(API + '/api/screener/fetch-quote-batch', {
         method: 'POST',
@@ -574,17 +554,11 @@ async function startQuoteFetch() {
       const d = await r.json();
       if (d.results) {
         for (const item of d.results) {
-          SCREENER_QUOTE[String(item.token)] = {
-            high: item.high,
-            low: item.low,
-            fetchedAt: d.fetchedAt
-          };
+          SCREENER_QUOTE[String(item.token)] = { high: item.high, low: item.low, fetchedAt: d.fetchedAt };
           ok++;
         }
         failed += (batch.length - (d.results?.length || 0));
-      } else {
-        failed += batch.length;
-      }
+      } else failed += batch.length;
     } catch (e) { failed += batch.length; }
 
     renderScreenerTable();
@@ -625,11 +599,10 @@ async function loadLTP() {
       for (const item of d.results) {
         if (item.ltp) SCREENER_LTP[item.token] = item.ltp;
         if (item.prevClose) SCREENER_PREV_CLOSE[item.token] = item.prevClose;
+        if (item.pivot) SCREENER_PIVOT[item.token] = item.pivot;
         if (item.highQuote) {
           SCREENER_QUOTE[item.token] = {
-            high: item.highQuote,
-            low: item.lowQuote,
-            fetchedAt: item.quoteFetchedAt
+            high: item.highQuote, low: item.lowQuote, fetchedAt: item.quoteFetchedAt
           };
         }
         if (item.token !== NIFTY50_TOKEN) {
@@ -664,7 +637,6 @@ function startLTPRefresh() {
 
 /* ============================================================
    SECTION 6.1 — SSE real-time push
-   Handles: 'ltp', 'orb', 'quote'
    ============================================================ */
 function startSSE() {
   if (SCREENER_SSE) return;
@@ -679,7 +651,6 @@ function startSSE() {
     try {
       const msg = JSON.parse(e.data);
 
-      /* --- LTP tick --- */
       if (msg.type === 'ltp' && msg.ticks) {
         if (msg.ticks[NIFTY50_TOKEN] !== undefined) {
           SCREENER_LTP[NIFTY50_TOKEN] = msg.ticks[NIFTY50_TOKEN];
@@ -687,20 +658,15 @@ function startSSE() {
         }
         updateLTPCells(msg.ticks);
       }
-
-      /* --- ORB stage change --- */
       else if (msg.type === 'orb' && msg.token && msg.state) {
         updateORBRow(msg.token, msg.state);
       }
-
-      /* --- Quote H/L update (auto or manual) --- */
       else if (msg.type === 'quote' && msg.quotes) {
         for (const [token, q] of Object.entries(msg.quotes)) {
           SCREENER_QUOTE[token] = { high: q.high, low: q.low, fetchedAt: q.fetchedAt };
         }
         renderScreenerTable();
       }
-
     } catch {}
   };
 
@@ -745,6 +711,7 @@ function renderScreenerTable() {
     <th>Stock / Company</th>
     <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
         <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
+    <th>Pivot</th>
     <th class="th-sortable" onclick="setSort('range')">9:15 Range (H / L) ${sortIndicator('range')}</th>
     <th>Quote H / L</th>
     <th>Target / SL</th>
@@ -758,7 +725,7 @@ function renderScreenerTable() {
   </tr>`;
 
   if (!SCREENER_STOCKS.length) {
-    body.innerHTML = `<tr><td colspan="12" style="text-align:center;padding:60px;color:var(--text-muted)">
+    body.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:60px;color:var(--text-muted)">
       No stocks match the strategy filter yet.<br>
       Click <strong>⚡ Fetch 9:15 Candles</strong> to load data.
     </td></tr>`;
@@ -775,7 +742,7 @@ function renderScreenerTable() {
   const sorted = sortStocks(filtered);
 
   if (!sorted.length) {
-    body.innerHTML = `<tr><td colspan="12" style="text-align:center;padding:40px;color:var(--text-muted)">
+    body.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:40px;color:var(--text-muted)">
       No stocks in this category.
     </td></tr>`;
     if (count) count.textContent = `${SCREENER_STOCKS.length} / ${SCREENER_ALL_STOCKS.length} match filter`;
@@ -788,6 +755,7 @@ function renderScreenerTable() {
     const ltp = SCREENER_LTP[s.token];
     const orb = SCREENER_ORB[s.token] || {};
     const quote = SCREENER_QUOTE[s.token];
+    const pivot = SCREENER_PIVOT[s.token];
 
     const sl = c.low;
     const target = c.high * 1.01;
@@ -805,6 +773,21 @@ function renderScreenerTable() {
       changeLine = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
     }
 
+    /* Pivot cell */
+    let pivotCell;
+    if (pivot) {
+      const above = ltp ? (+ltp >= pivot) : null;
+      if (above === null) {
+        pivotCell = `<span style="color:var(--text-muted)">₹${pivot.toFixed(2)}</span>`;
+      } else {
+        const color = above ? 'var(--success)' : 'var(--danger)';
+        const arrow = above ? '▲' : '▼';
+        pivotCell = `<span style="color:${color};font-weight:700">${arrow} ₹${pivot.toFixed(2)}</span>`;
+      }
+    } else {
+      pivotCell = '<span style="color:var(--text-muted)">—</span>';
+    }
+
     let quoteCell;
     if (quote) {
       const qt = formatTimeOnly(quote.fetchedAt);
@@ -816,7 +799,6 @@ function renderScreenerTable() {
       quoteCell = '<span style="color:var(--text-muted)">—</span>';
     }
 
-    /* NEW LOW / PULLBACK / BREAKOUT — time + price */
     const newLowCell    = orb.lowBroken ? renderTimePrice(orb.newLowAt, orb.lowBreakPrice) : '—';
     const pullbackCell  = orb.pullbackConfirmed ? renderTimePrice(orb.pullbackAt, orb.pullbackPrice) : '—';
     const breakoutCell  = orb.entrySignal ? renderTimePrice(orb.breakoutAt, orb.entryPrice) : '—';
@@ -830,6 +812,7 @@ function renderScreenerTable() {
         <span class="cell-primary ltp-cell">${ltp ? '₹' + (+ltp).toFixed(2) : '—'}</span>
         <span class="cell-sub change-cell">${changeLine}</span>
       </td>
+      <td class="pivot-cell" style="white-space:nowrap">${pivotCell}</td>
       <td style="white-space:nowrap">
         <span class="cell-primary" style="color:var(--success)">H: ₹${c.high.toFixed(2)}</span>
         <span class="cell-sub" style="color:var(--danger)">L: ₹${c.low.toFixed(2)}</span>

@@ -1,11 +1,6 @@
 /* ============================================================
-   SCREENER.JS  — v2.2
-   + Pivot column (from NSE Bhavcopy)
-
-   CHANGELOG v2.2 (2026-10-06):
-   - Added SCREENER_PIVOT map
-   - Added "Pivot" column (after Change %)
-   - Color: LTP > Pivot = green ▲, LTP < Pivot = red ▼
+   SCREENER.JS  — v2.3
+   + Bhavcopy fetch button
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -22,13 +17,13 @@ let SCREENER_LTP_TIMER = null;
 let SCREENER_SSE = null;
 let FETCHING = false;
 let QUOTE_FETCHING = false;
+let BHAVCOPY_FETCHING = false;
 
 let SCREENER_STAGE_FILTER = 'all';
 let SCREENER_SORT_BY = 'change';
 let SCREENER_SORT_DIR = 'desc';
 
 const NIFTY50_TOKEN = '99926000';
-
 const CURRENT_STRATEGY = 'advance_orb';
 const STRATEGY_FILTER = { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 };
 
@@ -69,6 +64,7 @@ function setupControls() {
   controls.innerHTML = `
     <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
     <button id="fetchQuoteBtn" class="btn btn-outline" onclick="startQuoteFetch()">📊 Fetch Quote H/L</button>
+    <button id="fetchBhavcopyBtn" class="btn btn-outline" onclick="startBhavcopyFetch()">📥 Fetch Bhavcopy</button>
     <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">Per-Trade ₹</label>
     <input id="perTradeInput" type="number" value="10000" min="100"
            style="width:110px;padding:7px 12px;border:1.5px solid var(--border-soft);border-radius:8px;
@@ -161,9 +157,7 @@ function getSortValue(stock, field) {
     const v = computeChangePct(stock.token);
     return v === null ? -Infinity : v;
   }
-  if (field === 'ltp') {
-    return SCREENER_LTP[stock.token] ?? -Infinity;
-  }
+  if (field === 'ltp') return SCREENER_LTP[stock.token] ?? -Infinity;
   if (field === 'range') {
     if (!candle) return -Infinity;
     return ((candle.high - candle.low) / candle.low) * 100;
@@ -189,7 +183,7 @@ function sortStocks(stocks) {
 }
 
 /* ============================================================
-   SECTION 3 — FILTER (strategy)
+   SECTION 3 — FILTER
    ============================================================ */
 function passesFilter(candle) {
   if (!candle) return false;
@@ -263,7 +257,6 @@ function updateNiftyHeader() {
     const color = isPos ? 'var(--success)' : 'var(--danger)';
     const arrow = isPos ? '▲' : '▼';
     const sign = isPos ? '+' : '';
-
     ltpEl.textContent = ltpText;
     ltpEl.style.color = color;
     chgEl.textContent = `${arrow} ${sign}${diff.toFixed(2)} (${sign}${pct.toFixed(2)}%)`;
@@ -276,7 +269,7 @@ function updateNiftyHeader() {
 }
 
 /* ============================================================
-   SECTION 3.3 — FAST CELL UPDATE (SSE LTP path)
+   SECTION 3.3 — FAST CELL UPDATE (SSE LTP)
    ============================================================ */
 function updateLTPCells(ticks) {
   const rows = document.querySelectorAll('#screenerBody tr[data-token]');
@@ -304,7 +297,6 @@ function updateLTPCells(ticks) {
       }
     }
 
-    /* Pivot cell color update (LTP vs Pivot) */
     const pivotEl = row.querySelector('.pivot-cell');
     if (pivotEl && SCREENER_PIVOT[token]) {
       const pivot = SCREENER_PIVOT[token];
@@ -317,7 +309,7 @@ function updateLTPCells(ticks) {
 }
 
 /* ============================================================
-   SECTION 3.4 — ORB ROW FAST UPDATE (SSE 'orb')
+   SECTION 3.4 — ORB ROW FAST UPDATE
    ============================================================ */
 function updateORBRow(token, state) {
   SCREENER_ORB[token] = {
@@ -450,7 +442,7 @@ async function loadCachedData() {
 }
 
 /* ============================================================
-   SECTION 5 — FETCH 9:15 (REST)
+   SECTION 5 — FETCH 9:15
    ============================================================ */
 async function startFetch() {
   if (FETCHING) return;
@@ -573,6 +565,66 @@ async function startQuoteFetch() {
   showToast('📊 Quote Done', `${ok} fetched · ${failed} failed · at ${ts} IST`);
 }
 
+/* ============================================================
+   SECTION 5.2 — FETCH BHAVCOPY (NSE EOD file)
+   ============================================================ */
+async function startBhavcopyFetch() {
+  if (BHAVCOPY_FETCHING) return;
+
+  const btn = document.getElementById('fetchBhavcopyBtn');
+  BHAVCOPY_FETCHING = true;
+  btn.disabled = true;
+  btn.textContent = '⏳ Bhavcopy...';
+
+  const todayIST = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().split('T')[0];
+  const dateInput = prompt(
+    'Enter date (YYYY-MM-DD) for Bhavcopy.\n\n' +
+    'Today (published after 6:30 PM IST): ' + todayIST + '\n' +
+    'Use yesterday if today not published yet.',
+    todayIST
+  );
+
+  if (!dateInput) {
+    BHAVCOPY_FETCHING = false;
+    btn.disabled = false;
+    btn.textContent = '📥 Fetch Bhavcopy';
+    return;
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateInput)) {
+    showToast('⚠️ Invalid date', 'Use YYYY-MM-DD format');
+    BHAVCOPY_FETCHING = false;
+    btn.disabled = false;
+    btn.textContent = '📥 Fetch Bhavcopy';
+    return;
+  }
+
+  try {
+    const r = await fetch(API + '/api/admin/fetch-bhavcopy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
+      body: JSON.stringify({ date: dateInput })
+    });
+    const d = await r.json();
+
+    if (!r.ok) {
+      showToast('⚠️ Bhavcopy Failed', d.error || `HTTP ${r.status}`);
+    } else {
+      showToast(
+        '✅ Bhavcopy Saved',
+        `${d.saved}/${d.total} saved · ${d.noMatch} not found · ${d.date}`
+      );
+      await loadLTP();
+    }
+  } catch (e) {
+    showToast('⚠️ Error', e.message);
+  }
+
+  BHAVCOPY_FETCHING = false;
+  btn.disabled = false;
+  btn.textContent = '📥 Fetch Bhavcopy';
+}
+
 function updateProgress(done, total) {
   const fill = document.getElementById('progressFill');
   const text = document.getElementById('progressText');
@@ -582,7 +634,7 @@ function updateProgress(done, total) {
 }
 
 /* ============================================================
-   SECTION 6 — LTP + ORB state (REST poll, 30s backup)
+   SECTION 6 — LTP POLL (30s backup)
    ============================================================ */
 async function loadLTP() {
   const tokens = SCREENER_STOCKS.map(s => s.token);
@@ -636,7 +688,7 @@ function startLTPRefresh() {
 }
 
 /* ============================================================
-   SECTION 6.1 — SSE real-time push
+   SECTION 6.1 — SSE
    ============================================================ */
 function startSSE() {
   if (SCREENER_SSE) return;
@@ -650,7 +702,6 @@ function startSSE() {
   SCREENER_SSE.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
-
       if (msg.type === 'ltp' && msg.ticks) {
         if (msg.ticks[NIFTY50_TOKEN] !== undefined) {
           SCREENER_LTP[NIFTY50_TOKEN] = msg.ticks[NIFTY50_TOKEN];
@@ -773,7 +824,6 @@ function renderScreenerTable() {
       changeLine = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
     }
 
-    /* Pivot cell */
     let pivotCell;
     if (pivot) {
       const above = ltp ? (+ltp >= pivot) : null;

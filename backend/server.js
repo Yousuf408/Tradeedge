@@ -1,34 +1,38 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v1.7
+   server.js — TradeAlgo Pro backend  |  v1.8
    ============================================================
 
    STRUCTURE:
     §1  Imports
-    §2  Config (env, DB, stock list, strategy)
+    §2  Config
     §3  Time / phases / holidays
-    §4  ORB state (memory + DB sync)
-    §4.1 Previous close (memory + DB + FULL quote fallback)
-    §4.2 Quote-based High/Low (parallel to REST 9:15)
-    §5  WebSocket manager (tick → stages) + SSE broadcast
-        + batched LTP DB writer
+    §4  ORB state (memory + DB sync) — now with PRICES + target/sl hits
+    §4.1 Previous close
+    §4.2 Quote-based High/Low
+    §5  WebSocket manager + SSE broadcast + LTP batched writes
     §6  Middleware + helpers
     §7  Auth routes
     §8  Forgot password
     §9  Change password + profile
-    §10 Users CRUD (admin)
+    §10 Users CRUD
     §11 Audit + prices
-    §12 Trading holidays (admin)
+    §12 Trading holidays
     §13 Screener routes + SSE stream + quote fetch
     §14 Closing prices (15:34 IST)
+    §14.1 Auto-quote fetch @ 9:30:10 IST (NEW)
     §15 DB cache loader
     §16 Start
 
-   CHANGELOG v1.7 (2026-10-06):
-    - Added §4.2 quoteCache + loadQuoteCacheFromDB()
-    - Added POST /api/screener/fetch-quote-batch (FULL quote)
-    - /api/screener/ltp now returns highQuote, lowQuote, quoteFetchedAt
-    - /api/screener/data now returns quotes{} for cached tokens
-    - WS / SSE / LTP batching pipeline — UNTOUCHED
+   CHANGELOG v1.8 (2026-10-06):
+    - Feature 1: Auto-trigger FULL quote fetch at 09:30:10 IST
+      + catch-up on startup if missed
+    - Feature 2: ORB now saves PRICES (low break, pullback, entry)
+      in DB — along with existing timestamps
+    - Feature 3: Target/SL hit detection after entry signal
+      - target_hit / target_hit_at
+      - sl_hit / sl_hit_at
+    - New SSE event 'orb' — pushes ORB state change instantly
+    - WS / SSE LTP batching / REST 9:15 fetch — UNTOUCHED
    ============================================================ */
 
 import express from 'express';
@@ -86,11 +90,8 @@ console.log(`📋 Stocks: ${STOCKS.length} active / ${ALL_STOCKS.length} total`)
 const SYM_BY_TOKEN = {};
 STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
 
-/* ---- NIFTY 50 index (streamed via same WS, exchangeType 1) ---- */
 const NIFTY50_TOKEN = '99926000';
-const NIFTY50_SYM = 'NIFTY 50';
 
-/* ---- Strategy config ---- */
 const STRATEGIES = {
   advance_orb: {
     id: 'advance_orb',
@@ -161,6 +162,7 @@ function countFilled(date) {
 
 /* ============================================================
    SECTION 4 — ORB STATE (memory + DB)
+   Now carries: prices (break/pullback/entry) + target/sl hits
    ============================================================ */
 const orbState = new Map();
 
@@ -168,8 +170,12 @@ async function loadOrbStateFromDB(date) {
   try {
     const activeTokens = STOCKS.map(s => String(s.token));
     const { rows } = await db.query(
-      `SELECT token, low_broken, first_low_break_at, pullback_confirmed, first_pullback_at,
-              entry_signal, first_entry_at
+      `SELECT token,
+              low_broken, first_low_break_at, first_low_break_price,
+              pullback_confirmed, first_pullback_at, first_pullback_price,
+              entry_signal, first_entry_at, first_entry_price,
+              target_hit, target_hit_at,
+              sl_hit, sl_hit_at
        FROM angel_15m_candle WHERE date=$1 AND token = ANY($2)`,
       [date, activeTokens]
     );
@@ -180,7 +186,14 @@ async function loadOrbStateFromDB(date) {
         entrySignal: !!r.entry_signal,
         firstLowBreakAt: r.first_low_break_at,
         firstPullbackAt: r.first_pullback_at,
-        firstEntryAt: r.first_entry_at
+        firstEntryAt: r.first_entry_at,
+        firstLowBreakPrice: r.first_low_break_price != null ? +r.first_low_break_price : null,
+        firstPullbackPrice: r.first_pullback_price != null ? +r.first_pullback_price : null,
+        firstEntryPrice: r.first_entry_price != null ? +r.first_entry_price : null,
+        targetHit: !!r.target_hit,
+        targetHitAt: r.target_hit_at,
+        slHit: !!r.sl_hit,
+        slHitAt: r.sl_hit_at
       });
     }
     console.log(`🎯 Loaded ORB for ${rows.length} stocks`);
@@ -189,12 +202,15 @@ async function loadOrbStateFromDB(date) {
 
 const getOrbState = (token, date) => orbState.get(`${token}_${date}`) || {
   lowBroken: false, pullbackConfirmed: false, entrySignal: false,
-  firstLowBreakAt: null, firstPullbackAt: null, firstEntryAt: null
+  firstLowBreakAt: null, firstPullbackAt: null, firstEntryAt: null,
+  firstLowBreakPrice: null, firstPullbackPrice: null, firstEntryPrice: null,
+  targetHit: false, targetHitAt: null,
+  slHit: false, slHitAt: null
 };
 
 
 /* ============================================================
-   SECTION 4.1 — PREVIOUS CLOSE (memory + DB + FULL quote fallback)
+   SECTION 4.1 — PREVIOUS CLOSE
    ============================================================ */
 const prevCloseCache = new Map();
 
@@ -256,12 +272,9 @@ async function fetchMissingPrevClose() {
 
 
 /* ============================================================
-   SECTION 4.2 — QUOTE-BASED HIGH/LOW (parallel to REST 9:15)
-   FULL quote se day high/low fetch karke DB mein save.
-   Frontend parallel column dikha sakta hai comparison ke liye.
-   WS / ORB logic isse touch nahi hota — separate channel.
+   SECTION 4.2 — QUOTE-BASED HIGH/LOW
    ============================================================ */
-const quoteCache = new Map();   // token → { high, low, fetchedAt }
+const quoteCache = new Map();
 
 async function loadQuoteCacheFromDB() {
   try {
@@ -288,7 +301,7 @@ async function loadQuoteCacheFromDB() {
 
 /* ============================================================
    SECTION 5 — WEBSOCKET MANAGER + SSE BROADCAST + LTP BATCH WRITER
-   ⚠️  PROTECTED ZONE — DO NOT MODIFY WITHOUT EXPLICIT REQUEST
+   ⚠️  PROTECTED — only ORB stage logic + target/sl check added
    ============================================================ */
 let wsStarted = false;
 let wsConnectedTokens = 0;
@@ -364,11 +377,39 @@ function broadcastLTP(token, ltp) {
   }, 100);
 }
 
+/* ---- ORB state change broadcaster (rare events — max 5/stock/day) ---- */
+function broadcastORB(token, state) {
+  if (!sseClients.size) return;
+  const payload = `data: ${JSON.stringify({
+    type: 'orb',
+    token,
+    state: {
+      lowBroken: state.lowBroken,
+      pullbackConfirmed: state.pullbackConfirmed,
+      entrySignal: state.entrySignal,
+      firstLowBreakAt: state.firstLowBreakAt,
+      firstPullbackAt: state.firstPullbackAt,
+      firstEntryAt: state.firstEntryAt,
+      firstLowBreakPrice: state.firstLowBreakPrice,
+      firstPullbackPrice: state.firstPullbackPrice,
+      firstEntryPrice: state.firstEntryPrice,
+      targetHit: state.targetHit,
+      targetHitAt: state.targetHitAt,
+      slHit: state.slHit,
+      slHitAt: state.slHitAt
+    }
+  })}\n\n`;
+  for (const c of sseClients) {
+    try { c.res.write(payload); }
+    catch { sseClients.delete(c); }
+  }
+}
+
 function handleTick(token, ltp) {
   /* Reject absurd LTPs (garbage packets, parse errors, etc.) */
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
 
-  /* NIFTY 50 — special path (no ORB, no candles, just LTP broadcast) */
+  /* NIFTY 50 — special path (no ORB) */
   if (token === NIFTY50_TOKEN) {
     setCachedLTP(token, ltp);
     broadcastLTP(token, ltp);
@@ -377,7 +418,7 @@ function handleTick(token, ltp) {
 
   const p = getScreenerPhase();
   if (p.phase !== 'ready' || !p.date) return;
-   
+
   const candleArr = getCachedCandles([token], p.date)[0]?.candle;
   if (!Array.isArray(candleArr) || candleArr.length < 5) return;
 
@@ -387,40 +428,80 @@ function handleTick(token, ltp) {
   const state = getOrbState(token, p.date);
   let changed = false;
 
+  /* Stage 1 — Low broken */
   if (!state.lowBroken && ltp < low) {
     state.lowBroken = true;
     state.firstLowBreakAt = new Date().toISOString();
+    state.firstLowBreakPrice = ltp;
     db.query(
-      `UPDATE angel_15m_candle SET low_broken=true, first_low_break_at=NOW()
+      `UPDATE angel_15m_candle
+       SET low_broken=true, first_low_break_at=NOW(), first_low_break_price=$3
        WHERE date=$1 AND token=$2 AND low_broken=false`,
-      [p.date, token]
+      [p.date, token, ltp]
     ).catch(() => {});
     changed = true;
   }
 
+  /* Stage 2 — Pullback confirmed */
   if (state.lowBroken && !state.pullbackConfirmed && ltp > low && ltp < high) {
     state.pullbackConfirmed = true;
     state.firstPullbackAt = new Date().toISOString();
+    state.firstPullbackPrice = ltp;
     db.query(
-      `UPDATE angel_15m_candle SET pullback_confirmed=true, first_pullback_at=NOW()
+      `UPDATE angel_15m_candle
+       SET pullback_confirmed=true, first_pullback_at=NOW(), first_pullback_price=$3
        WHERE date=$1 AND token=$2 AND pullback_confirmed=false`,
-      [p.date, token]
+      [p.date, token, ltp]
     ).catch(() => {});
     changed = true;
   }
 
+  /* Stage 3 — Entry signal (breakout) */
   if (state.pullbackConfirmed && !state.entrySignal && ltp > high) {
     state.entrySignal = true;
     state.firstEntryAt = new Date().toISOString();
+    state.firstEntryPrice = ltp;
     db.query(
-      `UPDATE angel_15m_candle SET entry_signal=true, first_entry_at=NOW()
+      `UPDATE angel_15m_candle
+       SET entry_signal=true, first_entry_at=NOW(), first_entry_price=$3
        WHERE date=$1 AND token=$2 AND entry_signal=false`,
-      [p.date, token]
+      [p.date, token, ltp]
     ).catch(() => {});
     changed = true;
   }
 
-  if (changed) orbState.set(key, state);
+  /* Stage 4 — Target / SL hit (only after entry, once) */
+  if (state.entrySignal && !state.targetHit && !state.slHit) {
+    const target = high * 1.01;    // matches frontend convention
+    const sl = low;
+
+    if (ltp >= target) {
+      state.targetHit = true;
+      state.targetHitAt = new Date().toISOString();
+      db.query(
+        `UPDATE angel_15m_candle
+         SET target_hit=true, target_hit_at=NOW()
+         WHERE date=$1 AND token=$2 AND target_hit=false`,
+        [p.date, token]
+      ).catch(() => {});
+      changed = true;
+    } else if (ltp <= sl) {
+      state.slHit = true;
+      state.slHitAt = new Date().toISOString();
+      db.query(
+        `UPDATE angel_15m_candle
+         SET sl_hit=true, sl_hit_at=NOW()
+         WHERE date=$1 AND token=$2 AND sl_hit=false`,
+        [p.date, token]
+      ).catch(() => {});
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    orbState.set(key, state);
+    broadcastORB(token, state);
+  }
 
   setCachedLTP(token, ltp);
   broadcastLTP(token, ltp);
@@ -925,7 +1006,7 @@ app.put('/api/prices', auth, adminOnly, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 12 — TRADING HOLIDAYS (admin)
+   SECTION 12 — TRADING HOLIDAYS
    ============================================================ */
 app.get('/api/admin/holidays', auth, adminOnly, async (req, res) => {
   const { rows } = await db.query('SELECT date::text AS date, reason FROM trading_holidays ORDER BY date ASC');
@@ -994,7 +1075,6 @@ app.get('/api/screener/data', auth, (req, res) => {
   const passingTokens = new Set(passing.map(c => String(c.token)));
   const passingStocks = STOCKS.filter(s => passingTokens.has(String(s.token)));
 
-  /* Attach quote H/L for cached tokens */
   const quotes = {};
   for (const t of cachedTokens) {
     const q = quoteCache.get(t);
@@ -1012,7 +1092,7 @@ app.get('/api/screener/data', auth, (req, res) => {
   });
 });
 
-/* ---- SSE stream — real-time LTP push ---- */
+/* ---- SSE stream ---- */
 app.get('/api/screener/stream', (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(401).end();
@@ -1041,7 +1121,7 @@ app.get('/api/screener/stream', (req, res) => {
   });
 });
 
-/* ---- FULL quote fetch (parallel to REST 9:15 fetch) ---- */
+/* ---- FULL quote fetch ---- */
 app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1068,6 +1148,20 @@ app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
       ).catch(() => {});
 
       results.push({ token, high, low });
+    }
+
+    /* Broadcast quote update via SSE */
+    if (sseClients.size && results.length) {
+      const payload = `data: ${JSON.stringify({
+        type: 'quote',
+        fetchedAt,
+        quotes: Object.fromEntries(
+          [...quoteCache.entries()].map(([t, v]) => [t, { high: v.high, low: v.low, fetchedAt: v.fetchedAt }])
+        )
+      })}\n\n`;
+      for (const c of sseClients) {
+        try { c.res.write(payload); } catch { sseClients.delete(c); }
+      }
     }
 
     console.log(`📊 Quote H/L fetched: ${results.length}/${tokens.length} at ${fetchedAt.toISOString()}`);
@@ -1102,7 +1196,10 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
         if (!orbState.has(`${r.token}_${p.date}`)) {
           orbState.set(`${r.token}_${p.date}`, {
             lowBroken: false, pullbackConfirmed: false, entrySignal: false,
-            firstLowBreakAt: null, firstPullbackAt: null, firstEntryAt: null
+            firstLowBreakAt: null, firstPullbackAt: null, firstEntryAt: null,
+            firstLowBreakPrice: null, firstPullbackPrice: null, firstEntryPrice: null,
+            targetHit: false, targetHitAt: null,
+            slHit: false, slHitAt: null
           });
         }
       }
@@ -1111,8 +1208,6 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* Client polls this — reads from memory.
-   Returns LTP + ORB state + prevClose + quote H/L. */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1139,6 +1234,13 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       newLowAt: state.firstLowBreakAt,
       pullbackAt: state.firstPullbackAt,
       breakoutAt: state.firstEntryAt,
+      lowBreakPrice: state.firstLowBreakPrice,
+      pullbackPrice: state.firstPullbackPrice,
+      entryPrice: state.firstEntryPrice,
+      targetHit: state.targetHit,
+      targetHitAt: state.targetHitAt,
+      slHit: state.slHit,
+      slHitAt: state.slHitAt,
       serverTime
     };
   });
@@ -1208,6 +1310,90 @@ function scheduleClosingFetch() {
 
 
 /* ============================================================
+   SECTION 14.1 — AUTO QUOTE FETCH @ 09:30:10 IST
+   ============================================================ */
+async function autoFetchQuote() {
+  try {
+    if (!isTradingDay(getIST())) {
+      console.log('📊 Auto-quote: non-trading day, skip');
+      return;
+    }
+
+    const p = getScreenerPhase();
+    if (!p.date) { console.log('📊 Auto-quote: no trading date, skip'); return; }
+
+    const tokens = STOCKS.map(s => String(s.token));
+    console.log(`📊 Auto-quote: fetching ${tokens.length} tokens...`);
+    const t0 = Date.now();
+
+    const quotes = await getFullQuotesForTokens(tokens);
+    const fetchedAt = new Date();
+    let saved = 0;
+
+    for (const q of quotes) {
+      if (!q || !q.token) continue;
+      const high = +q.high;
+      const low = +q.low;
+      if (!Number.isFinite(high) || !Number.isFinite(low) || high <= 0 || low <= 0) continue;
+
+      const token = String(q.token);
+      quoteCache.set(token, { high, low, fetchedAt });
+
+      db.query(
+        `UPDATE angel_15m_candle SET high_quote=$1, low_quote=$2, quote_fetched_at=$3 WHERE date=$4 AND token=$5`,
+        [high, low, fetchedAt, p.date, token]
+      ).catch(() => {});
+
+      saved++;
+    }
+
+    /* Broadcast to SSE clients */
+    if (sseClients.size) {
+      const payload = `data: ${JSON.stringify({
+        type: 'quote',
+        fetchedAt,
+        quotes: Object.fromEntries(
+          [...quoteCache.entries()].map(([t, v]) => [t, { high: v.high, low: v.low, fetchedAt: v.fetchedAt }])
+        )
+      })}\n\n`;
+      for (const c of sseClients) {
+        try { c.res.write(payload); } catch { sseClients.delete(c); }
+      }
+    }
+
+    console.log(`✅ Auto-quote: ${saved}/${tokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
+  } catch (e) {
+    console.error('Auto-quote failed:', e.message);
+  }
+}
+
+function msUntilNext93010IST() {
+  const ist = getIST();
+  const daySecs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
+  const target = 9 * 3600 + 30 * 60 + 10;   // 09:30:10 IST
+  let diffSecs = target - daySecs;
+  if (diffSecs <= 0) diffSecs += 86400;
+
+  /* Skip non-trading days */
+  for (let i = 0; i < 15; i++) {
+    const candidate = new Date(ist.getTime() + diffSecs * 1000);
+    if (isTradingDay(candidate)) break;
+    diffSecs += 86400;
+  }
+  return diffSecs * 1000;
+}
+
+function scheduleQuoteAutoFetch() {
+  const ms = msUntilNext93010IST();
+  console.log(`⏰ Next auto-quote fetch in ${Math.round(ms / 60000)} min`);
+  setTimeout(async () => {
+    await autoFetchQuote();
+    scheduleQuoteAutoFetch();
+  }, ms);
+}
+
+
+/* ============================================================
    SECTION 15 — DB CACHE LOADER
    ============================================================ */
 async function loadScreenerCacheFromDB() {
@@ -1251,6 +1437,7 @@ app.listen(PORT, async () => {
 
   fetchMissingPrevClose().catch(e => console.error('prevClose fetch err:', e.message));
 
+  /* Late startup catch-up for closing prices */
   const nowIST = getIST();
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
   const dow = nowIST.getUTCDay();
@@ -1258,7 +1445,28 @@ app.listen(PORT, async () => {
     console.log('🔔 Late startup — fetching closing prices');
     fetchClosingPrices();
   }
-  scheduleClosingFetch();
 
-  console.log('ℹ️  Ready — WS + SSE + batched LTP + NIFTY 50 + quote H/L');
+  /* Late startup catch-up for auto-quote (9:30:10 – 9:45 window) */
+  if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 570 && mins <= 585) {
+    const pQ = getScreenerPhase();
+    if (pQ.date) {
+      try {
+        const { rows } = await db.query(
+          'SELECT COUNT(*) AS cnt FROM angel_15m_candle WHERE date=$1 AND high_quote IS NOT NULL',
+          [pQ.date]
+        );
+        if (+rows[0].cnt === 0) {
+          console.log('🔔 Late startup — running auto-quote catch-up');
+          autoFetchQuote().catch(e => console.error('catch-up failed:', e.message));
+        } else {
+          console.log(`✅ Today's quote already fetched (${rows[0].cnt} tokens)`);
+        }
+      } catch (e) { console.error('catch-up check failed:', e.message); }
+    }
+  }
+
+  scheduleClosingFetch();
+  scheduleQuoteAutoFetch();
+
+  console.log('ℹ️  Ready — WS + SSE + batched LTP + NIFTY 50 + quote H/L + auto-quote @ 9:30:10');
 });

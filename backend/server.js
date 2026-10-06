@@ -361,7 +361,7 @@ function broadcastLTP(token, ltp) {
       try { c.res.write(payload); }
       catch { sseClients.delete(c); }
     }
-  }, 300);
+  }, 100);
 }
 
 /* ---- Called for every tick from WebSocket ---- */

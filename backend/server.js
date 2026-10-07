@@ -1,12 +1,12 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v2.3
+   server.js — TradeAlgo Pro backend  |  v2.4
    ============================================================
 
-   DUAL SOURCE MODE + PIVOT CACHE
-   - REST historical (9:15 candles) → open/high/low/close
-   - FULL Quote (9:30:10 auto) → q15_open/q15_high/q15_low/q15_close
-   - 15:16 daily fetch (auto + manual) → day_high/day_low/day_close + pivot
-   - Pivot loaded from most recent non-null (yesterday's pivot for today)
+   DUAL SOURCE MODE + PIVOT CACHE (yesterday's pivot for today)
+   - REST historical → open/high/low/close
+   - FULL Quote (9:30:10 auto) → q15_* columns
+   - 15:16 daily fetch (auto + manual) → day_high/low/close + pivot
+   - Pivot loader: date < today (never uses today's own pivot)
    ============================================================ */
 
 import express from 'express';
@@ -235,16 +235,16 @@ async function loadQuoteCacheFromDB() {
 
 /* ============================================================
    SECTION 4.2b — PIVOT CACHE
-   Loads most recent non-null pivot per token (yesterday's pivot
-   for today's trading). Same flow used by frontend.
+   Loads most recent pivot from BEFORE today (yesterday's pivot
+   for today's trading). Today's own pivot is never used as
+   today's reference — it belongs to tomorrow.
    ============================================================ */
 const pivotCache = new Map();
 
 async function loadLatestPivotFromDB() {
   try {
     const activeTokens = STOCKS.map(s => String(s.token));
-    const { rows } = await db.query(
-         const today = getIST().toISOString().split('T')[0];
+    const today = getIST().toISOString().split('T')[0];
     const { rows } = await db.query(
       `SELECT DISTINCT ON (token) token, pivot
        FROM angel_15m_candle
@@ -254,9 +254,8 @@ async function loadLatestPivotFromDB() {
        ORDER BY token, date DESC`,
       [activeTokens, today]
     );
-     
     for (const r of rows) pivotCache.set(String(r.token), +r.pivot);
-    console.log(`📐 Loaded pivot for ${rows.length} tokens from DB`);
+    console.log(`📐 Loaded pivot for ${rows.length} tokens (from dates < ${today})`);
   } catch (e) { console.error('pivot load failed:', e.message); }
 }
 
@@ -1030,7 +1029,7 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* ---- FULL Quote fetch → q15_* columns ---- */
+/* ---- FULL Quote fetch ---- */
 app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1157,7 +1156,8 @@ async function fetchDayHLC() {
       ).catch(() => {});
 
       prevCloseCache.set(token, close);
-      pivotCache.set(token, pivot);
+      /* NOTE: pivotCache NOT updated — it must keep yesterday's pivot
+         for the rest of today. Tomorrow's boot will load this new pivot. */
       saved++;
     }
     await flushLtpWrites();
@@ -1186,7 +1186,7 @@ function msUntilNext1516IST() {
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
   const target = new Date(ist);
   target.setUTCHours(0, 0, 0, 0);
-  target.setUTCMinutes(916);   // 15:16 IST
+  target.setUTCMinutes(916);
   if (mins >= 916) target.setUTCDate(target.getUTCDate() + 1);
   const dow = target.getUTCDay();
   if (dow === 6) target.setUTCDate(target.getUTCDate() + 2);

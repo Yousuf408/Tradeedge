@@ -1,9 +1,9 @@
 /* ============================================================
-   SCREENER.JS  — v2.3
+   SCREENER.JS  — v2.4
    + Strategy dropdown (Advance ORB / Momentum)
    + Pivot column
-   + Null-safe guards (works even before any fetch)
-   + Shows all stocks if no candles cached yet
+   + Manual "Fetch Day H/L/C" button (admin only)
+   + Null-safe guards
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -20,6 +20,7 @@ let SCREENER_LTP_TIMER = null;
 let SCREENER_SSE = null;
 let FETCHING = false;
 let QUOTE_FETCHING = false;
+let DAYHLC_FETCHING = false;
 
 let SCREENER_STAGE_FILTER = 'all';
 let SCREENER_SORT_BY = 'change';
@@ -74,6 +75,7 @@ function setupControls() {
     </select>
     <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
     <button id="fetchQuoteBtn" class="btn btn-outline" onclick="startQuoteFetch()">📊 Fetch Quote H/L</button>
+    <button id="fetchDayHLCBtn" class="btn btn-outline" onclick="startDayHLCFetch()">📅 Fetch Day H/L/C</button>
     <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">Per-Trade ₹</label>
     <input id="perTradeInput" type="number" value="10000" min="100"
            style="width:110px;padding:7px 12px;border:1.5px solid var(--border-soft);border-radius:8px;
@@ -202,7 +204,7 @@ function sortStocks(stocks) {
 }
 
 /* ============================================================
-   SECTION 3 — FILTER (strategy)
+   SECTION 3 — FILTER
    ============================================================ */
 function passesFilter(candle) {
   if (!candle) return false;
@@ -213,7 +215,6 @@ function passesFilter(candle) {
 }
 
 function recomputeFilteredStocks() {
-  /* No candles cached yet → show ALL stocks (so Quote/LTP visible without REST) */
   if (SCREENER_CACHED_TOKENS.size === 0) {
     SCREENER_STOCKS = [...SCREENER_ALL_STOCKS];
     return;
@@ -293,7 +294,7 @@ function updateNiftyHeader() {
 }
 
 /* ============================================================
-   SECTION 3.3 — FAST CELL UPDATE (SSE LTP path)
+   SECTION 3.3 — FAST CELL UPDATE (SSE LTP)
    ============================================================ */
 function updateLTPCells(ticks) {
   const rows = document.querySelectorAll('#screenerBody tr[data-token]');
@@ -321,7 +322,6 @@ function updateLTPCells(ticks) {
       }
     }
 
-    /* Pivot cell live color update */
     const pivotEl = row.querySelector('.pivot-cell');
     if (pivotEl && SCREENER_PIVOT[token]) {
       const pivot = SCREENER_PIVOT[token];
@@ -334,7 +334,7 @@ function updateLTPCells(ticks) {
 }
 
 /* ============================================================
-   SECTION 3.4 — ORB ROW FAST UPDATE (SSE 'orb')
+   SECTION 3.4 — ORB ROW FAST UPDATE
    ============================================================ */
 function updateORBRow(token, state) {
   SCREENER_ORB[token] = {
@@ -555,7 +555,7 @@ async function startFetch() {
 }
 
 /* ============================================================
-   SECTION 5.1 — FETCH QUOTE (FULL quote → q15_* on server)
+   SECTION 5.1 — FETCH QUOTE
    ============================================================ */
 async function startQuoteFetch() {
   if (QUOTE_FETCHING) return;
@@ -591,7 +591,6 @@ async function startQuoteFetch() {
           };
           SCREENER_CACHED_TOKENS.add(String(item.token));
 
-          /* Also populate local candle cache for immediate table render */
           if (!SCREENER_ALL_CANDLES[item.token]) {
             SCREENER_ALL_CANDLES[item.token] = {
               open: item.open || item.low,
@@ -626,6 +625,52 @@ async function startQuoteFetch() {
   startSSE();
 }
 
+/* ============================================================
+   SECTION 5.2 — MANUAL DAY H/L/C + PIVOT FETCH
+   ============================================================ */
+async function startDayHLCFetch() {
+  const btn = document.getElementById('fetchDayHLCBtn');
+  if (!btn) return;
+  if (DAYHLC_FETCHING) return;
+
+  const ok = confirm(
+    'Fetch day High/Low/Close + Pivot for all stocks now?\n\n' +
+    '• Server will call Quote API for all 387 stocks\n' +
+    '• Takes ~5–8 seconds\n' +
+    '• Overwrites existing day_high/day_low/day_close/pivot\n\n' +
+    'Continue?'
+  );
+  if (!ok) return;
+
+  DAYHLC_FETCHING = true;
+  btn.disabled = true;
+  btn.textContent = '⏳ Fetching day H/L/C...';
+
+  try {
+    const r = await fetch(API + '/api/admin/force-day-hlc', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
+    });
+    const d = await r.json();
+
+    if (!r.ok) {
+      showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
+    } else {
+      showToast(
+        '✅ Day H/L/C Saved',
+        `${d.saved}/${d.total} stocks · ${d.date}`
+      );
+      await loadLTP();
+    }
+  } catch (e) {
+    showToast('⚠️ Error', e.message);
+  }
+
+  DAYHLC_FETCHING = false;
+  btn.disabled = false;
+  btn.textContent = '📅 Fetch Day H/L/C';
+}
+
 function updateProgress(done, total) {
   const fill = document.getElementById('progressFill');
   const text = document.getElementById('progressText');
@@ -635,7 +680,7 @@ function updateProgress(done, total) {
 }
 
 /* ============================================================
-   SECTION 6 — LTP + ORB state (REST poll, 30s backup)
+   SECTION 6 — LTP POLL (30s backup)
    ============================================================ */
 async function loadLTP() {
   const tokens = SCREENER_STOCKS.map(s => s.token);
@@ -692,7 +737,7 @@ function startLTPRefresh() {
 }
 
 /* ============================================================
-   SECTION 6.1 — SSE real-time push
+   SECTION 6.1 — SSE
    ============================================================ */
 function startSSE() {
   if (SCREENER_SSE) return;
@@ -763,7 +808,7 @@ function renderScreenerTable() {
   const count = document.getElementById('screenerCount');
   if (!head || !body) return;
 
-  /* ---- Momentum branch (columns only) ---- */
+  /* ---- Momentum branch ---- */
   if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
     head.innerHTML = `<tr>
       <th>Stock / Company</th>
@@ -788,7 +833,7 @@ function renderScreenerTable() {
     return;
   }
 
-  /* ---- Advance ORB branch ---- */
+  /* ---- Advance ORB ---- */
   const chipsEl = document.getElementById('stageChips');
   if (chipsEl) chipsEl.style.display = '';
 
@@ -842,7 +887,6 @@ function renderScreenerTable() {
     const quote = SCREENER_QUOTE[s.token];
     const pivot = SCREENER_PIVOT[s.token];
 
-    /* Null-safe: candle may be missing before any fetch */
     const sl = c ? c.low : null;
     const high = c ? c.high : null;
     const target = high ? high * 1.01 : null;
@@ -862,7 +906,6 @@ function renderScreenerTable() {
       changeLine = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
     }
 
-    /* Pivot cell */
     let pivotCell;
     if (pivot) {
       const above = ltp ? (+ltp >= pivot) : null;

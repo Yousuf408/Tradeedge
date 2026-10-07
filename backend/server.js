@@ -1,11 +1,12 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v2.4
+   server.js — TradeAlgo Pro backend  |  v2.5
    ============================================================
 
-   DUAL SOURCE MODE + PIVOT CACHE (yesterday's pivot for today)
+   DUAL SOURCE MODE + PIVOT CACHE + RETRY FOR MISSING TOKENS
    - REST historical → open/high/low/close
    - FULL Quote (9:30:10 auto) → q15_* columns
    - 15:16 daily fetch (auto + manual) → day_high/low/close + pivot
+   - Retry logic for tokens silently dropped by Angel quote API
    - Pivot loader: date < today (never uses today's own pivot)
    ============================================================ */
 
@@ -235,9 +236,9 @@ async function loadQuoteCacheFromDB() {
 
 /* ============================================================
    SECTION 4.2b — PIVOT CACHE
-   Loads most recent pivot from BEFORE today (yesterday's pivot
-   for today's trading). Today's own pivot is never used as
-   today's reference — it belongs to tomorrow.
+   Most recent pivot from BEFORE today (yesterday's pivot for
+   today's trading). Today's own pivot is never used as today's
+   reference — it belongs to tomorrow.
    ============================================================ */
 const pivotCache = new Map();
 
@@ -1129,17 +1130,20 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 
 /* ============================================================
    SECTION 14 — DAY H/L/C FETCH (15:16 IST) + PIVOT
+   With retry for tokens silently dropped by Angel quote API
    ============================================================ */
 async function fetchDayHLC() {
   try {
     const p = getScreenerPhase();
     if (!p.date) return;
-    const tokens = STOCKS.map(s => String(s.token));
-    console.log(`🔔 Fetching day H/L/C (Quote) for ${tokens.length} stocks...`);
+    const allTokens = STOCKS.map(s => String(s.token));
+    console.log(`🔔 Fetching day H/L/C (Quote) for ${allTokens.length} stocks...`);
 
-    const quotes = await fetchQuotesForTokens(tokens);
-    let saved = 0;
+    const savedTokens = new Set();
+    const t0 = Date.now();
 
+    /* ---- Attempt 1: all tokens ---- */
+    let quotes = await fetchQuotesForTokens(allTokens);
     for (const q of quotes) {
       if (!q || !q.token) continue;
       if (!Number.isFinite(q.high) || !Number.isFinite(q.low) || q.high <= 0 || q.low <= 0) continue;
@@ -1156,12 +1160,46 @@ async function fetchDayHLC() {
       ).catch(() => {});
 
       prevCloseCache.set(token, close);
-      /* NOTE: pivotCache NOT updated — it must keep yesterday's pivot
-         for the rest of today. Tomorrow's boot will load this new pivot. */
-      saved++;
+      savedTokens.add(token);
     }
+
+    /* ---- Retry missing tokens (2 more attempts) ---- */
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const missing = allTokens.filter(t => !savedTokens.has(t));
+      if (!missing.length) break;
+
+      console.log(`🔁 Retry ${attempt}: ${missing.length} missing tokens...`);
+      await new Promise(r => setTimeout(r, 1500));
+
+      const retry = await fetchQuotesForTokens(missing);
+      for (const q of retry) {
+        if (!q || !q.token) continue;
+        if (!Number.isFinite(q.high) || !Number.isFinite(q.low) || q.high <= 0 || q.low <= 0) continue;
+
+        const token = String(q.token);
+        const close = q.ltp || q.close;
+        const pivot = (+q.high + +q.low + +close) / 3;
+
+        db.query(
+          `UPDATE angel_15m_candle
+           SET day_high=$1, day_low=$2, day_close=$3, pivot=$4, prev_close=$5
+           WHERE date=$6 AND token=$7`,
+          [q.high, q.low, close, pivot, close, p.date, token]
+        ).catch(() => {});
+
+        prevCloseCache.set(token, close);
+        savedTokens.add(token);
+      }
+    }
+
     await flushLtpWrites();
-    console.log(`✅ Day H/L/C + pivot: ${saved}/${tokens.length} saved`);
+    const totalTime = Math.round((Date.now() - t0) / 1000);
+    console.log(`✅ Day H/L/C: ${savedTokens.size}/${allTokens.length} saved in ${totalTime}s`);
+
+    const stillMissing = allTokens.filter(t => !savedTokens.has(t));
+    if (stillMissing.length) {
+      console.log(`⚠️  Still missing (${stillMissing.length}):`, stillMissing.join(','));
+    }
   } catch (e) { console.error('Day H/L/C fetch failed:', e.message); }
 }
 
@@ -1203,6 +1241,7 @@ function scheduleDailyFetch() {
 
 /* ============================================================
    SECTION 14.1 — AUTO QUOTE FETCH @ 09:30:10 IST
+   With retry for missing tokens
    ============================================================ */
 async function autoFetchQuote() {
   try {
@@ -1210,21 +1249,21 @@ async function autoFetchQuote() {
     const p = getScreenerPhase();
     if (!p.date) { console.log('📊 Auto-quote: no trading date, skip'); return; }
 
-    const tokens = STOCKS.map(s => String(s.token));
-    console.log(`📊 Auto-quote: fetching ${tokens.length} tokens...`);
+    const allTokens = STOCKS.map(s => String(s.token));
+    console.log(`📊 Auto-quote: fetching ${allTokens.length} tokens...`);
     const t0 = Date.now();
 
-    const quotes = await fetchQuotesForTokens(tokens);
+    const savedTokens = new Set();
     const fetchedAt = new Date();
-    let saved = 0;
 
+    /* ---- Attempt 1 ---- */
+    let quotes = await fetchQuotesForTokens(allTokens);
     for (const q of quotes) {
       if (!q || !q.token) continue;
       if (!Number.isFinite(q.high) || !Number.isFinite(q.low) || q.high <= 0 || q.low <= 0) continue;
 
       const token = String(q.token);
       quoteCache.set(token, { high: q.high, low: q.low, fetchedAt });
-
       if (q.close > 0 && !prevCloseCache.has(token)) prevCloseCache.set(token, q.close);
 
       db.query(
@@ -1250,11 +1289,52 @@ async function autoFetchQuote() {
           targetHit: false, targetHitAt: null, slHit: false, slHitAt: null
         });
       }
-      saved++;
+      savedTokens.add(token);
+    }
+
+    /* ---- Retry missing ---- */
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const missing = allTokens.filter(t => !savedTokens.has(t));
+      if (!missing.length) break;
+
+      console.log(`🔁 Auto-quote retry ${attempt}: ${missing.length} missing tokens...`);
+      await new Promise(r => setTimeout(r, 1500));
+
+      const retry = await fetchQuotesForTokens(missing);
+      for (const q of retry) {
+        if (!q || !q.token) continue;
+        if (!Number.isFinite(q.high) || !Number.isFinite(q.low) || q.high <= 0 || q.low <= 0) continue;
+
+        const token = String(q.token);
+        quoteCache.set(token, { high: q.high, low: q.low, fetchedAt });
+        if (q.close > 0 && !prevCloseCache.has(token)) prevCloseCache.set(token, q.close);
+
+        db.query(
+          `INSERT INTO angel_15m_candle (date, token, sym, q15_open, q15_high, q15_low, q15_close, prev_close, quote_fetched_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+           ON CONFLICT (date, token) DO UPDATE SET
+             sym=EXCLUDED.sym,
+             q15_open=EXCLUDED.q15_open, q15_high=EXCLUDED.q15_high,
+             q15_low=EXCLUDED.q15_low, q15_close=EXCLUDED.q15_close,
+             prev_close=COALESCE(EXCLUDED.prev_close, angel_15m_candle.prev_close),
+             quote_fetched_at=EXCLUDED.quote_fetched_at, updated_at=NOW()`,
+          [p.date, token, SYM_BY_TOKEN[token] || '?', q.open || q.low, q.high, q.low, q.ltp || q.high, q.close || null, fetchedAt]
+        ).catch(() => {});
+
+        setCachedCandle(token, p.date, [0, q.open || q.low, q.high, q.low, q.ltp || q.high, 0]);
+        if (q.ltp) setCachedLTP(token, q.ltp);
+
+        savedTokens.add(token);
+      }
     }
 
     broadcastQuote(fetchedAt);
-    console.log(`✅ Auto-quote: ${saved}/${tokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
+    console.log(`✅ Auto-quote: ${savedTokens.size}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
+
+    const stillMissing = allTokens.filter(t => !savedTokens.has(t));
+    if (stillMissing.length) {
+      console.log(`⚠️  Auto-quote still missing (${stillMissing.length}):`, stillMissing.slice(0, 20).join(','));
+    }
   } catch (e) {
     console.error('Auto-quote failed:', e.message);
   }
@@ -1341,13 +1421,11 @@ app.listen(PORT, async () => {
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
   const dow = nowIST.getUTCDay();
 
-  /* Late startup catch-up: day H/L/C (15:16 – 15:40 IST) */
   if (dow >= 1 && dow <= 5 && mins >= 916 && mins <= 940) {
     console.log('🔔 Late startup — fetching day H/L/C');
     fetchDayHLC();
   }
 
-  /* Late startup catch-up: auto-quote (9:30:10 – 9:45 IST) */
   if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 570 && mins <= 585) {
     const pQ = getScreenerPhase();
     if (pQ.date) {

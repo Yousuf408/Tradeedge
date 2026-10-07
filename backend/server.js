@@ -1,14 +1,12 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v2.1
+   server.js — TradeAlgo Pro backend  |  v2.2
    ============================================================
 
-   DUAL SOURCE MODE:
+   DUAL SOURCE MODE + SNAPQUOTE:
    - REST historical (9:15 candles) → open/high/low/close
    - FULL Quote (9:30:10 auto) → q15_open/q15_high/q15_low/q15_close
    - 15:34 daily fetch → day_high/day_low/day_close + pivot
-
-   Both feed the SAME candle cache. Boot loader prefers REST,
-   falls back to Q15 if REST missing.
+   - SnapQuote WS (parallel connection) → buy/sell qty, volume, ltq, atp
    ============================================================ */
 
 import express from 'express';
@@ -42,6 +40,7 @@ import {
 } from './brokers/angelone/Angel_Quote.js';
 
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
+import { startWSSnap, stopWSSnap, getWSSnapStatus } from './brokers/angelone/Angel_WS_Snap.js';
 
 dotenv.config();
 
@@ -73,7 +72,7 @@ const SYM_BY_TOKEN = {};
 STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
 
 const NIFTY50_TOKEN = '99926000';
-const ENTRY_CUTOFF_MINS = Number(process.env.ENTRY_CUTOFF_MINS || 885); // 14:45 IST
+const ENTRY_CUTOFF_MINS = Number(process.env.ENTRY_CUTOFF_MINS || 885);
 
 const STRATEGIES = {
   advance_orb: {
@@ -209,9 +208,8 @@ async function loadPrevCloseFromDB() {
 
 /* ============================================================
    SECTION 4.2 — QUOTE H/L CACHE (from q15_* columns)
-   Used by frontend "Quote H/L" column and day-H/L tracking
    ============================================================ */
-const quoteCache = new Map();   // token → { high, low, fetchedAt }
+const quoteCache = new Map();
 
 async function loadQuoteCacheFromDB() {
   try {
@@ -233,6 +231,44 @@ async function loadQuoteCacheFromDB() {
     }
     console.log(`📊 Loaded quote H/L for ${rows.length} tokens from DB`);
   } catch (e) { console.error('quoteCache load failed:', e.message); }
+}
+
+
+/* ============================================================
+   SECTION 4.3 — SNAP QUOTE CACHE (buy/sell qty, volume, ltq, atp)
+   Fed by separate SnapQuote WS connection.
+   ============================================================ */
+const snapCache = new Map();
+let snapPending = new Map();
+let snapFlushTimer = null;
+
+function broadcastSnap(token, snap) {
+  if (!sseClients.size) return;
+  snapPending.set(String(token), snap);
+  if (snapFlushTimer) return;
+  snapFlushTimer = setTimeout(() => {
+    snapFlushTimer = null;
+    if (!snapPending.size) return;
+    const payload = `data: ${JSON.stringify({ type: 'snap', snaps: Object.fromEntries(snapPending) })}\n\n`;
+    snapPending.clear();
+    for (const c of sseClients) {
+      try { c.res.write(payload); } catch { sseClients.delete(c); }
+    }
+  }, 300);
+}
+
+function handleSnapTick(token, snap) {
+  if (!snap) return;
+  const entry = {
+    buyQty: snap.buyQty ?? null,
+    sellQty: snap.sellQty ?? null,
+    volume: snap.volume ?? null,
+    ltq: snap.ltq ?? null,
+    atp: snap.atp ?? null,
+    ts: snap.ts
+  };
+  snapCache.set(String(token), entry);
+  broadcastSnap(token, entry);
 }
 
 
@@ -417,7 +453,6 @@ function startWebSocketForReadyPhase() {
   const p = getScreenerPhase();
   if (p.phase !== 'ready' || !p.date) return;
 
-  /* Prefer REST session for WS feed token (fallback to Quote) */
   const restSession = getSessionStatusREST();
   const feedToken = restSession.loggedIn ? getFeedTokenREST() : getFeedTokenQuote();
   if (!feedToken) { console.log('⚠️  WS skipped — no feed token'); return; }
@@ -435,6 +470,21 @@ function startWebSocketForReadyPhase() {
     wsStarted = true;
     console.log(`🔌 WS started for ${tokens.length} tokens`);
   } catch (e) { console.error('WS start failed:', e.message); }
+
+  /* Start SnapQuote connection (parallel, independent) */
+  try {
+    startWSSnap({
+      apiKey: process.env.ANGEL_API_KEY,
+      clientCode: process.env.ANGEL_CLIENT_ID,
+      feedToken,
+      tokens,
+      onSnapTick: handleSnapTick,
+      onDisconnect: async (gapStart, gapEnd) => {
+        console.log(`🔁 [Snap] gap ${Math.round((gapEnd - gapStart) / 1000)}s — reconnecting`);
+      }
+    });
+    console.log(`🔌 [Snap] WS started for ${tokens.length} tokens`);
+  } catch (e) { console.error('[Snap] WS start failed:', e.message); }
 }
 
 function stopWebSocketIfNeeded() {
@@ -444,9 +494,10 @@ function stopWebSocketIfNeeded() {
   const dow = ist.getUTCDay();
   if (dow === 0 || dow === 6 || !isTradingDay(ist) || mins >= 930) {
     stopWS();
+    try { stopWSSnap(); } catch {}
     wsStarted = false;
     flushLtpWrites().catch(() => {});
-    console.log('🔌 WS stopped');
+    console.log('🔌 WS stopped (LTP + Snap)');
   }
 }
 
@@ -534,7 +585,7 @@ function verifyTotpServer(secret, input) {
 /* ============================================================
    SECTION 7 — AUTH
    ============================================================ */
-app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend', mode: 'dual-rest-quote' }));
+app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend', mode: 'dual-rest-quote-snap' }));
 
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
@@ -896,7 +947,12 @@ app.get('/api/broker/status', auth, (req, res) => {
   });
 });
 
-app.get('/api/ws/status', auth, (req, res) => res.json(getWSStatus()));
+app.get('/api/ws/status', auth, (req, res) => {
+  res.json({
+    ltp: getWSStatus(),
+    snap: getWSSnapStatus()
+  });
+});
 
 app.get('/api/strategies', auth, (req, res) => {
   res.json(Object.values(STRATEGIES).map(s => ({ id: s.id, name: s.name, filters: s.filters })));
@@ -907,7 +963,8 @@ app.get('/api/screener/status', auth, (req, res) => {
   res.json({
     phase: p.phase, date: p.date || null,
     filled: p.date ? countFilled(p.date) : 0, total: STOCKS.length,
-    ws: getWSStatus()
+    ws: getWSStatus(),
+    wsSnap: getWSSnapStatus()
   });
 });
 
@@ -1025,10 +1082,7 @@ app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
       const token = String(q.token);
       quoteCache.set(token, { high: q.high, low: q.low, fetchedAt });
 
-      /* Save prev_close if new */
-      if (q.close > 0 && !prevCloseCache.has(token)) {
-        prevCloseCache.set(token, q.close);
-      }
+      if (q.close > 0 && !prevCloseCache.has(token)) prevCloseCache.set(token, q.close);
 
       db.query(
         `INSERT INTO angel_15m_candle (date, token, sym, q15_open, q15_high, q15_low, q15_close, prev_close, quote_fetched_at, updated_at)
@@ -1042,7 +1096,6 @@ app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
         [p.date, token, SYM_BY_TOKEN[token] || '?', q.open || q.low, q.high, q.low, q.ltp || q.high, q.close || null, fetchedAt]
       ).catch(() => {});
 
-      /* Populate candle cache (so ORB / filter work instantly) */
       setCachedCandle(token, p.date, [0, q.open || q.low, q.high, q.low, q.ltp || q.high, 0]);
       if (q.ltp) setCachedLTP(token, q.ltp);
 
@@ -1067,7 +1120,7 @@ app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
   }
 });
 
-/* ---- LTP + ORB + quote state ---- */
+/* ---- LTP + ORB + quote + snap state ---- */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1081,11 +1134,17 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const ltp = getCachedLTP(token);
     const prevClose = prevCloseCache.get(token) || null;
     const quote = quoteCache.get(token) || null;
+    const snap = snapCache.get(token) || null;
     return {
       token, ltp, prevClose,
       highQuote: quote?.high ?? null,
       lowQuote: quote?.low ?? null,
       quoteFetchedAt: quote?.fetchedAt ?? null,
+      buyQty: snap?.buyQty ?? null,
+      sellQty: snap?.sellQty ?? null,
+      volume: snap?.volume ?? null,
+      ltq: snap?.ltq ?? null,
+      atp: snap?.atp ?? null,
       lowBroken: state.lowBroken,
       pullbackConfirmed: state.pullbackConfirmed,
       entrySignal: state.entrySignal,
@@ -1258,7 +1317,6 @@ async function loadScreenerCacheFromDB() {
       [p.date, activeTokens]
     );
     for (const r of rows) {
-      /* Prefer REST candle; fallback to Q15 */
       if (r.high > 0 && r.low > 0) {
         setCachedCandle(r.token, p.date, [0, +r.open, +r.high, +r.low, +r.close, +r.volume]);
       } else if (r.q15_high > 0 && r.q15_low > 0) {
@@ -1277,16 +1335,19 @@ async function loadScreenerCacheFromDB() {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} (dual REST + Quote)`);
+  console.log(`✅ Server on port ${PORT} (dual REST + Quote + Snap)`);
   console.log(`📊 Strategy: ${STRATEGIES.advance_orb.name}`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);
 
-  /* Login to both sources independently */
+  /* REST login first */
   try {
     await loginREST();
     console.log('✅ [REST] session started');
   } catch (e) { console.error('⚠️  [REST] login failed:', e.message); }
+
+  /* Wait 4s before Quote login to avoid 403 rate limit */
+  await new Promise(r => setTimeout(r, 4000));
 
   try {
     await loginQuote();
@@ -1302,13 +1363,11 @@ app.listen(PORT, async () => {
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
   const dow = nowIST.getUTCDay();
 
-  /* Late startup: day H/L/C fetch */
   if (dow >= 1 && dow <= 5 && mins >= 934 && mins <= 960) {
     console.log('🔔 Late startup — fetching day H/L/C');
     fetchDayHLC();
   }
 
-  /* Late startup: auto-quote catch-up */
   if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 570 && mins <= 585) {
     const pQ = getScreenerPhase();
     if (pQ.date) {
@@ -1330,5 +1389,5 @@ app.listen(PORT, async () => {
   scheduleDailyFetch();
   scheduleQuoteAutoFetch();
 
-  console.log('ℹ️  Ready — REST + Quote + WS + SSE + auto-quote @ 9:30:10 + day H/L @ 15:34');
+  console.log('ℹ️  Ready — REST + Quote + WS + WS-Snap + SSE + auto-quote @ 9:30:10 + day H/L @ 15:34');
 });

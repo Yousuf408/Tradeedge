@@ -1,11 +1,11 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v2.1
+   server.js — TradeAlgo Pro backend  |  v2.2
    ============================================================
 
-   DUAL SOURCE MODE:
+   DUAL SOURCE MODE + MANUAL DAY H/L/C TRIGGER
    - REST historical (9:15 candles) → open/high/low/close
    - FULL Quote (9:30:10 auto) → q15_open/q15_high/q15_low/q15_close
-   - 15:34 daily fetch → day_high/day_low/day_close + pivot
+   - 15:16 daily fetch (auto + manual button) → day_high/day_low/day_close + pivot
    ============================================================ */
 
 import express from 'express';
@@ -1099,7 +1099,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 14 — DAY H/L/C FETCH (15:34 IST) + PIVOT
+   SECTION 14 — DAY H/L/C FETCH (15:16 IST) + PIVOT
    ============================================================ */
 async function fetchDayHLC() {
   try {
@@ -1134,13 +1134,29 @@ async function fetchDayHLC() {
   } catch (e) { console.error('Day H/L/C fetch failed:', e.message); }
 }
 
-function msUntilNext1534IST() {
+/* ---- Manual trigger: fetch day H/L/C + pivot now ---- */
+app.post('/api/admin/force-day-hlc', auth, adminOnly, async (req, res) => {
+  try {
+    await fetchDayHLC();
+    const p = getScreenerPhase();
+    const { rows } = await db.query(
+      `SELECT COUNT(*) AS cnt FROM angel_15m_candle
+       WHERE date=$1 AND day_high IS NOT NULL`,
+      [p.date]
+    );
+    res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+function msUntilNext1516IST() {
   const ist = getIST();
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
   const target = new Date(ist);
   target.setUTCHours(0, 0, 0, 0);
-  target.setUTCMinutes(934);
-  if (mins >= 934) target.setUTCDate(target.getUTCDate() + 1);
+  target.setUTCMinutes(916);   // 15:16 IST
+  if (mins >= 916) target.setUTCDate(target.getUTCDate() + 1);
   const dow = target.getUTCDay();
   if (dow === 6) target.setUTCDate(target.getUTCDate() + 2);
   if (dow === 0) target.setUTCDate(target.getUTCDate() + 1);
@@ -1148,7 +1164,7 @@ function msUntilNext1534IST() {
 }
 
 function scheduleDailyFetch() {
-  const ms = msUntilNext1534IST();
+  const ms = msUntilNext1516IST();
   console.log(`⏰ Next daily H/L/C fetch in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => { await fetchDayHLC(); scheduleDailyFetch(); }, ms);
 }
@@ -1293,11 +1309,13 @@ app.listen(PORT, async () => {
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
   const dow = nowIST.getUTCDay();
 
-  if (dow >= 1 && dow <= 5 && mins >= 934 && mins <= 960) {
+  /* Late startup catch-up: day H/L/C (15:16 – 15:40 IST) */
+  if (dow >= 1 && dow <= 5 && mins >= 916 && mins <= 940) {
     console.log('🔔 Late startup — fetching day H/L/C');
     fetchDayHLC();
   }
 
+  /* Late startup catch-up: auto-quote (9:30:10 – 9:45 IST) */
   if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 570 && mins <= 585) {
     const pQ = getScreenerPhase();
     if (pQ.date) {
@@ -1319,5 +1337,5 @@ app.listen(PORT, async () => {
   scheduleDailyFetch();
   scheduleQuoteAutoFetch();
 
-  console.log('ℹ️  Ready — REST + Quote + WS + SSE + auto-quote @ 9:30:10 + day H/L @ 15:34');
+  console.log('ℹ️  Ready — REST + Quote + WS + SSE + auto-quote @ 9:30:10 + day H/L @ 15:16');
 });

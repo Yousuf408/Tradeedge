@@ -956,12 +956,16 @@ app.get('/api/screener/data', auth, (req, res) => {
     if (q) quotes[t] = { high: q.high, low: q.low, fetchedAt: q.fetchedAt };
   }
 
+    /* Return ALL cached candles (not just passing) — frontend filters locally */
+  const allCached = allCandles.filter(c => Array.isArray(c.candle) && c.candle.length >= 5);
+
   res.json({
     ok: true, phase: p.phase, date: p.date,
     strategy: strategy.id, strategyName: strategy.name, filters: strategy.filters,
     filled: passing.length, total: STOCKS.length,
     cachedTokens, quotes,
-    results: passing, stocks: passingStocks
+    results: allCached,
+    stocks: passingStocks
   });
 });
 

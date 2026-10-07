@@ -244,12 +244,17 @@ async function loadLatestPivotFromDB() {
   try {
     const activeTokens = STOCKS.map(s => String(s.token));
     const { rows } = await db.query(
+         const today = getIST().toISOString().split('T')[0];
+    const { rows } = await db.query(
       `SELECT DISTINCT ON (token) token, pivot
        FROM angel_15m_candle
-       WHERE pivot IS NOT NULL AND token = ANY($1)
+       WHERE pivot IS NOT NULL
+         AND token = ANY($1)
+         AND date < $2
        ORDER BY token, date DESC`,
-      [activeTokens]
+      [activeTokens, today]
     );
+     
     for (const r of rows) pivotCache.set(String(r.token), +r.pivot);
     console.log(`📐 Loaded pivot for ${rows.length} tokens from DB`);
   } catch (e) { console.error('pivot load failed:', e.message); }

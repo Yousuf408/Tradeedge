@@ -1,8 +1,9 @@
 /* ============================================================
-   SCREENER.JS  — v2.4
+   SCREENER.JS  — v2.5
    + Strategy dropdown (Advance ORB / Momentum)
    + Pivot column
    + Manual "Fetch Day H/L/C" button (admin only)
+   + New chip: "Pivot + Entry" (pivot touch + bullish close + entry)
    + Null-safe guards
    ============================================================ */
 
@@ -121,6 +122,18 @@ function categorizeStock(stock) {
   return 'waiting';
 }
 
+/* Pivot touch filter (0.1% buffer) + bullish close above pivot */
+function passesPivotFilter(token) {
+  const c = SCREENER_ALL_CANDLES[token];
+  const pivot = SCREENER_PIVOT[token];
+  if (!c || !pivot || pivot <= 0) return false;
+  const buffer = pivot * 0.001;
+  const touches = (c.low - buffer) <= pivot && pivot <= (c.high + buffer);
+  if (!touches) return false;
+  if (c.close <= pivot) return false;
+  return true;
+}
+
 function setStageFilter(key) {
   SCREENER_STAGE_FILTER = key;
   renderScreenerTable();
@@ -130,10 +143,13 @@ function renderChips() {
   const el = document.getElementById('stageChips');
   if (!el) return;
 
-  const counts = { all: 0, entry: 0, lowbrok: 0, waiting: 0 };
+  const counts = { all: 0, entry: 0, lowbrok: 0, waiting: 0, pivot_entry: 0 };
   for (const s of SCREENER_STOCKS) {
     counts.all++;
     counts[categorizeStock(s)]++;
+    if (passesPivotFilter(s.token) && (SCREENER_ORB[s.token]?.entrySignal)) {
+      counts.pivot_entry++;
+    }
   }
 
   const chip = (key, label, count) => {
@@ -145,6 +161,7 @@ function renderChips() {
 
   el.innerHTML =
     chip('all', 'All', counts.all) +
+    chip('pivot_entry', '🎯 Pivot + Entry', counts.pivot_entry) +
     chip('entry', '🎯 Entry Signal', counts.entry) +
     chip('lowbrok', '⬇️ Low Broken', counts.lowbrok) +
     chip('waiting', '⏸️ Waiting', counts.waiting);
@@ -865,7 +882,9 @@ function renderScreenerTable() {
   }
 
   let filtered = SCREENER_STOCKS;
-  if (SCREENER_STAGE_FILTER !== 'all') {
+  if (SCREENER_STAGE_FILTER === 'pivot_entry') {
+    filtered = filtered.filter(s => passesPivotFilter(s.token) && (SCREENER_ORB[s.token]?.entrySignal));
+  } else if (SCREENER_STAGE_FILTER !== 'all') {
     filtered = filtered.filter(s => categorizeStock(s) === SCREENER_STAGE_FILTER);
   }
 

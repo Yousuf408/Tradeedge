@@ -1439,16 +1439,17 @@ async function autoFetchBS() {
         volume: r.volume
       });
 
-      db.query(
-        `INSERT INTO strategy_bs_snapshot (date, token, strategy_id, buy_qty, sell_qty, ltp, volume, fetched_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            db.query(
+        `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, fetched_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (date, token, strategy_id) DO UPDATE SET
+           sym=EXCLUDED.sym,
            buy_qty=EXCLUDED.buy_qty,
            sell_qty=EXCLUDED.sell_qty,
            ltp=EXCLUDED.ltp,
            volume=EXCLUDED.volume,
            fetched_at=EXCLUDED.fetched_at`,
-        [p.date, r.token, 'momentum', r.buyQty, r.sellQty, r.ltp, r.volume, fetchedAt]
+        [p.date, SYM_BY_TOKEN[r.token] || '?', r.token, 'momentum', r.buyQty, r.sellQty, r.ltp, r.volume, fetchedAt]
       ).catch(() => {});
     }
 

@@ -1,9 +1,8 @@
 /* ============================================================
-   SCREENER.JS  — v2.6
-   + Buy/Sell column (from BS cache)
-   + Top 15 Gainers / Top 15 Losers chips
-   + Pivot + Entry chip
-   + All previous features
+   SCREENER.JS  — v2.7
+   + Momentum strategy columns (Buy/Sell, Pivot, 20 EMA, Target/SL, MAXQTY)
+   + Momentum chips: All, Top 15 Gainers, Top 15 Losers
+   + Advance ORB untouched
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -24,6 +23,7 @@ let QUOTE_FETCHING = false;
 let DAYHLC_FETCHING = false;
 
 let SCREENER_STAGE_FILTER = 'all';
+let SCREENER_MOMENTUM_FILTER = 'all';
 let SCREENER_SORT_BY = 'change';
 let SCREENER_SORT_DIR = 'desc';
 let SCREENER_ACTIVE_STRATEGY = 'advance_orb';
@@ -54,7 +54,7 @@ async function initScreener() {
 }
 
 /* ============================================================
-   SECTION 2 — CONTROLS + CHIPS
+   SECTION 2 — CONTROLS
    ============================================================ */
 function setupControls() {
   const controls = document.querySelector('.screener-controls');
@@ -114,7 +114,7 @@ function onStrategyChange(value) {
 }
 
 /* ============================================================
-   SECTION 2.1 — STAGE CATEGORIZATION
+   SECTION 2.1 — FILTERS
    ============================================================ */
 function categorizeStock(stock) {
   const orb = SCREENER_ORB[stock.token] || {};
@@ -139,10 +139,33 @@ function setStageFilter(key) {
   renderScreenerTable();
 }
 
+function setMomentumFilter(key) {
+  SCREENER_MOMENTUM_FILTER = key;
+  renderScreenerTable();
+}
+
+/* ============================================================
+   SECTION 2.2 — CHIPS RENDER
+   ============================================================ */
 function renderChips() {
   const el = document.getElementById('stageChips');
   if (!el) return;
 
+  if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
+    const chip = (key, label) => {
+      const active = SCREENER_MOMENTUM_FILTER === key ? 'active' : '';
+      return `<button class="filter-chip ${active}" onclick="setMomentumFilter('${key}')">${label}</button>`;
+    };
+    el.innerHTML =
+      chip('all', 'All') +
+      chip('top_gainers', '🚀 Top 15 Gainers') +
+      chip('top_losers', '📉 Top 15 Losers');
+    el.style.display = '';
+    return;
+  }
+
+  /* Advance ORB chips */
+  el.style.display = '';
   const counts = { all: 0, entry: 0, lowbrok: 0, waiting: 0, pivot_entry: 0 };
   for (const s of SCREENER_STOCKS) {
     counts.all++;
@@ -164,13 +187,11 @@ function renderChips() {
     chip('pivot_entry', '🎯 Pivot + Entry', counts.pivot_entry) +
     chip('entry', '🎯 Entry Signal', counts.entry) +
     chip('lowbrok', '⬇️ Low Broken', counts.lowbrok) +
-    chip('waiting', '⏸️ Waiting', counts.waiting) +
-    chip('top_gainers', '🚀 Top 15 Gainers', 15) +
-    chip('top_losers', '📉 Top 15 Losers', 15);
+    chip('waiting', '⏸️ Waiting', counts.waiting);
 }
 
 /* ============================================================
-   SECTION 2.2 — SORTING
+   SECTION 2.3 — SORTING
    ============================================================ */
 function setSort(field) {
   if (SCREENER_SORT_BY === field) {
@@ -430,7 +451,7 @@ function updateORBRow(token, state) {
   }
 
   const stageCell = row.querySelector('.cell-stage');
-  if (stageCell) {
+  if (stageCell && SCREENER_ALL_CANDLES[token]) {
     const stage = resolveOrbStage(token, SCREENER_ALL_CANDLES[token], SCREENER_LTP[token]);
     stageCell.style.color = stage.color;
     stageCell.style.fontWeight = stage.weight;
@@ -770,7 +791,7 @@ function updateProgress(done, total) {
 }
 
 /* ============================================================
-   SECTION 6 — LTP POLL (30s backup)
+   SECTION 6 — LTP POLL
    ============================================================ */
 async function loadLTP() {
   const tokens = SCREENER_STOCKS.map(s => s.token);
@@ -907,41 +928,126 @@ function renderScreenerTable() {
   const count = document.getElementById('screenerCount');
   if (!head || !body) return;
 
-  /* ---- Momentum branch ---- */
+  /* ============================================================
+     MOMENTUM strategy branch
+     ============================================================ */
   if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
     head.innerHTML = `<tr>
       <th>Stock / Company</th>
-      <th>LTP / Chg %</th>
+      <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
+          <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
       <th>Buy / Sell</th>
       <th>Pivot</th>
       <th>20 EMA</th>
-      <th>9:15 Range (H / L)</th>
       <th>Target / SL</th>
       <th>MAXQTY</th>
-      <th>BREAKOUT</th>
       <th>LAST UPDATE</th>
-      <th>STAGE</th>
       <th>ACTION</th>
     </tr>`;
-    body.innerHTML = `<tr><td colspan="12" style="text-align:center;padding:60px;color:var(--text-muted);line-height:1.9">
-      🚀 <strong>Momentum strategy</strong> — columns ready<br>
-      <span style="font-size:12px">Logic will be implemented soon.</span>
-    </td></tr>`;
-    if (count) count.textContent = `Momentum — not active yet`;
-    const chips = document.getElementById('stageChips');
-    if (chips) chips.style.display = 'none';
+
+    if (!SCREENER_STOCKS.length) {
+      body.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:60px;color:var(--text-muted)">
+        Loading stocks...<br>
+        Click <strong>⚡ Fetch 9:15 Candles</strong> to load data.
+      </td></tr>`;
+      if (count) count.textContent = `0 / ${SCREENER_ALL_STOCKS.length}`;
+      renderChips();
+      return;
+    }
+
+    let filtered = SCREENER_STOCKS;
+    if (SCREENER_MOMENTUM_FILTER === 'top_gainers') {
+      filtered = [...filtered]
+        .filter(s => computeChangePct(s.token) !== null)
+        .sort((a, b) => computeChangePct(b.token) - computeChangePct(a.token))
+        .slice(0, 15);
+    } else if (SCREENER_MOMENTUM_FILTER === 'top_losers') {
+      filtered = [...filtered]
+        .filter(s => computeChangePct(s.token) !== null)
+        .sort((a, b) => computeChangePct(a.token) - computeChangePct(b.token))
+        .slice(0, 15);
+    }
+
+    const sorted = sortStocks(filtered);
+
+    if (!sorted.length) {
+      body.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text-muted)">
+        No stocks in this category.
+      </td></tr>`;
+      if (count) count.textContent = `${SCREENER_STOCKS.length} / ${SCREENER_ALL_STOCKS.length}`;
+      renderChips();
+      return;
+    }
+
+    body.innerHTML = sorted.map(s => {
+      const c = SCREENER_ALL_CANDLES[s.token];
+      const ltp = SCREENER_LTP[s.token];
+      const orb = SCREENER_ORB[s.token] || {};
+      const pivot = SCREENER_PIVOT[s.token];
+
+      const sl = c ? c.low : null;
+      const high = c ? c.high : null;
+      const target = high ? high * 1.01 : null;
+      const risk = (ltp && sl) ? (ltp - sl) : 0;
+      const maxQty = risk > 0 ? Math.floor(PER_TRADE / risk) : '—';
+
+      const changePct = computeChangePct(s.token);
+      let changeLine;
+      if (changePct === null) {
+        changeLine = '<span style="color:var(--text-muted)">—</span>';
+      } else {
+        const isPos = changePct >= 0;
+        const color = isPos ? 'var(--success)' : 'var(--danger)';
+        changeLine = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
+      }
+
+      let pivotCell;
+      if (pivot) {
+        const above = ltp ? (+ltp >= pivot) : null;
+        if (above === null) {
+          pivotCell = `<span style="color:var(--text-muted)">₹${pivot.toFixed(2)}</span>`;
+        } else {
+          const color = above ? 'var(--success)' : 'var(--danger)';
+          const arrow = above ? '▲' : '▼';
+          pivotCell = `<span style="color:${color};font-weight:700">${arrow} ₹${pivot.toFixed(2)}</span>`;
+        }
+      } else {
+        pivotCell = '<span style="color:var(--text-muted)">—</span>';
+      }
+
+      const lastUpdate = formatTimeIST(orb.serverTime);
+      const rowClass = orb.entrySignal ? 'row-signal' : '';
+
+      return `<tr class="${rowClass}" data-token="${s.token}">
+        <td><span class="sym">${s.sym}</span><span class="tok">${s.token}</span></td>
+        <td style="white-space:nowrap">
+          <span class="cell-primary ltp-cell">${ltp ? '₹' + (+ltp).toFixed(2) : '—'}</span>
+          <span class="cell-sub change-cell">${changeLine}</span>
+        </td>
+        <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
+        <td class="pivot-cell" style="white-space:nowrap">${pivotCell}</td>
+        <td style="white-space:nowrap"><span style="color:var(--text-muted)">—</span></td>
+        <td style="white-space:nowrap" class="cell-targetsl">${c ? renderTargetSL(c, orb) : '<span style="color:var(--text-muted)">—</span>'}</td>
+        <td style="font-weight:700;color:#6C5CE7">${maxQty}</td>
+        <td style="color:var(--text-muted);font-size:11px;font-family:ui-monospace,monospace">${lastUpdate}</td>
+        <td class="cell-action">${orb.entrySignal
+          ? `<button class="btn btn-success btn-sm" onclick="placeOrder('${s.sym}')">Buy</button>`
+          : '<span style="color:var(--text-muted);font-size:11px">—</span>'}</td>
+      </tr>`;
+    }).join('');
+
+    if (count) count.textContent = `${sorted.length} / ${SCREENER_ALL_STOCKS.length} shown`;
+    renderChips();
     return;
   }
 
-  /* ---- Advance ORB ---- */
-  const chipsEl = document.getElementById('stageChips');
-  if (chipsEl) chipsEl.style.display = '';
-
+  /* ============================================================
+     ADVANCE ORB strategy branch (unchanged)
+     ============================================================ */
   head.innerHTML = `<tr>
     <th>Stock / Company</th>
     <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
         <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
-    <th>Buy / Sell</th>
     <th>Pivot</th>
     <th class="th-sortable" onclick="setSort('range')">9:15 Range (H / L) ${sortIndicator('range')}</th>
     <th>Quote H / L</th>
@@ -956,7 +1062,7 @@ function renderScreenerTable() {
   </tr>`;
 
   if (!SCREENER_STOCKS.length) {
-    body.innerHTML = `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
+    body.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:60px;color:var(--text-muted)">
       Loading stocks...<br>
       Click <strong>⚡ Fetch 9:15 Candles</strong> or <strong>📊 Fetch Quote H/L</strong> to load data.
     </td></tr>`;
@@ -968,16 +1074,6 @@ function renderScreenerTable() {
   let filtered = SCREENER_STOCKS;
   if (SCREENER_STAGE_FILTER === 'pivot_entry') {
     filtered = filtered.filter(s => passesPivotFilter(s.token) && (SCREENER_ORB[s.token]?.entrySignal));
-  } else if (SCREENER_STAGE_FILTER === 'top_gainers') {
-    filtered = [...filtered]
-      .filter(s => computeChangePct(s.token) !== null)
-      .sort((a, b) => computeChangePct(b.token) - computeChangePct(a.token))
-      .slice(0, 15);
-  } else if (SCREENER_STAGE_FILTER === 'top_losers') {
-    filtered = [...filtered]
-      .filter(s => computeChangePct(s.token) !== null)
-      .sort((a, b) => computeChangePct(a.token) - computeChangePct(b.token))
-      .slice(0, 15);
   } else if (SCREENER_STAGE_FILTER !== 'all') {
     filtered = filtered.filter(s => categorizeStock(s) === SCREENER_STAGE_FILTER);
   }
@@ -985,7 +1081,7 @@ function renderScreenerTable() {
   const sorted = sortStocks(filtered);
 
   if (!sorted.length) {
-    body.innerHTML = `<tr><td colspan="14" style="text-align:center;padding:40px;color:var(--text-muted)">
+    body.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:40px;color:var(--text-muted)">
       No stocks in this category.
     </td></tr>`;
     if (count) count.textContent = `${SCREENER_STOCKS.length} / ${SCREENER_ALL_STOCKS.length}`;
@@ -1057,7 +1153,6 @@ function renderScreenerTable() {
         <span class="cell-primary ltp-cell">${ltp ? '₹' + (+ltp).toFixed(2) : '—'}</span>
         <span class="cell-sub change-cell">${changeLine}</span>
       </td>
-      <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
       <td class="pivot-cell" style="white-space:nowrap">${pivotCell}</td>
       <td style="white-space:nowrap">
         ${c ? `<span class="cell-primary" style="color:var(--success)">H: ₹${c.high.toFixed(2)}</span>

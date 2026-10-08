@@ -1,12 +1,13 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v2.6
+   server.js — TradeAlgo Pro backend  |  v2.7
    ============================================================
 
-   DUAL SOURCE MODE + PIVOT CACHE + RETRY + BUY/SELL SNAPSHOT
+   DUAL SOURCE MODE + PIVOT + BS SNAPSHOT
    - REST historical → open/high/low/close
    - FULL Quote (9:30:10 auto) → q15_* columns
-   - 15:16 daily fetch (auto + manual) → day_high/low/close + pivot
-   - 9:15:30 BS fetch (auto + manual) → strategy_bs_snapshot table
+   - 15:16 daily fetch → day_high/low/close + pivot
+   - 9:15:30 BS fetch → strategy_bs_snapshot table
+   - prevClose loaded from previous day's day_close (not prev_close column)
    - Pivot loader: date < today
    ============================================================ */
 
@@ -192,22 +193,25 @@ const getOrbState = (token, date) => orbState.get(`${token}_${date}`) || {
 
 
 /* ============================================================
-   SECTION 4.1 — PREV CLOSE
+   SECTION 4.1 — PREV CLOSE (from previous day's day_close)
    ============================================================ */
 const prevCloseCache = new Map();
 
 async function loadPrevCloseFromDB() {
   try {
     const activeTokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
+    const today = getIST().toISOString().split('T')[0];
     const { rows } = await db.query(
-      `SELECT DISTINCT ON (token) token, prev_close
+      `SELECT DISTINCT ON (token) token, day_close
        FROM angel_15m_candle
-       WHERE prev_close IS NOT NULL AND token = ANY($1)
+       WHERE day_close IS NOT NULL
+         AND token = ANY($1)
+         AND date < $2
        ORDER BY token, date DESC`,
-      [activeTokens]
+      [activeTokens, today]
     );
-    for (const r of rows) prevCloseCache.set(String(r.token), +r.prev_close);
-    console.log(`💾 Loaded prevClose for ${rows.length} tokens from DB`);
+    for (const r of rows) prevCloseCache.set(String(r.token), +r.day_close);
+    console.log(`💾 Loaded prevClose for ${rows.length} tokens (from day_close < ${today})`);
   } catch (e) { console.error('prevClose load failed:', e.message); }
 }
 
@@ -267,7 +271,7 @@ async function loadLatestPivotFromDB() {
 /* ============================================================
    SECTION 4.3 — BUY/SELL CACHE (from strategy_bs_snapshot)
    ============================================================ */
-const bsCache = new Map();   // token → { buyQty, sellQty, ltp, volume, ltq, atp }
+const bsCache = new Map();
 
 async function loadBSCacheFromDB() {
   try {
@@ -1051,15 +1055,14 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
     for (const r of results) {
       const c = r.candle;
       if (Array.isArray(c) && c.length >= 5) {
-        const prevClose = prevCloseCache.get(String(r.token)) || null;
         db.query(
-          `INSERT INTO angel_15m_candle (date, token, sym, open, high, low, close, volume, prev_close, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+          `INSERT INTO angel_15m_candle (date, token, sym, open, high, low, close, volume, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
            ON CONFLICT (date, token) DO UPDATE SET
              sym=EXCLUDED.sym, open=EXCLUDED.open, high=EXCLUDED.high,
              low=EXCLUDED.low, close=EXCLUDED.close, volume=EXCLUDED.volume,
-             prev_close=COALESCE(EXCLUDED.prev_close, angel_15m_candle.prev_close), updated_at=NOW()`,
-          [p.date, r.token, SYM_BY_TOKEN[r.token] || '?', c[1], c[2], c[3], c[4], c[5] || 0, prevClose]
+             updated_at=NOW()`,
+          [p.date, r.token, SYM_BY_TOKEN[r.token] || '?', c[1], c[2], c[3], c[4], c[5] || 0]
         ).catch(() => {});
         if (!orbState.has(`${r.token}_${p.date}`)) {
           orbState.set(`${r.token}_${p.date}`, {
@@ -1095,18 +1098,15 @@ app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
       const token = String(q.token);
       quoteCache.set(token, { high: q.high, low: q.low, fetchedAt });
 
-      if (q.close > 0 && !prevCloseCache.has(token)) prevCloseCache.set(token, q.close);
-
       db.query(
-        `INSERT INTO angel_15m_candle (date, token, sym, q15_open, q15_high, q15_low, q15_close, prev_close, quote_fetched_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+        `INSERT INTO angel_15m_candle (date, token, sym, q15_open, q15_high, q15_low, q15_close, quote_fetched_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
          ON CONFLICT (date, token) DO UPDATE SET
            sym=EXCLUDED.sym,
            q15_open=EXCLUDED.q15_open, q15_high=EXCLUDED.q15_high,
            q15_low=EXCLUDED.q15_low, q15_close=EXCLUDED.q15_close,
-           prev_close=COALESCE(EXCLUDED.prev_close, angel_15m_candle.prev_close),
            quote_fetched_at=EXCLUDED.quote_fetched_at, updated_at=NOW()`,
-        [p.date, token, SYM_BY_TOKEN[token] || '?', q.open || q.low, q.high, q.low, q.ltp || q.high, q.close || null, fetchedAt]
+        [p.date, token, SYM_BY_TOKEN[token] || '?', q.open || q.low, q.high, q.low, q.ltp || q.high, fetchedAt]
       ).catch(() => {});
 
       setCachedCandle(token, p.date, [0, q.open || q.low, q.high, q.low, q.ltp || q.high, 0]);
@@ -1180,6 +1180,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 
 /* ============================================================
    SECTION 14 — DAY H/L/C FETCH (15:16 IST) + PIVOT
+   NOTE: prev_close column is NOT touched here.
    ============================================================ */
 async function fetchDayHLC() {
   try {
@@ -1201,19 +1202,17 @@ async function fetchDayHLC() {
       const pivot = (+q.high + +q.low + +close) / 3;
 
       db.query(
-        `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, prev_close, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+        `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
          ON CONFLICT (date, token) DO UPDATE SET
            day_high=EXCLUDED.day_high,
            day_low=EXCLUDED.day_low,
            day_close=EXCLUDED.day_close,
            pivot=EXCLUDED.pivot,
-           prev_close=EXCLUDED.prev_close,
            updated_at=NOW()`,
-        [p.date, token, SYM_BY_TOKEN[token] || '?', q.high, q.low, close, pivot, close]
+        [p.date, token, SYM_BY_TOKEN[token] || '?', q.high, q.low, close, pivot]
       ).catch(() => {});
 
-      prevCloseCache.set(token, close);
       savedTokens.add(token);
     }
 
@@ -1234,19 +1233,17 @@ async function fetchDayHLC() {
         const pivot = (+q.high + +q.low + +close) / 3;
 
         db.query(
-          `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, prev_close, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+          `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
            ON CONFLICT (date, token) DO UPDATE SET
              day_high=EXCLUDED.day_high,
              day_low=EXCLUDED.day_low,
              day_close=EXCLUDED.day_close,
              pivot=EXCLUDED.pivot,
-             prev_close=EXCLUDED.prev_close,
              updated_at=NOW()`,
-          [p.date, token, SYM_BY_TOKEN[token] || '?', q.high, q.low, close, pivot, close]
+          [p.date, token, SYM_BY_TOKEN[token] || '?', q.high, q.low, close, pivot]
         ).catch(() => {});
 
-        prevCloseCache.set(token, close);
         savedTokens.add(token);
       }
     }
@@ -1299,6 +1296,7 @@ function scheduleDailyFetch() {
 
 /* ============================================================
    SECTION 14.1 — AUTO QUOTE FETCH @ 09:30:10 IST
+   NOTE: prev_close column is NOT touched here.
    ============================================================ */
 async function autoFetchQuote() {
   try {
@@ -1320,18 +1318,16 @@ async function autoFetchQuote() {
 
       const token = String(q.token);
       quoteCache.set(token, { high: q.high, low: q.low, fetchedAt });
-      if (q.close > 0 && !prevCloseCache.has(token)) prevCloseCache.set(token, q.close);
 
       db.query(
-        `INSERT INTO angel_15m_candle (date, token, sym, q15_open, q15_high, q15_low, q15_close, prev_close, quote_fetched_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+        `INSERT INTO angel_15m_candle (date, token, sym, q15_open, q15_high, q15_low, q15_close, quote_fetched_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
          ON CONFLICT (date, token) DO UPDATE SET
            sym=EXCLUDED.sym,
            q15_open=EXCLUDED.q15_open, q15_high=EXCLUDED.q15_high,
            q15_low=EXCLUDED.q15_low, q15_close=EXCLUDED.q15_close,
-           prev_close=COALESCE(EXCLUDED.prev_close, angel_15m_candle.prev_close),
            quote_fetched_at=EXCLUDED.quote_fetched_at, updated_at=NOW()`,
-        [p.date, token, SYM_BY_TOKEN[token] || '?', q.open || q.low, q.high, q.low, q.ltp || q.high, q.close || null, fetchedAt]
+        [p.date, token, SYM_BY_TOKEN[token] || '?', q.open || q.low, q.high, q.low, q.ltp || q.high, fetchedAt]
       ).catch(() => {});
 
       setCachedCandle(token, p.date, [0, q.open || q.low, q.high, q.low, q.ltp || q.high, 0]);
@@ -1362,18 +1358,16 @@ async function autoFetchQuote() {
 
         const token = String(q.token);
         quoteCache.set(token, { high: q.high, low: q.low, fetchedAt });
-        if (q.close > 0 && !prevCloseCache.has(token)) prevCloseCache.set(token, q.close);
 
         db.query(
-          `INSERT INTO angel_15m_candle (date, token, sym, q15_open, q15_high, q15_low, q15_close, prev_close, quote_fetched_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+          `INSERT INTO angel_15m_candle (date, token, sym, q15_open, q15_high, q15_low, q15_close, quote_fetched_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
            ON CONFLICT (date, token) DO UPDATE SET
              sym=EXCLUDED.sym,
              q15_open=EXCLUDED.q15_open, q15_high=EXCLUDED.q15_high,
              q15_low=EXCLUDED.q15_low, q15_close=EXCLUDED.q15_close,
-             prev_close=COALESCE(EXCLUDED.prev_close, angel_15m_candle.prev_close),
              quote_fetched_at=EXCLUDED.quote_fetched_at, updated_at=NOW()`,
-          [p.date, token, SYM_BY_TOKEN[token] || '?', q.open || q.low, q.high, q.low, q.ltp || q.high, q.close || null, fetchedAt]
+          [p.date, token, SYM_BY_TOKEN[token] || '?', q.open || q.low, q.high, q.low, q.ltp || q.high, fetchedAt]
         ).catch(() => {});
 
         setCachedCandle(token, p.date, [0, q.open || q.low, q.high, q.low, q.ltp || q.high, 0]);
@@ -1478,7 +1472,7 @@ app.post('/api/admin/force-bs', auth, adminOnly, async (req, res) => {
 function msUntilNext91530IST() {
   const ist = getIST();
   const daySecs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
-  const target = 9 * 3600 + 15 * 60 + 30;   // 09:15:30 IST
+  const target = 9 * 3600 + 15 * 60 + 30;
   let diffSecs = target - daySecs;
   if (diffSecs <= 0) diffSecs += 86400;
   for (let i = 0; i < 15; i++) {
@@ -1534,7 +1528,6 @@ app.listen(PORT, async () => {
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);
 
-  /* REST login */
   try {
     await loginREST();
     console.log('✅ [REST] session started');
@@ -1542,7 +1535,6 @@ app.listen(PORT, async () => {
 
   await new Promise(r => setTimeout(r, 4000));
 
-  /* Quote login */
   try {
     await loginQuote();
     console.log('✅ [Quote] session started');
@@ -1550,7 +1542,6 @@ app.listen(PORT, async () => {
 
   await new Promise(r => setTimeout(r, 4000));
 
-  /* BS login */
   try {
     await loginBS();
     console.log('✅ [BS] session started');
@@ -1567,13 +1558,11 @@ app.listen(PORT, async () => {
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
   const dow = nowIST.getUTCDay();
 
-  /* Late startup catch-up: day H/L/C (15:16 – 15:40 IST) */
   if (dow >= 1 && dow <= 5 && mins >= 916 && mins <= 940) {
     console.log('🔔 Late startup — fetching day H/L/C');
     fetchDayHLC();
   }
 
-  /* Late startup catch-up: auto-quote (9:30:10 – 9:45 IST) */
   if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 570 && mins <= 585) {
     const pQ = getScreenerPhase();
     if (pQ.date) {
@@ -1592,7 +1581,6 @@ app.listen(PORT, async () => {
     }
   }
 
-  /* Late startup catch-up: BS fetch (9:15:30 – 9:45 IST) */
   if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 555 && mins <= 585) {
     const pB = getScreenerPhase();
     if (pB.date) {

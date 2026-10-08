@@ -1,13 +1,13 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v2.5
+   server.js — TradeAlgo Pro backend  |  v2.6
    ============================================================
 
-   DUAL SOURCE MODE + PIVOT CACHE + RETRY FOR MISSING TOKENS
+   DUAL SOURCE MODE + PIVOT CACHE + RETRY + BUY/SELL SNAPSHOT
    - REST historical → open/high/low/close
    - FULL Quote (9:30:10 auto) → q15_* columns
    - 15:16 daily fetch (auto + manual) → day_high/low/close + pivot
-   - Retry logic for tokens silently dropped by Angel quote API
-   - Pivot loader: date < today (never uses today's own pivot)
+   - 9:15:30 BS fetch (auto + manual) → strategy_bs_snapshot table
+   - Pivot loader: date < today
    ============================================================ */
 
 import express from 'express';
@@ -39,6 +39,12 @@ import {
   getSessionStatus as getSessionStatusQuote,
   getFeedToken as getFeedTokenQuote
 } from './brokers/angelone/Angel_Quote.js';
+
+import {
+  loginPlatform as loginBS,
+  getSessionStatus as getSessionStatusBS,
+  fetchBuySellForTokens
+} from './brokers/angelone/Angel_BS.js';
 
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 
@@ -236,9 +242,6 @@ async function loadQuoteCacheFromDB() {
 
 /* ============================================================
    SECTION 4.2b — PIVOT CACHE
-   Most recent pivot from BEFORE today (yesterday's pivot for
-   today's trading). Today's own pivot is never used as today's
-   reference — it belongs to tomorrow.
    ============================================================ */
 const pivotCache = new Map();
 
@@ -258,6 +261,35 @@ async function loadLatestPivotFromDB() {
     for (const r of rows) pivotCache.set(String(r.token), +r.pivot);
     console.log(`📐 Loaded pivot for ${rows.length} tokens (from dates < ${today})`);
   } catch (e) { console.error('pivot load failed:', e.message); }
+}
+
+
+/* ============================================================
+   SECTION 4.3 — BUY/SELL CACHE (from strategy_bs_snapshot)
+   ============================================================ */
+const bsCache = new Map();   // token → { buyQty, sellQty, ltp, volume, ltq, atp }
+
+async function loadBSCacheFromDB() {
+  try {
+    const p = getScreenerPhase();
+    if (!p.date) return;
+    const activeTokens = STOCKS.map(s => String(s.token));
+    const { rows } = await db.query(
+      `SELECT token, buy_qty, sell_qty, ltp, volume
+       FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id=$2 AND token = ANY($3)`,
+      [p.date, 'advance_orb', activeTokens]
+    );
+    for (const r of rows) {
+      bsCache.set(String(r.token), {
+        buyQty: r.buy_qty != null ? +r.buy_qty : null,
+        sellQty: r.sell_qty != null ? +r.sell_qty : null,
+        ltp: r.ltp != null ? +r.ltp : null,
+        volume: r.volume != null ? +r.volume : null
+      });
+    }
+    console.log(`💹 Loaded buy/sell for ${rows.length} tokens from DB`);
+  } catch (e) { console.error('BS cache load failed:', e.message); }
 }
 
 
@@ -347,6 +379,17 @@ function broadcastQuote(fetchedAt) {
   const payload = `data: ${JSON.stringify({
     type: 'quote', fetchedAt,
     quotes: Object.fromEntries([...quoteCache.entries()].map(([t, v]) => [t, { high: v.high, low: v.low, fetchedAt: v.fetchedAt }]))
+  })}\n\n`;
+  for (const c of sseClients) {
+    try { c.res.write(payload); } catch { sseClients.delete(c); }
+  }
+}
+
+function broadcastBS(fetchedAt) {
+  if (!sseClients.size) return;
+  const payload = `data: ${JSON.stringify({
+    type: 'bs', fetchedAt,
+    bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => [t, { buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp, volume: v.volume }]))
   })}\n\n`;
   for (const c of sseClients) {
     try { c.res.write(payload); } catch { sseClients.delete(c); }
@@ -558,7 +601,7 @@ function verifyTotpServer(secret, input) {
 /* ============================================================
    SECTION 7 — AUTH
    ============================================================ */
-app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend', mode: 'dual-rest-quote' }));
+app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend', mode: 'dual-rest-quote-bs' }));
 
 app.post('/api/login', async (req, res) => {
   const { input, password } = req.body;
@@ -916,7 +959,8 @@ app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
 app.get('/api/broker/status', auth, (req, res) => {
   res.json({
     rest: getSessionStatusREST(),
-    quote: getSessionStatusQuote()
+    quote: getSessionStatusQuote(),
+    bs: getSessionStatusBS()
   });
 });
 
@@ -956,7 +1000,6 @@ app.get('/api/screener/data', auth, (req, res) => {
     if (q) quotes[t] = { high: q.high, low: q.low, fetchedAt: q.fetchedAt };
   }
 
-    /* Return ALL cached candles (not just passing) — frontend filters locally */
   const allCached = allCandles.filter(c => Array.isArray(c.candle) && c.candle.length >= 5);
 
   res.json({
@@ -964,8 +1007,7 @@ app.get('/api/screener/data', auth, (req, res) => {
     strategy: strategy.id, strategyName: strategy.name, filters: strategy.filters,
     filled: passing.length, total: STOCKS.length,
     cachedTokens, quotes,
-    results: allCached,
-    stocks: passingStocks
+    results: allCached, stocks: passingStocks
   });
 });
 
@@ -1091,7 +1133,7 @@ app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
   }
 });
 
-/* ---- LTP + ORB + quote + pivot ---- */
+/* ---- LTP + ORB + quote + pivot + BS ---- */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1106,8 +1148,12 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const prevClose = prevCloseCache.get(token) || null;
     const quote = quoteCache.get(token) || null;
     const pivot = pivotCache.get(token) || null;
+    const bs = bsCache.get(token) || null;
     return {
       token, ltp, prevClose, pivot,
+      buyQty: bs?.buyQty ?? null,
+      sellQty: bs?.sellQty ?? null,
+      bsVolume: bs?.volume ?? null,
       highQuote: quote?.high ?? null,
       lowQuote: quote?.low ?? null,
       quoteFetchedAt: quote?.fetchedAt ?? null,
@@ -1134,7 +1180,6 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 
 /* ============================================================
    SECTION 14 — DAY H/L/C FETCH (15:16 IST) + PIVOT
-   With retry for tokens silently dropped by Angel quote API
    ============================================================ */
 async function fetchDayHLC() {
   try {
@@ -1146,7 +1191,6 @@ async function fetchDayHLC() {
     const savedTokens = new Set();
     const t0 = Date.now();
 
-    /* ---- Attempt 1: all tokens ---- */
     let quotes = await fetchQuotesForTokens(allTokens);
     for (const q of quotes) {
       if (!q || !q.token) continue;
@@ -1157,17 +1201,22 @@ async function fetchDayHLC() {
       const pivot = (+q.high + +q.low + +close) / 3;
 
       db.query(
-        `UPDATE angel_15m_candle
-         SET day_high=$1, day_low=$2, day_close=$3, pivot=$4, prev_close=$5
-         WHERE date=$6 AND token=$7`,
-        [q.high, q.low, close, pivot, close, p.date, token]
+        `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, prev_close, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+         ON CONFLICT (date, token) DO UPDATE SET
+           day_high=EXCLUDED.day_high,
+           day_low=EXCLUDED.day_low,
+           day_close=EXCLUDED.day_close,
+           pivot=EXCLUDED.pivot,
+           prev_close=EXCLUDED.prev_close,
+           updated_at=NOW()`,
+        [p.date, token, SYM_BY_TOKEN[token] || '?', q.high, q.low, close, pivot, close]
       ).catch(() => {});
 
       prevCloseCache.set(token, close);
       savedTokens.add(token);
     }
 
-    /* ---- Retry missing tokens (2 more attempts) ---- */
     for (let attempt = 1; attempt <= 2; attempt++) {
       const missing = allTokens.filter(t => !savedTokens.has(t));
       if (!missing.length) break;
@@ -1185,10 +1234,16 @@ async function fetchDayHLC() {
         const pivot = (+q.high + +q.low + +close) / 3;
 
         db.query(
-          `UPDATE angel_15m_candle
-           SET day_high=$1, day_low=$2, day_close=$3, pivot=$4, prev_close=$5
-           WHERE date=$6 AND token=$7`,
-          [q.high, q.low, close, pivot, close, p.date, token]
+          `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, prev_close, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+           ON CONFLICT (date, token) DO UPDATE SET
+             day_high=EXCLUDED.day_high,
+             day_low=EXCLUDED.day_low,
+             day_close=EXCLUDED.day_close,
+             pivot=EXCLUDED.pivot,
+             prev_close=EXCLUDED.prev_close,
+             updated_at=NOW()`,
+          [p.date, token, SYM_BY_TOKEN[token] || '?', q.high, q.low, close, pivot, close]
         ).catch(() => {});
 
         prevCloseCache.set(token, close);
@@ -1202,12 +1257,11 @@ async function fetchDayHLC() {
 
     const stillMissing = allTokens.filter(t => !savedTokens.has(t));
     if (stillMissing.length) {
-      console.log(`⚠️  Still missing (${stillMissing.length}):`, stillMissing.join(','));
+      console.log(`⚠️  Still missing (${stillMissing.length}):`, stillMissing.slice(0, 20).join(','));
     }
   } catch (e) { console.error('Day H/L/C fetch failed:', e.message); }
 }
 
-/* ---- Manual trigger: fetch day H/L/C + pivot now ---- */
 app.post('/api/admin/force-day-hlc', auth, adminOnly, async (req, res) => {
   try {
     await fetchDayHLC();
@@ -1245,7 +1299,6 @@ function scheduleDailyFetch() {
 
 /* ============================================================
    SECTION 14.1 — AUTO QUOTE FETCH @ 09:30:10 IST
-   With retry for missing tokens
    ============================================================ */
 async function autoFetchQuote() {
   try {
@@ -1260,7 +1313,6 @@ async function autoFetchQuote() {
     const savedTokens = new Set();
     const fetchedAt = new Date();
 
-    /* ---- Attempt 1 ---- */
     let quotes = await fetchQuotesForTokens(allTokens);
     for (const q of quotes) {
       if (!q || !q.token) continue;
@@ -1296,7 +1348,6 @@ async function autoFetchQuote() {
       savedTokens.add(token);
     }
 
-    /* ---- Retry missing ---- */
     for (let attempt = 1; attempt <= 2; attempt++) {
       const missing = allTokens.filter(t => !savedTokens.has(t));
       if (!missing.length) break;
@@ -1366,6 +1417,86 @@ function scheduleQuoteAutoFetch() {
 
 
 /* ============================================================
+   SECTION 14.2 — AUTO BUY/SELL FETCH @ 09:15:30 IST
+   ============================================================ */
+async function autoFetchBS() {
+  try {
+    if (!isTradingDay(getIST())) { console.log('💹 Auto-BS: non-trading day, skip'); return; }
+    const p = getScreenerPhase();
+    if (!p.date) { console.log('💹 Auto-BS: no trading date, skip'); return; }
+
+    const allTokens = STOCKS.map(s => String(s.token));
+    console.log(`💹 Auto-BS: fetching ${allTokens.length} tokens...`);
+    const t0 = Date.now();
+
+    const fetchedAt = new Date();
+    const results = await fetchBuySellForTokens(allTokens);
+
+    for (const r of results) {
+      bsCache.set(r.token, {
+        buyQty: r.buyQty,
+        sellQty: r.sellQty,
+        ltp: r.ltp,
+        volume: r.volume
+      });
+
+      db.query(
+        `INSERT INTO strategy_bs_snapshot (date, token, strategy_id, buy_qty, sell_qty, ltp, volume, fetched_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (date, token, strategy_id) DO UPDATE SET
+           buy_qty=EXCLUDED.buy_qty,
+           sell_qty=EXCLUDED.sell_qty,
+           ltp=EXCLUDED.ltp,
+           volume=EXCLUDED.volume,
+           fetched_at=EXCLUDED.fetched_at`,
+        [p.date, r.token, 'advance_orb', r.buyQty, r.sellQty, r.ltp, r.volume, fetchedAt]
+      ).catch(() => {});
+    }
+
+    broadcastBS(fetchedAt);
+    console.log(`✅ Auto-BS: ${results.length}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
+  } catch (e) {
+    console.error('Auto-BS failed:', e.message);
+  }
+}
+
+app.post('/api/admin/force-bs', auth, adminOnly, async (req, res) => {
+  try {
+    await autoFetchBS();
+    const p = getScreenerPhase();
+    const { rows } = await db.query(
+      `SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id=$2 AND buy_qty IS NOT NULL`,
+      [p.date, 'advance_orb']
+    );
+    res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+function msUntilNext91530IST() {
+  const ist = getIST();
+  const daySecs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
+  const target = 9 * 3600 + 15 * 60 + 30;   // 09:15:30 IST
+  let diffSecs = target - daySecs;
+  if (diffSecs <= 0) diffSecs += 86400;
+  for (let i = 0; i < 15; i++) {
+    const candidate = new Date(ist.getTime() + diffSecs * 1000);
+    if (isTradingDay(candidate)) break;
+    diffSecs += 86400;
+  }
+  return diffSecs * 1000;
+}
+
+function scheduleBSAutoFetch() {
+  const ms = msUntilNext91530IST();
+  console.log(`⏰ Next auto-BS fetch in ${Math.round(ms / 60000)} min`);
+  setTimeout(async () => { await autoFetchBS(); scheduleBSAutoFetch(); }, ms);
+}
+
+
+/* ============================================================
    SECTION 15 — DB CACHE LOADER
    ============================================================ */
 async function loadScreenerCacheFromDB() {
@@ -1398,11 +1529,12 @@ async function loadScreenerCacheFromDB() {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} (dual REST + Quote)`);
+  console.log(`✅ Server on port ${PORT} (REST + Quote + BS)`);
   console.log(`📊 Strategy: ${STRATEGIES.advance_orb.name}`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);
 
+  /* REST login */
   try {
     await loginREST();
     console.log('✅ [REST] session started');
@@ -1410,26 +1542,38 @@ app.listen(PORT, async () => {
 
   await new Promise(r => setTimeout(r, 4000));
 
+  /* Quote login */
   try {
     await loginQuote();
     console.log('✅ [Quote] session started');
   } catch (e) { console.error('⚠️  [Quote] login failed:', e.message); }
+
+  await new Promise(r => setTimeout(r, 4000));
+
+  /* BS login */
+  try {
+    await loginBS();
+    console.log('✅ [BS] session started');
+  } catch (e) { console.error('⚠️  [BS] login failed:', e.message); }
 
   await loadHolidaysFromDB();
   await loadScreenerCacheFromDB();
   await loadPrevCloseFromDB();
   await loadQuoteCacheFromDB();
   await loadLatestPivotFromDB();
+  await loadBSCacheFromDB();
 
   const nowIST = getIST();
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
   const dow = nowIST.getUTCDay();
 
+  /* Late startup catch-up: day H/L/C (15:16 – 15:40 IST) */
   if (dow >= 1 && dow <= 5 && mins >= 916 && mins <= 940) {
     console.log('🔔 Late startup — fetching day H/L/C');
     fetchDayHLC();
   }
 
+  /* Late startup catch-up: auto-quote (9:30:10 – 9:45 IST) */
   if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 570 && mins <= 585) {
     const pQ = getScreenerPhase();
     if (pQ.date) {
@@ -1448,8 +1592,28 @@ app.listen(PORT, async () => {
     }
   }
 
+  /* Late startup catch-up: BS fetch (9:15:30 – 9:45 IST) */
+  if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 555 && mins <= 585) {
+    const pB = getScreenerPhase();
+    if (pB.date) {
+      try {
+        const { rows } = await db.query(
+          'SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot WHERE date=$1 AND strategy_id=$2',
+          [pB.date, 'advance_orb']
+        );
+        if (+rows[0].cnt === 0) {
+          console.log('🔔 Late startup — running auto-BS catch-up');
+          autoFetchBS().catch(e => console.error('BS catch-up failed:', e.message));
+        } else {
+          console.log(`✅ Today's BS already fetched (${rows[0].cnt} tokens)`);
+        }
+      } catch (e) { console.error('BS catch-up check failed:', e.message); }
+    }
+  }
+
   scheduleDailyFetch();
   scheduleQuoteAutoFetch();
+  scheduleBSAutoFetch();
 
-  console.log('ℹ️  Ready — REST + Quote + WS + SSE + auto-quote @ 9:30:10 + day H/L @ 15:16');
+  console.log('ℹ️  Ready — REST + Quote + BS + WS + SSE + auto-quote @ 9:30:10 + day H/L @ 15:16 + BS @ 9:15:30');
 });

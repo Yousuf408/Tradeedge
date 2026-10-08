@@ -204,6 +204,10 @@ export async function fetchBuySellForTokens(tokens) {
       });
 
       if (r.status && r.data?.fetched) {
+                 if (r.data.fetched[0] && !global._bsSampleLogged) {
+          global._bsSampleLogged = true;
+          console.log('🔬 [BS] FULL quote sample:', JSON.stringify(r.data.fetched[0]));
+        }
         for (const q of r.data.fetched) {
           const token = String(q.symbolToken);
 

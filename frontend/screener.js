@@ -1,10 +1,9 @@
 /* ============================================================
-   SCREENER.JS  — v2.5
-   + Strategy dropdown (Advance ORB / Momentum)
-   + Pivot column
-   + Manual "Fetch Day H/L/C" button (admin only)
-   + New chip: "Pivot + Entry" (pivot touch + bullish close + entry)
-   + Null-safe guards
+   SCREENER.JS  — v2.6
+   + Buy/Sell column (from BS cache)
+   + Top 15 Gainers / Top 15 Losers chips
+   + Pivot + Entry chip
+   + All previous features
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -15,6 +14,7 @@ let SCREENER_LTP = {};
 let SCREENER_PREV_CLOSE = {};
 let SCREENER_QUOTE = {};
 let SCREENER_PIVOT = {};
+let SCREENER_BS = {};
 let SCREENER_ORB = {};
 let SCREENER_INIT_DONE = false;
 let SCREENER_LTP_TIMER = null;
@@ -77,6 +77,7 @@ function setupControls() {
     <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
     <button id="fetchQuoteBtn" class="btn btn-outline" onclick="startQuoteFetch()">📊 Fetch Quote H/L</button>
     <button id="fetchDayHLCBtn" class="btn btn-outline" onclick="startDayHLCFetch()">📅 Fetch Day H/L/C</button>
+    <button id="fetchBSBtn" class="btn btn-outline" onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
     <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">Per-Trade ₹</label>
     <input id="perTradeInput" type="number" value="10000" min="100"
            style="width:110px;padding:7px 12px;border:1.5px solid var(--border-soft);border-radius:8px;
@@ -122,7 +123,6 @@ function categorizeStock(stock) {
   return 'waiting';
 }
 
-/* Pivot touch filter (0.1% buffer) + bullish close above pivot */
 function passesPivotFilter(token) {
   const c = SCREENER_ALL_CANDLES[token];
   const pivot = SCREENER_PIVOT[token];
@@ -164,7 +164,9 @@ function renderChips() {
     chip('pivot_entry', '🎯 Pivot + Entry', counts.pivot_entry) +
     chip('entry', '🎯 Entry Signal', counts.entry) +
     chip('lowbrok', '⬇️ Low Broken', counts.lowbrok) +
-    chip('waiting', '⏸️ Waiting', counts.waiting);
+    chip('waiting', '⏸️ Waiting', counts.waiting) +
+    chip('top_gainers', '🚀 Top 15 Gainers', 15) +
+    chip('top_losers', '📉 Top 15 Losers', 15);
 }
 
 /* ============================================================
@@ -193,9 +195,7 @@ function getSortValue(stock, field) {
     const v = computeChangePct(stock.token);
     return v === null ? -Infinity : v;
   }
-  if (field === 'ltp') {
-    return SCREENER_LTP[stock.token] ?? -Infinity;
-  }
+  if (field === 'ltp') return SCREENER_LTP[stock.token] ?? -Infinity;
   if (field === 'range') {
     if (!candle) return -Infinity;
     return ((candle.high - candle.low) / candle.low) * 100;
@@ -270,6 +270,14 @@ function formatTimeIST(isoStr) {
     const ist = new Date(d.getTime() + 5.5 * 3600 * 1000);
     return ist.toISOString().slice(11, 19);
   } catch { return '—'; }
+}
+
+function formatQty(n) {
+  if (n == null) return '—';
+  if (n >= 10000000) return (n / 10000000).toFixed(1) + 'Cr';
+  if (n >= 100000) return (n / 100000).toFixed(1) + 'L';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return String(Math.round(n));
 }
 
 /* ============================================================
@@ -351,7 +359,34 @@ function updateLTPCells(ticks) {
 }
 
 /* ============================================================
-   SECTION 3.4 — ORB ROW FAST UPDATE
+   SECTION 3.4 — BUY/SELL CELL
+   ============================================================ */
+function renderBuySellCell(token) {
+  const bs = SCREENER_BS[token];
+  if (!bs || bs.buyQty == null || bs.sellQty == null) {
+    return '<span style="color:var(--text-muted)">—</span>';
+  }
+  const total = bs.buyQty + bs.sellQty;
+  if (total <= 0) return '<span style="color:var(--text-muted)">—</span>';
+  const buyPct = (bs.buyQty / total) * 100;
+  const sellPct = 100 - buyPct;
+  const color = buyPct > 55 ? 'var(--success)' : buyPct < 45 ? 'var(--danger)' : 'var(--text-secondary)';
+  const arrow = buyPct > 55 ? '▲' : buyPct < 45 ? '▼' : '•';
+  return `
+    <div style="display:flex;flex-direction:column;gap:2px;min-width:80px">
+      <div style="display:flex;justify-content:space-between;font-size:11px;font-weight:700;color:${color}">
+        <span>${arrow} ${buyPct.toFixed(0)}%</span>
+        <span style="color:var(--text-muted);font-weight:500">${sellPct.toFixed(0)}%</span>
+      </div>
+      <div style="background:rgba(225,112,85,0.25);border-radius:3px;height:6px;overflow:hidden;position:relative">
+        <div style="position:absolute;left:0;top:0;bottom:0;width:${buyPct}%;background:var(--success)"></div>
+      </div>
+      <div style="font-size:9px;color:var(--text-muted);font-family:ui-monospace,monospace">${formatQty(bs.buyQty)} / ${formatQty(bs.sellQty)}</div>
+    </div>`;
+}
+
+/* ============================================================
+   SECTION 3.5 — ORB ROW FAST UPDATE
    ============================================================ */
 function updateORBRow(token, state) {
   SCREENER_ORB[token] = {
@@ -673,10 +708,7 @@ async function startDayHLCFetch() {
     if (!r.ok) {
       showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
     } else {
-      showToast(
-        '✅ Day H/L/C Saved',
-        `${d.saved}/${d.total} stocks · ${d.date}`
-      );
+      showToast('✅ Day H/L/C Saved', `${d.saved}/${d.total} stocks · ${d.date}`);
       await loadLTP();
     }
   } catch (e) {
@@ -686,6 +718,47 @@ async function startDayHLCFetch() {
   DAYHLC_FETCHING = false;
   btn.disabled = false;
   btn.textContent = '📅 Fetch Day H/L/C';
+}
+
+/* ============================================================
+   SECTION 5.3 — MANUAL BUY/SELL FETCH
+   ============================================================ */
+async function startBSFetch() {
+  const btn = document.getElementById('fetchBSBtn');
+  if (!btn) return;
+  if (btn.disabled) return;
+
+  const ok = confirm(
+    'Fetch Buy/Sell snapshot for all stocks now?\n\n' +
+    '• Server will call Quote API for all 387 stocks\n' +
+    '• Takes ~5–8 seconds\n' +
+    '• Overwrites today\'s existing snapshot\n\n' +
+    'Continue?'
+  );
+  if (!ok) return;
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Fetching Buy/Sell...';
+
+  try {
+    const r = await fetch(API + '/api/admin/force-bs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
+    });
+    const d = await r.json();
+
+    if (!r.ok) {
+      showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
+    } else {
+      showToast('✅ Buy/Sell Saved', `${d.saved}/${d.total} stocks · ${d.date}`);
+      await loadLTP();
+    }
+  } catch (e) {
+    showToast('⚠️ Error', e.message);
+  }
+
+  btn.disabled = false;
+  btn.textContent = '💹 Fetch Buy/Sell';
 }
 
 function updateProgress(done, total) {
@@ -716,6 +789,9 @@ async function loadLTP() {
         if (item.ltp) SCREENER_LTP[item.token] = item.ltp;
         if (item.prevClose) SCREENER_PREV_CLOSE[item.token] = item.prevClose;
         if (item.pivot) SCREENER_PIVOT[item.token] = item.pivot;
+        if (item.buyQty != null || item.sellQty != null) {
+          SCREENER_BS[item.token] = { buyQty: item.buyQty, sellQty: item.sellQty, volume: item.bsVolume };
+        }
         if (item.highQuote) {
           SCREENER_QUOTE[item.token] = {
             high: item.highQuote,
@@ -785,6 +861,12 @@ function startSSE() {
         }
         renderScreenerTable();
       }
+      else if (msg.type === 'bs' && msg.bs) {
+        for (const [token, v] of Object.entries(msg.bs)) {
+          SCREENER_BS[token] = { buyQty: v.buyQty, sellQty: v.sellQty, volume: v.volume };
+        }
+        renderScreenerTable();
+      }
     } catch {}
   };
 
@@ -830,6 +912,7 @@ function renderScreenerTable() {
     head.innerHTML = `<tr>
       <th>Stock / Company</th>
       <th>LTP / Chg %</th>
+      <th>Buy / Sell</th>
       <th>Pivot</th>
       <th>20 EMA</th>
       <th>9:15 Range (H / L)</th>
@@ -840,7 +923,7 @@ function renderScreenerTable() {
       <th>STAGE</th>
       <th>ACTION</th>
     </tr>`;
-    body.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:60px;color:var(--text-muted);line-height:1.9">
+    body.innerHTML = `<tr><td colspan="12" style="text-align:center;padding:60px;color:var(--text-muted);line-height:1.9">
       🚀 <strong>Momentum strategy</strong> — columns ready<br>
       <span style="font-size:12px">Logic will be implemented soon.</span>
     </td></tr>`;
@@ -858,6 +941,7 @@ function renderScreenerTable() {
     <th>Stock / Company</th>
     <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
         <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
+    <th>Buy / Sell</th>
     <th>Pivot</th>
     <th class="th-sortable" onclick="setSort('range')">9:15 Range (H / L) ${sortIndicator('range')}</th>
     <th>Quote H / L</th>
@@ -872,7 +956,7 @@ function renderScreenerTable() {
   </tr>`;
 
   if (!SCREENER_STOCKS.length) {
-    body.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:60px;color:var(--text-muted)">
+    body.innerHTML = `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
       Loading stocks...<br>
       Click <strong>⚡ Fetch 9:15 Candles</strong> or <strong>📊 Fetch Quote H/L</strong> to load data.
     </td></tr>`;
@@ -884,6 +968,16 @@ function renderScreenerTable() {
   let filtered = SCREENER_STOCKS;
   if (SCREENER_STAGE_FILTER === 'pivot_entry') {
     filtered = filtered.filter(s => passesPivotFilter(s.token) && (SCREENER_ORB[s.token]?.entrySignal));
+  } else if (SCREENER_STAGE_FILTER === 'top_gainers') {
+    filtered = [...filtered]
+      .filter(s => computeChangePct(s.token) !== null)
+      .sort((a, b) => computeChangePct(b.token) - computeChangePct(a.token))
+      .slice(0, 15);
+  } else if (SCREENER_STAGE_FILTER === 'top_losers') {
+    filtered = [...filtered]
+      .filter(s => computeChangePct(s.token) !== null)
+      .sort((a, b) => computeChangePct(a.token) - computeChangePct(b.token))
+      .slice(0, 15);
   } else if (SCREENER_STAGE_FILTER !== 'all') {
     filtered = filtered.filter(s => categorizeStock(s) === SCREENER_STAGE_FILTER);
   }
@@ -891,7 +985,7 @@ function renderScreenerTable() {
   const sorted = sortStocks(filtered);
 
   if (!sorted.length) {
-    body.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:40px;color:var(--text-muted)">
+    body.innerHTML = `<tr><td colspan="14" style="text-align:center;padding:40px;color:var(--text-muted)">
       No stocks in this category.
     </td></tr>`;
     if (count) count.textContent = `${SCREENER_STOCKS.length} / ${SCREENER_ALL_STOCKS.length}`;
@@ -963,6 +1057,7 @@ function renderScreenerTable() {
         <span class="cell-primary ltp-cell">${ltp ? '₹' + (+ltp).toFixed(2) : '—'}</span>
         <span class="cell-sub change-cell">${changeLine}</span>
       </td>
+      <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
       <td class="pivot-cell" style="white-space:nowrap">${pivotCell}</td>
       <td style="white-space:nowrap">
         ${c ? `<span class="cell-primary" style="color:var(--success)">H: ₹${c.high.toFixed(2)}</span>

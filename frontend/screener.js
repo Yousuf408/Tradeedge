@@ -955,7 +955,7 @@ function renderScreenerTable() {
       return;
     }
 
-    let filtered = SCREENER_STOCKS;
+    let filtered = [...SCREENER_ALL_STOCKS];
     if (SCREENER_MOMENTUM_FILTER === 'top_gainers') {
       filtered = [...filtered]
         .filter(s => computeChangePct(s.token) !== null)

@@ -1,10 +1,9 @@
 /* ============================================================
-   SCREENER.JS  — v2.8
-   + Momentum uses all 387 stocks (no filter)
-   + LTP loaded before first render (fixes empty LTP on load)
-   + Default sort: Change% desc
-   + Buy/Sell column
-   + Top 15 Gainers / Losers chips
+   SCREENER.JS  — v2.9
+   + Gap % filter for Top Gainers / Top Losers
+   + Momentum uses all 387 stocks
+   + LTP loaded before first render
+   + Buy/Sell column + Pivot + 20 EMA placeholder
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -110,11 +109,13 @@ function onPerTradeChange() {
   renderScreenerTable();
 }
 
-function onStrategyChange(value) {
+async function onStrategyChange(value) {
   SCREENER_ACTIVE_STRATEGY = value;
-  /* Always show LTP sorted top → bottom by change% on switch */
   SCREENER_SORT_BY = 'change';
   SCREENER_SORT_DIR = 'desc';
+  SCREENER_STAGE_FILTER = 'all';
+  SCREENER_MOMENTUM_FILTER = 'all';
+  await loadLTP();
   renderScreenerTable();
 }
 
@@ -146,6 +147,8 @@ function setStageFilter(key) {
 
 function setMomentumFilter(key) {
   SCREENER_MOMENTUM_FILTER = key;
+  SCREENER_SORT_BY = 'change';
+  SCREENER_SORT_DIR = 'desc';
   renderScreenerTable();
 }
 
@@ -269,6 +272,14 @@ function computeChangePct(token) {
   const prevClose = SCREENER_PREV_CLOSE[token];
   if (!ltp || !prevClose || prevClose <= 0) return null;
   return ((ltp - prevClose) / prevClose) * 100;
+}
+
+/* Gap % = (today open − prev close) / prev close × 100 */
+function computeGapPct(token) {
+  const c = SCREENER_ALL_CANDLES[token];
+  const prev = SCREENER_PREV_CLOSE[token];
+  if (!c || !c.open || !prev || prev <= 0) return null;
+  return ((c.open - prev) / prev) * 100;
 }
 
 function formatPriceINR(v) {
@@ -795,7 +806,6 @@ function updateProgress(done, total) {
    SECTION 6 — LTP POLL
    ============================================================ */
 async function loadLTP() {
-  /* Momentum → all stocks; Advance ORB → filtered list */
   const baseList = SCREENER_ACTIVE_STRATEGY === 'momentum'
     ? SCREENER_ALL_STOCKS
     : SCREENER_STOCKS;
@@ -846,11 +856,8 @@ async function loadLTP() {
         }
       }
     }
-        updateNiftyHeader();
-    /* Only update LTP/change cells — no full table rebuild */
-    updateLTPCells(Object.fromEntries(
-      d.results.filter(r => r.ltp).map(r => [r.token, r.ltp])
-    ));
+    updateNiftyHeader();
+    renderScreenerTable();
   } catch (e) { console.error('LTP failed:', e); }
 }
 
@@ -959,12 +966,26 @@ function renderScreenerTable() {
 
     if (SCREENER_MOMENTUM_FILTER === 'top_gainers') {
       filtered = filtered
-        .filter(s => computeChangePct(s.token) !== null)
+        .filter(s => {
+          const chg = computeChangePct(s.token);
+          const gap = computeGapPct(s.token);
+          if (chg === null || chg <= 0) return false;
+          /* Exclude 2%+ gap up */
+          if (gap !== null && gap >= 2) return false;
+          return true;
+        })
         .sort((a, b) => computeChangePct(b.token) - computeChangePct(a.token))
         .slice(0, 15);
     } else if (SCREENER_MOMENTUM_FILTER === 'top_losers') {
       filtered = filtered
-        .filter(s => computeChangePct(s.token) !== null)
+        .filter(s => {
+          const chg = computeChangePct(s.token);
+          const gap = computeGapPct(s.token);
+          if (chg === null || chg >= 0) return false;
+          /* Exclude 2%+ gap down */
+          if (gap !== null && gap <= -2) return false;
+          return true;
+        })
         .sort((a, b) => computeChangePct(a.token) - computeChangePct(b.token))
         .slice(0, 15);
     }

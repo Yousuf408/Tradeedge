@@ -846,8 +846,11 @@ async function loadLTP() {
         }
       }
     }
-    updateNiftyHeader();
-    renderScreenerTable();
+        updateNiftyHeader();
+    /* Only update LTP/change cells — no full table rebuild */
+    updateLTPCells(Object.fromEntries(
+      d.results.filter(r => r.ltp).map(r => [r.token, r.ltp])
+    ));
   } catch (e) { console.error('LTP failed:', e); }
 }
 

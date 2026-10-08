@@ -1,8 +1,10 @@
 /* ============================================================
-   SCREENER.JS  — v2.7
-   + Momentum strategy columns (Buy/Sell, Pivot, 20 EMA, Target/SL, MAXQTY)
-   + Momentum chips: All, Top 15 Gainers, Top 15 Losers
-   + Advance ORB untouched
+   SCREENER.JS  — v2.8
+   + Momentum uses all 387 stocks (no filter)
+   + LTP loaded before first render (fixes empty LTP on load)
+   + Default sort: Change% desc
+   + Buy/Sell column
+   + Top 15 Gainers / Losers chips
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -110,11 +112,14 @@ function onPerTradeChange() {
 
 function onStrategyChange(value) {
   SCREENER_ACTIVE_STRATEGY = value;
+  /* Always show LTP sorted top → bottom by change% on switch */
+  SCREENER_SORT_BY = 'change';
+  SCREENER_SORT_DIR = 'desc';
   renderScreenerTable();
 }
 
 /* ============================================================
-   SECTION 2.1 — FILTERS
+   SECTION 2.1 — FILTERS + CHIPS
    ============================================================ */
 function categorizeStock(stock) {
   const orb = SCREENER_ORB[stock.token] || {};
@@ -144,9 +149,6 @@ function setMomentumFilter(key) {
   renderScreenerTable();
 }
 
-/* ============================================================
-   SECTION 2.2 — CHIPS RENDER
-   ============================================================ */
 function renderChips() {
   const el = document.getElementById('stageChips');
   if (!el) return;
@@ -164,7 +166,6 @@ function renderChips() {
     return;
   }
 
-  /* Advance ORB chips */
   el.style.display = '';
   const counts = { all: 0, entry: 0, lowbrok: 0, waiting: 0, pivot_entry: 0 };
   for (const s of SCREENER_STOCKS) {
@@ -191,7 +192,7 @@ function renderChips() {
 }
 
 /* ============================================================
-   SECTION 2.3 — SORTING
+   SECTION 2.2 — SORTING
    ============================================================ */
 function setSort(field) {
   if (SCREENER_SORT_BY === field) {
@@ -542,12 +543,14 @@ async function loadCachedData() {
     }
 
     recomputeFilteredStocks();
-    renderScreenerTable();
 
+    /* Load LTP FIRST so change% is ready before first render */
     if (Object.keys(SCREENER_ALL_CANDLES).length) {
       await loadLTP();
       startLTPRefresh();
     }
+
+    renderScreenerTable();
   } catch (e) { console.error(e); }
 }
 
@@ -699,7 +702,7 @@ async function startQuoteFetch() {
 }
 
 /* ============================================================
-   SECTION 5.2 — MANUAL DAY H/L/C + PIVOT FETCH
+   SECTION 5.2 — MANUAL DAY H/L/C
    ============================================================ */
 async function startDayHLCFetch() {
   const btn = document.getElementById('fetchDayHLCBtn');
@@ -709,8 +712,7 @@ async function startDayHLCFetch() {
   const ok = confirm(
     'Fetch day High/Low/Close + Pivot for all stocks now?\n\n' +
     '• Server will call Quote API for all 387 stocks\n' +
-    '• Takes ~5–8 seconds\n' +
-    '• Overwrites existing day_high/day_low/day_close/pivot\n\n' +
+    '• Takes ~5–8 seconds\n\n' +
     'Continue?'
   );
   if (!ok) return;
@@ -742,7 +744,7 @@ async function startDayHLCFetch() {
 }
 
 /* ============================================================
-   SECTION 5.3 — MANUAL BUY/SELL FETCH
+   SECTION 5.3 — MANUAL BUY/SELL
    ============================================================ */
 async function startBSFetch() {
   const btn = document.getElementById('fetchBSBtn');
@@ -752,8 +754,7 @@ async function startBSFetch() {
   const ok = confirm(
     'Fetch Buy/Sell snapshot for all stocks now?\n\n' +
     '• Server will call Quote API for all 387 stocks\n' +
-    '• Takes ~5–8 seconds\n' +
-    '• Overwrites today\'s existing snapshot\n\n' +
+    '• Takes ~5–8 seconds\n\n' +
     'Continue?'
   );
   if (!ok) return;
@@ -794,9 +795,11 @@ function updateProgress(done, total) {
    SECTION 6 — LTP POLL
    ============================================================ */
 async function loadLTP() {
+  /* Momentum → all stocks; Advance ORB → filtered list */
   const baseList = SCREENER_ACTIVE_STRATEGY === 'momentum'
     ? SCREENER_ALL_STOCKS
     : SCREENER_STOCKS;
+
   const tokens = baseList.map(s => s.token);
   if (!tokens.includes(NIFTY50_TOKEN)) tokens.push(NIFTY50_TOKEN);
   if (!tokens.length) return;
@@ -948,24 +951,16 @@ function renderScreenerTable() {
       <th>ACTION</th>
     </tr>`;
 
-    if (!SCREENER_STOCKS.length) {
-      body.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:60px;color:var(--text-muted)">
-        Loading stocks...<br>
-        Click <strong>⚡ Fetch 9:15 Candles</strong> to load data.
-      </td></tr>`;
-      if (count) count.textContent = `0 / ${SCREENER_ALL_STOCKS.length}`;
-      renderChips();
-      return;
-    }
-
+    /* All 387 stocks, no candle-range filter */
     let filtered = [...SCREENER_ALL_STOCKS];
+
     if (SCREENER_MOMENTUM_FILTER === 'top_gainers') {
-      filtered = [...filtered]
+      filtered = filtered
         .filter(s => computeChangePct(s.token) !== null)
         .sort((a, b) => computeChangePct(b.token) - computeChangePct(a.token))
         .slice(0, 15);
     } else if (SCREENER_MOMENTUM_FILTER === 'top_losers') {
-      filtered = [...filtered]
+      filtered = filtered
         .filter(s => computeChangePct(s.token) !== null)
         .sort((a, b) => computeChangePct(a.token) - computeChangePct(b.token))
         .slice(0, 15);
@@ -974,10 +969,10 @@ function renderScreenerTable() {
     const sorted = sortStocks(filtered);
 
     if (!sorted.length) {
-      body.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text-muted)">
-        No stocks in this category.
+      body.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:60px;color:var(--text-muted)">
+        Loading stocks...<br>Please wait a few seconds.
       </td></tr>`;
-      if (count) count.textContent = `${SCREENER_STOCKS.length} / ${SCREENER_ALL_STOCKS.length}`;
+      if (count) count.textContent = `0 / ${SCREENER_ALL_STOCKS.length}`;
       renderChips();
       return;
     }
@@ -1045,7 +1040,7 @@ function renderScreenerTable() {
   }
 
   /* ============================================================
-     ADVANCE ORB strategy branch (unchanged)
+     ADVANCE ORB strategy branch
      ============================================================ */
   head.innerHTML = `<tr>
     <th>Stock / Company</th>

@@ -278,7 +278,7 @@ async function loadBSCacheFromDB() {
       `SELECT token, buy_qty, sell_qty, ltp, volume
        FROM strategy_bs_snapshot
        WHERE date=$1 AND strategy_id=$2 AND token = ANY($3)`,
-      [p.date, 'advance_orb', activeTokens]
+      [p.date, 'momentum', activeTokens]
     );
     for (const r of rows) {
       bsCache.set(String(r.token), {
@@ -1449,7 +1449,7 @@ async function autoFetchBS() {
            ltp=EXCLUDED.ltp,
            volume=EXCLUDED.volume,
            fetched_at=EXCLUDED.fetched_at`,
-        [p.date, r.token, 'advance_orb', r.buyQty, r.sellQty, r.ltp, r.volume, fetchedAt]
+        [p.date, r.token, 'momentum', r.buyQty, r.sellQty, r.ltp, r.volume, fetchedAt]
       ).catch(() => {});
     }
 
@@ -1467,7 +1467,7 @@ app.post('/api/admin/force-bs', auth, adminOnly, async (req, res) => {
     const { rows } = await db.query(
       `SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot
        WHERE date=$1 AND strategy_id=$2 AND buy_qty IS NOT NULL`,
-      [p.date, 'advance_orb']
+      [p.date, 'momentum']
     );
     res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
   } catch (e) {
@@ -1599,7 +1599,7 @@ app.listen(PORT, async () => {
       try {
         const { rows } = await db.query(
           'SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot WHERE date=$1 AND strategy_id=$2',
-          [pB.date, 'advance_orb']
+          [pB.date, 'momentum']
         );
         if (+rows[0].cnt === 0) {
           console.log('🔔 Late startup — running auto-BS catch-up');

@@ -953,6 +953,7 @@ function renderScreenerTable() {
       <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
           <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
       <th>Buy / Sell</th>
+      <th>Volume</th>
       <th>Pivot</th>
       <th>20 EMA</th>
       <th>Target / SL</th>
@@ -1047,6 +1048,7 @@ function renderScreenerTable() {
           <span class="cell-sub change-cell">${changeLine}</span>
         </td>
         <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
+        <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">${SCREENER_BS[s.token]?.volume ? formatQty(SCREENER_BS[s.token].volume) : '—'}</td>
         <td class="pivot-cell" style="white-space:nowrap">${pivotCell}</td>
         <td style="white-space:nowrap"><span style="color:var(--text-muted)">—</span></td>
         <td style="white-space:nowrap" class="cell-targetsl">${c ? renderTargetSL(c, orb) : '<span style="color:var(--text-muted)">—</span>'}</td>

@@ -794,7 +794,10 @@ function updateProgress(done, total) {
    SECTION 6 — LTP POLL
    ============================================================ */
 async function loadLTP() {
-  const tokens = SCREENER_STOCKS.map(s => s.token);
+  const baseList = SCREENER_ACTIVE_STRATEGY === 'momentum'
+    ? SCREENER_ALL_STOCKS
+    : SCREENER_STOCKS;
+  const tokens = baseList.map(s => s.token);
   if (!tokens.includes(NIFTY50_TOKEN)) tokens.push(NIFTY50_TOKEN);
   if (!tokens.length) return;
 

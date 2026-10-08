@@ -1,14 +1,14 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v2.7
+   server.js — TradeAlgo Pro backend  |  v2.8
    ============================================================
 
-   DUAL SOURCE MODE + PIVOT + BS SNAPSHOT
    - REST historical → open/high/low/close
    - FULL Quote (9:30:10 auto) → q15_* columns
    - 15:16 daily fetch → day_high/low/close + pivot
    - 9:15:30 BS fetch → strategy_bs_snapshot table
-   - prevClose loaded from previous day's day_close (not prev_close column)
-   - Pivot loader: date < today
+   - prevClose loaded from previous day's day_close
+   - WS starts at 09:14:55 IST, stops at 15:30
+   - LTP cache + SSE broadcast active from 09:14:55 (ORB only in ready)
    ============================================================ */
 
 import express from 'express';
@@ -141,6 +141,16 @@ function getScreenerPhase() {
   return { phase: 'ready', date: today };
 }
 
+/* WS starts at 09:14:55 IST, stops at 15:30 */
+function shouldStartWS() {
+  const ist = getIST();
+  if (!isTradingDay(ist)) return false;
+  const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
+  const start = 9 * 3600 + 14 * 60 + 55;   // 09:14:55
+  const end   = 15 * 3600 + 30 * 60;       // 15:30:00
+  return secs >= start && secs < end;
+}
+
 function countFilled(date) {
   const cached = getCachedCandles(STOCKS.map(s => s.token), date);
   return cached.filter(c => c.candle && !c.candle.error && Array.isArray(c.candle)).length;
@@ -269,7 +279,7 @@ async function loadLatestPivotFromDB() {
 
 
 /* ============================================================
-   SECTION 4.3 — BUY/SELL CACHE (from strategy_bs_snapshot)
+   SECTION 4.3 — BUY/SELL CACHE
    ============================================================ */
 const bsCache = new Map();
 
@@ -409,8 +419,12 @@ function handleTick(token, ltp) {
     return;
   }
 
+  /* Always cache + broadcast LTP (works during preopen too) */
+  setCachedLTP(token, ltp);
+  broadcastLTP(token, ltp);
+
   const p = getScreenerPhase();
-  if (p.phase !== 'ready' || !p.date) return;
+  if (p.phase !== 'ready' || !p.date) return;   // ORB logic only in ready phase
 
   const candleArr = getCachedCandles([token], p.date)[0]?.candle;
   if (!Array.isArray(candleArr) || candleArr.length < 5) return;
@@ -479,15 +493,12 @@ function handleTick(token, ltp) {
   }
 
   if (changed) { orbState.set(key, state); broadcastORB(token, state); }
-  setCachedLTP(token, ltp);
-  broadcastLTP(token, ltp);
   queueLtpWrite(token, ltp, p.date);
 }
 
 function startWebSocketForReadyPhase() {
   if (wsStarted) return;
-  const p = getScreenerPhase();
-  if (p.phase !== 'ready' || !p.date) return;
+  if (!shouldStartWS()) return;
 
   const restSession = getSessionStatusREST();
   const feedToken = restSession.loggedIn ? getFeedTokenREST() : getFeedTokenQuote();
@@ -510,22 +521,18 @@ function startWebSocketForReadyPhase() {
 
 function stopWebSocketIfNeeded() {
   if (!wsStarted) return;
-  const ist = getIST();
-  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  const dow = ist.getUTCDay();
-  if (dow === 0 || dow === 6 || !isTradingDay(ist) || mins >= 930) {
-    stopWS();
-    wsStarted = false;
-    flushLtpWrites().catch(() => {});
-    console.log('🔌 WS stopped');
-  }
+  if (shouldStartWS()) return;
+
+  stopWS();
+  wsStarted = false;
+  flushLtpWrites().catch(() => {});
+  console.log('🔌 WS stopped');
 }
 
 setInterval(() => {
-  const p = getScreenerPhase();
-  if (p.phase === 'ready') startWebSocketForReadyPhase();
+  if (shouldStartWS()) startWebSocketForReadyPhase();
   else stopWebSocketIfNeeded();
-}, 60 * 1000);
+}, 5 * 1000);
 
 
 /* ============================================================
@@ -1180,7 +1187,6 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 
 /* ============================================================
    SECTION 14 — DAY H/L/C FETCH (15:16 IST) + PIVOT
-   NOTE: prev_close column is NOT touched here.
    ============================================================ */
 async function fetchDayHLC() {
   try {
@@ -1296,7 +1302,6 @@ function scheduleDailyFetch() {
 
 /* ============================================================
    SECTION 14.1 — AUTO QUOTE FETCH @ 09:30:10 IST
-   NOTE: prev_close column is NOT touched here.
    ============================================================ */
 async function autoFetchQuote() {
   try {
@@ -1527,6 +1532,7 @@ app.listen(PORT, async () => {
   console.log(`📊 Strategy: ${STRATEGIES.advance_orb.name}`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);
+  console.log(`🔌 WS window: 09:14:55 – 15:30:00 IST`);
 
   try {
     await loginREST();
@@ -1603,5 +1609,5 @@ app.listen(PORT, async () => {
   scheduleQuoteAutoFetch();
   scheduleBSAutoFetch();
 
-  console.log('ℹ️  Ready — REST + Quote + BS + WS + SSE + auto-quote @ 9:30:10 + day H/L @ 15:16 + BS @ 9:15:30');
+  console.log('ℹ️  Ready — REST + Quote + BS + WS + SSE + auto-quote @ 9:30:10 + day H/L @ 15:16 + BS @ 9:15:30 + WS @ 9:14:55');
 });

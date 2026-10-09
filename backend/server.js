@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v3.5
+   server.js — TradeAlgo Pro backend  |  v3.6
    ============================================================ */
 
 import express from 'express';
@@ -16,6 +16,7 @@ import { dirname, join } from 'path';
 import {
   loginPlatform as loginREST,
   getCandlesForTokens,
+  getPrevDayLastClosesBatch,
   getCachedCandles,
   setCachedCandle,
   setCachedLTP,
@@ -284,6 +285,24 @@ async function loadLatestPivotFromDB() {
    SECTION 4.3 — BUY/SELL CACHE  (strategy_bs_snapshot)
    ============================================================ */
 const bsCache = new Map();
+const prevClosesCache = new Map();   // token -> [{ ts, close }, ...]
+
+function computeRSI(prevCloses, currentClose) {
+  if (!Array.isArray(prevCloses) || prevCloses.length < 13) return null;
+  if (!Number.isFinite(currentClose) || currentClose <= 0) return null;
+
+  const closes = [...prevCloses, currentClose];
+  let gains = 0, losses = 0;
+  for (let i = 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) gains += d; else losses -= d;
+  }
+  const n = closes.length - 1;
+  const avgGain = gains / n;
+  const avgLoss = losses / n;
+  if (avgLoss === 0) return 100;
+  return 100 - (100 / (1 + avgGain / avgLoss));
+}
 
 async function loadBSCacheFromDB() {
   try {
@@ -291,7 +310,7 @@ async function loadBSCacheFromDB() {
     if (!p.date) return;
     const activeTokens = STOCKS.map(s => String(s.token));
     const { rows } = await db.query(
-      `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no, preopen_price, preopen_at, day_open
+      `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no, preopen_price, preopen_at, day_open, rsi
        FROM strategy_bs_snapshot
        WHERE date=$1 AND strategy_id=$2 AND token = ANY($3)`,
       [p.date, 'momentum', activeTokens]
@@ -305,11 +324,35 @@ async function loadBSCacheFromDB() {
         rank: r.rank_no != null ? +r.rank_no : null,
         preopenPrice: r.preopen_price != null ? +r.preopen_price : null,
         preopenAt: r.preopen_at,
-        dayOpen: r.day_open != null ? +r.day_open : null
+        dayOpen: r.day_open != null ? +r.day_open : null,
+        rsi: r.rsi != null ? +r.rsi : null
       });
     }
     console.log(`💹 Loaded buy/sell for ${rows.length} tokens from DB`);
   } catch (e) { console.error('BS cache load failed:', e.message); }
+}
+
+/* Load prev-day min_1_close from DB into prevClosesCache (morning preload) */
+async function loadPrevClosesFromDB() {
+  try {
+    const prevDate = getPreviousTradingDay(getIST());
+    const activeTokens = STOCKS.map(s => String(s.token));
+    const { rows } = await db.query(
+      `SELECT token, min_1_close, min_1_ts FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL
+         AND token = ANY($2)`,
+      [prevDate, activeTokens]
+    );
+    prevClosesCache.clear();
+    for (const r of rows) {
+      if (Array.isArray(r.min_1_close) && r.min_1_close.length >= 13) {
+        const closes = r.min_1_close.map(c => +c);
+        const ts = Array.isArray(r.min_1_ts) ? r.min_1_ts : [];
+        prevClosesCache.set(String(r.token), closes.map((c, i) => ({ ts: ts[i] || null, close: c })));
+      }
+    }
+    console.log(`📈 Loaded prev closes for ${prevClosesCache.size} tokens (from ${prevDate})`);
+  } catch (e) { console.error('prevCloses load failed:', e.message); }
 }
 
 
@@ -367,49 +410,31 @@ async function fetchPreopenRaw() {
 
 function parsePreopen(json) {
   const items = (json && json.data) || [];
-
-  // Step 1: build NSE map — { "AAVAS": 1188.30, "COLPAL": 1842.80, ... }
   const nseMap = new Map();
+
   for (const item of items) {
     const meta = item.metadata || {};
     const detail = (item.detail && item.detail.preOpenMarket) || {};
-
     const nseSym = String(meta.symbol || '').toUpperCase().trim();
     if (!nseSym) continue;
 
-    const price =
-      detail.finalPrice ??
-      meta.lastPrice ??
-      detail.IEP ??
-      null;
-
+    const price = detail.finalPrice ?? meta.lastPrice ?? detail.IEP ?? null;
     if (!Number.isFinite(price) || price <= 0) continue;
 
     const key = nseSym.replace(/-EQ$|-BE$|-BL$|-BZ$/, '');
     nseMap.set(key, +price);
   }
 
-  // Step 2: iterate OUR stocks → lookup in NSE map
   const matched = [];
   const missingSyms = [];
-
   for (const s of STOCKS) {
     const key = String(s.sym).toUpperCase().trim().replace(/-EQ$|-BE$|-BL$|-BZ$/, '');
     const price = nseMap.get(key);
-
-    if (price == null) {
-      missingSyms.push(s.sym);
-      continue;
-    }
-
+    if (price == null) { missingSyms.push(s.sym); continue; }
     matched.push({ token: String(s.token), sym: s.sym, price });
   }
 
-  return {
-    matched,
-    unmatchedSyms: missingSyms,
-    nseTotal: items.length
-  };
+  return { matched, unmatchedSyms: missingSyms, nseTotal: items.length };
 }
 
 
@@ -513,7 +538,8 @@ function broadcastBS(fetchedAt) {
       buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
       volume: v.volume, rank: v.rank,
       preopenPrice: v.preopenPrice ?? null,
-      dayOpen: v.dayOpen ?? null
+      dayOpen: v.dayOpen ?? null,
+      rsi: v.rsi ?? null
     }]))
   })}\n\n`;
   for (const c of sseClients) {
@@ -1271,6 +1297,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       rank: bs?.rank ?? null,
       preopenPrice: bs?.preopenPrice ?? null,
       dayOpen: bs?.dayOpen ?? null,
+      rsi: bs?.rsi ?? null,
       highQuote: quote?.high ?? null,
       lowQuote: quote?.low ?? null,
       quoteFetchedAt: quote?.fetchedAt ?? null,
@@ -1526,7 +1553,7 @@ function scheduleQuoteAutoFetch() {
 
 
 /* ============================================================
-   SECTION 14.2 — BS FETCH (9:15:30 + 30s interval during market)
+   SECTION 14.2 — BS FETCH (9:15:00 + 30s interval during market)
    ============================================================ */
 let bsIntervalTimer = null;
 
@@ -1564,6 +1591,17 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
         bsCache.set(String(r.token), existing);
       } else {
         const existing = bsCache.get(String(r.token)) || {};
+
+        /* Compute RSI on first BS tick of the day */
+        let rsi = existing.rsi ?? null;
+        if (rsi == null && Number.isFinite(r.ltp)) {
+          const prev = prevClosesCache.get(String(r.token));
+          if (prev && prev.length >= 13) {
+            const last13 = prev.slice(-13).map(x => x.close);
+            rsi = computeRSI(last13, r.ltp);
+          }
+        }
+
         bsCache.set(String(r.token), {
           buyQty: r.buyQty,
           sellQty: r.sellQty,
@@ -1572,12 +1610,13 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
           dayOpen: r.dayOpen ?? existing.dayOpen ?? null,
           rank: existing.rank ?? null,
           preopenPrice: existing.preopenPrice ?? null,
-          preopenAt: existing.preopenAt ?? null
+          preopenAt: existing.preopenAt ?? null,
+          rsi
         });
         try {
           await db.query(
-            `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, day_open, fetched_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, day_open, rsi, fetched_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
              ON CONFLICT (date, token, strategy_id) DO UPDATE SET
                sym=EXCLUDED.sym,
                buy_qty=EXCLUDED.buy_qty,
@@ -1585,8 +1624,9 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
                ltp=EXCLUDED.ltp,
                volume=EXCLUDED.volume,
                day_open=COALESCE(EXCLUDED.day_open, strategy_bs_snapshot.day_open),
+               rsi=COALESCE(EXCLUDED.rsi, strategy_bs_snapshot.rsi),
                fetched_at=EXCLUDED.fetched_at`,
-            [p.date, SYM_BY_TOKEN[r.token] || '?', r.token, 'momentum', r.buyQty, r.sellQty, r.ltp, r.volume, r.dayOpen ?? null, fetchedAt]
+            [p.date, SYM_BY_TOKEN[r.token] || '?', r.token, 'momentum', r.buyQty, r.sellQty, r.ltp, r.volume, r.dayOpen ?? null, rsi, fetchedAt]
           );
         } catch (e) { dbErrors.push(`${r.token}: ${e.message}`); }
       }
@@ -1683,7 +1723,8 @@ app.post('/api/admin/fetch-preopen', auth, adminOnly, async (req, res) => {
         rank: existing.rank ?? null,
         preopenPrice: m.price,
         preopenAt: fetchedAt,
-        dayOpen: existing.dayOpen ?? null
+        dayOpen: existing.dayOpen ?? null,
+        rsi: existing.rsi ?? null
       });
 
       if (p.date) {
@@ -1722,7 +1763,67 @@ app.post('/api/admin/fetch-preopen', auth, adminOnly, async (req, res) => {
   }
 });
 
-/* ---- 30s BS interval (9:15:30 → 15:30) ---- */
+/* ---- EOD 3:35 PM — fetch & save prev-day 20 one-min closes ---- */
+async function fetchPrevDayClosesEOD() {
+  try {
+    if (!isTradingDay(getIST())) { console.log('📈 EOD closes: non-trading day, skip'); return; }
+    const today = getIST().toISOString().split('T')[0];
+    const allTokens = STOCKS.map(s => String(s.token));
+    console.log(`📈 EOD: fetching 20 one-min closes for ${allTokens.length} stocks (${today})...`);
+    const t0 = Date.now();
+
+    const data = await getPrevDayLastClosesBatch(allTokens, today, 20);
+    let saved = 0;
+
+    for (const [token, candles] of data) {
+      const closes = candles.map(c => c.close);
+      const ts = candles.map(c => c.ts);
+      try {
+        await db.query(
+          `UPDATE strategy_bs_snapshot SET min_1_close=$1, min_1_ts=$2
+           WHERE date=$3 AND token=$4 AND strategy_id='momentum'`,
+          [closes, ts, today, token]
+        );
+        saved++;
+      } catch {}
+    }
+    console.log(`✅ EOD closes saved: ${saved}/${allTokens.length} in ${Math.round((Date.now() - t0) / 1000)}s`);
+  } catch (e) { console.error('EOD closes failed:', e.message); }
+}
+
+function msUntilEOD() {
+  const ist = getIST();
+  const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
+  const target = 15 * 3600 + 35 * 60;
+  let diff = target - secs;
+  if (diff <= 0) diff += 86400;
+  for (let i = 0; i < 15; i++) {
+    const candidate = new Date(ist.getTime() + diff * 1000);
+    if (isTradingDay(candidate)) break;
+    diff += 86400;
+  }
+  return diff * 1000;
+}
+
+function scheduleEODFetch() {
+  const ms = msUntilEOD();
+  console.log(`⏰ Next EOD closes fetch in ${Math.round(ms / 60000)} min`);
+  setTimeout(async () => {
+    await fetchPrevDayClosesEOD();
+    scheduleEODFetch();
+  }, ms);
+}
+
+app.post('/api/admin/force-eod-closes', auth, adminOnly, async (req, res) => {
+  try {
+    await fetchPrevDayClosesEOD();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---- 30s BS interval (9:15:00 → 15:30) ---- */
 function startBSInterval() {
   if (bsIntervalTimer) return;
   bsIntervalTimer = setInterval(async () => {
@@ -1745,10 +1846,10 @@ function startBSInterval() {
   console.log('💹 BS 30s interval started');
 }
 
-function msUntilNext91530IST() {
+function msUntilNext915IST() {
   const ist = getIST();
   const daySecs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
-  const target = 9 * 3600 + 15 * 60 + 30;
+  const target = 9 * 3600 + 15 * 60;
   let diffSecs = target - daySecs;
   if (diffSecs <= 0) diffSecs += 86400;
   for (let i = 0; i < 15; i++) {
@@ -1760,7 +1861,7 @@ function msUntilNext91530IST() {
 }
 
 function scheduleBSAutoFetch() {
-  const ms = msUntilNext91530IST();
+  const ms = msUntilNext915IST();
   console.log(`⏰ Next auto-BS fetch in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
     await autoFetchBS();
@@ -1803,12 +1904,13 @@ async function loadScreenerCacheFromDB() {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.5`);
+  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.6`);
   console.log(`📊 Strategies: Momentum (default) + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);
   console.log(`🔌 WS window: 09:14:55 – 15:30:00 IST`);
-  console.log(`💹 BS interval: 09:15:30 – 15:30:00 IST (every 30s)`);
+  console.log(`💹 BS interval: 09:15:00 – 15:30:00 IST (every 30s)`);
+  console.log(`🌅 RSI: EOD 15:35 fetch + morning preload`);
 
   try {
     await loginREST();
@@ -1835,6 +1937,7 @@ app.listen(PORT, async () => {
   await loadQuoteCacheFromDB();
   await loadLatestPivotFromDB();
   await loadBSCacheFromDB();
+  await loadPrevClosesFromDB();
 
   const nowIST = getIST();
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
@@ -1864,7 +1967,7 @@ app.listen(PORT, async () => {
     }
   }
 
-  const bsStart = 9 * 3600 + 15 * 60 + 30;
+  const bsStart = 9 * 3600 + 15 * 60;
   const bsEnd   = 15 * 3600 + 30 * 60;
   if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && secs >= bsStart && secs < bsEnd) {
     const pB = getScreenerPhase();
@@ -1889,7 +1992,8 @@ app.listen(PORT, async () => {
   scheduleDailyFetch();
   scheduleQuoteAutoFetch();
   scheduleBSAutoFetch();
+  scheduleEODFetch();
 
   console.log('ℹ️  Ready — Momentum (default) + Advance ORB');
-  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15:30 (then every 30s) | Quote@9:30:10 | HLC@15:16');
+  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15:00 (30s) | Quote@9:30:10 | HLC@15:16 | EOD-RSI@15:35');
 });

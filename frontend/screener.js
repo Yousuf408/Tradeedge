@@ -17,7 +17,6 @@ let SCREENER_PIVOT = {};
 let SCREENER_BS = {};
 let SCREENER_ORB = {};
 let SCREENER_INIT_DONE = false;
-let SCREENER_LTP_TIMER = null;
 let SCREENER_SSE = null;
 let FETCHING = false;
 let QUOTE_FETCHING = false;
@@ -44,7 +43,6 @@ const BATCH_DELAY = 150;
 async function initScreener() {
   if (SCREENER_INIT_DONE) {
     renderScreenerTable();
-    if (!SCREENER_LTP_TIMER) startLTPRefresh();
     startSSE();
     return;
   }
@@ -555,10 +553,7 @@ async function loadCachedData() {
 
     recomputeFilteredStocks();
 
-    if (Object.keys(SCREENER_ALL_CANDLES).length) {
-      await loadLTP();
-      startLTPRefresh();
-    }
+    await loadLTP();
 
     renderScreenerTable();
   } catch (e) { console.error(e); }
@@ -589,7 +584,6 @@ async function startFetch() {
     btn.disabled = false;
     btn.textContent = '⚡ Refresh';
     await loadLTP();
-    startLTPRefresh();
     startSSE();
     return;
   }
@@ -636,7 +630,6 @@ async function startFetch() {
   btn.textContent = '⚡ Refresh';
 
   await loadLTP();
-  startLTPRefresh();
   startSSE();
 }
 
@@ -707,7 +700,6 @@ async function startQuoteFetch() {
   showToast('📊 Quote Done', `${ok} fetched · ${failed} failed · at ${ts} IST`);
 
   await loadLTP();
-  startLTPRefresh();
   startSSE();
 }
 
@@ -792,7 +784,7 @@ function updateProgress(done, total) {
 }
 
 /* ============================================================
-   SECTION 6 — LTP POLL
+   SECTION 6 — LTP POLL (initial only, no 30s timer)
    ============================================================ */
 async function loadLTP() {
   const baseList = SCREENER_ACTIVE_STRATEGY === 'momentum'
@@ -854,11 +846,6 @@ async function loadLTP() {
     updateNiftyHeader();
     renderScreenerTable();
   } catch (e) { console.error('LTP failed:', e); }
-}
-
-function startLTPRefresh() {
-  if (SCREENER_LTP_TIMER) clearInterval(SCREENER_LTP_TIMER);
-  SCREENER_LTP_TIMER = setInterval(() => loadLTP(), 30000);
 }
 
 /* ============================================================

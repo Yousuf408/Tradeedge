@@ -213,11 +213,12 @@ export async function fetchBuySellForTokens(tokens) {
           const volume  = Number.isFinite(+q.tradeVolume) ? +q.tradeVolume : null;
           const ltq     = Number.isFinite(+q.lastTradeQty) ? +q.lastTradeQty : null;
           const atp     = Number.isFinite(+q.avgPrice)    ? +q.avgPrice    : null;
+          const dayOpen = Number.isFinite(+q.open)        ? +q.open        : null;
 
           /* Skip if BOTH buy and sell missing (Angel sometimes omits) */
           if (buyQty === null && sellQty === null) continue;
 
-          out.push({ token, buyQty, sellQty, ltp, volume, ltq, atp });
+          out.push({ token, buyQty, sellQty, ltp, volume, ltq, atp, dayOpen });
         }
       }
     } catch (e) {

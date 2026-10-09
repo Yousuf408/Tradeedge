@@ -1,14 +1,14 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v2.8
+   server.js — TradeAlgo Pro backend  |  v3.0
    ============================================================
 
    - REST historical → open/high/low/close
    - FULL Quote (9:30:10 auto) → q15_* columns
    - 15:16 daily fetch → day_high/low/close + pivot
-   - 9:15:30 BS fetch → strategy_bs_snapshot table
+   - 9:15:30 BS fetch → strategy_bs_snapshot + rank_no assign
+   - 16:00 EOD volume-only update
    - prevClose loaded from previous day's day_close
    - WS starts at 09:14:55 IST, stops at 15:30
-   - LTP cache + SSE broadcast active from 09:14:55 (ORB only in ready)
    ============================================================ */
 
 import express from 'express';
@@ -82,6 +82,11 @@ const NIFTY50_TOKEN = '99926000';
 const ENTRY_CUTOFF_MINS = Number(process.env.ENTRY_CUTOFF_MINS || 885);
 
 const STRATEGIES = {
+  momentum: {
+    id: 'momentum',
+    name: 'Momentum',
+    filters: { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 }
+  },
   advance_orb: {
     id: 'advance_orb',
     name: 'Advance ORB',
@@ -89,7 +94,7 @@ const STRATEGIES = {
   }
 };
 
-const getStrategy = id => STRATEGIES[id] || STRATEGIES.advance_orb;
+const getStrategy = id => STRATEGIES[id] || STRATEGIES.momentum;
 
 function passesStrategy(candle, strategy) {
   if (!Array.isArray(candle) || candle.length < 5) return false;
@@ -141,13 +146,12 @@ function getScreenerPhase() {
   return { phase: 'ready', date: today };
 }
 
-/* WS starts at 09:14:55 IST, stops at 15:30 */
 function shouldStartWS() {
   const ist = getIST();
   if (!isTradingDay(ist)) return false;
   const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
-  const start = 9 * 3600 + 14 * 60 + 55;   // 09:14:55
-  const end   = 15 * 3600 + 30 * 60;       // 15:30:00
+  const start = 9 * 3600 + 14 * 60 + 55;
+  const end   = 15 * 3600 + 30 * 60;
   return secs >= start && secs < end;
 }
 
@@ -203,7 +207,7 @@ const getOrbState = (token, date) => orbState.get(`${token}_${date}`) || {
 
 
 /* ============================================================
-   SECTION 4.1 — PREV CLOSE (from previous day's day_close)
+   SECTION 4.1 — PREV CLOSE
    ============================================================ */
 const prevCloseCache = new Map();
 
@@ -279,7 +283,7 @@ async function loadLatestPivotFromDB() {
 
 
 /* ============================================================
-   SECTION 4.3 — BUY/SELL CACHE
+   SECTION 4.3 — BUY/SELL CACHE (from strategy_bs_snapshot)
    ============================================================ */
 const bsCache = new Map();
 
@@ -289,7 +293,7 @@ async function loadBSCacheFromDB() {
     if (!p.date) return;
     const activeTokens = STOCKS.map(s => String(s.token));
     const { rows } = await db.query(
-      `SELECT token, buy_qty, sell_qty, ltp, volume
+      `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no
        FROM strategy_bs_snapshot
        WHERE date=$1 AND strategy_id=$2 AND token = ANY($3)`,
       [p.date, 'momentum', activeTokens]
@@ -299,7 +303,8 @@ async function loadBSCacheFromDB() {
         buyQty: r.buy_qty != null ? +r.buy_qty : null,
         sellQty: r.sell_qty != null ? +r.sell_qty : null,
         ltp: r.ltp != null ? +r.ltp : null,
-        volume: r.volume != null ? +r.volume : null
+        volume: r.volume != null ? +r.volume : null,
+        rank: r.rank_no != null ? +r.rank_no : null
       });
     }
     console.log(`💹 Loaded buy/sell for ${rows.length} tokens from DB`);
@@ -403,7 +408,7 @@ function broadcastBS(fetchedAt) {
   if (!sseClients.size) return;
   const payload = `data: ${JSON.stringify({
     type: 'bs', fetchedAt,
-    bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => [t, { buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp, volume: v.volume }]))
+    bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => [t, { buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp, volume: v.volume, rank: v.rank }]))
   })}\n\n`;
   for (const c of sseClients) {
     try { c.res.write(payload); } catch { sseClients.delete(c); }
@@ -419,12 +424,11 @@ function handleTick(token, ltp) {
     return;
   }
 
-  /* Always cache + broadcast LTP (works during preopen too) */
   setCachedLTP(token, ltp);
   broadcastLTP(token, ltp);
 
   const p = getScreenerPhase();
-  if (p.phase !== 'ready' || !p.date) return;   // ORB logic only in ready phase
+  if (p.phase !== 'ready' || !p.date) return;
 
   const candleArr = getCachedCandles([token], p.date)[0]?.candle;
   if (!Array.isArray(candleArr) || candleArr.length < 5) return;
@@ -991,7 +995,7 @@ app.get('/api/screener/status', auth, (req, res) => {
 });
 
 app.get('/api/screener/data', auth, (req, res) => {
-  const strategy = getStrategy(req.query.strategy || 'advance_orb');
+  const strategy = getStrategy(req.query.strategy || 'momentum');
   const p = getScreenerPhase();
   if (p.phase === 'closed')  return res.json({ ok: false, phase: 'closed' });
   if (p.phase === 'forming') return res.json({ ok: false, phase: 'forming' });
@@ -1140,7 +1144,7 @@ app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
   }
 });
 
-/* ---- LTP + ORB + quote + pivot + BS ---- */
+/* ---- LTP + ORB + quote + pivot + BS + rank ---- */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1161,6 +1165,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       buyQty: bs?.buyQty ?? null,
       sellQty: bs?.sellQty ?? null,
       bsVolume: bs?.volume ?? null,
+      rank: bs?.rank ?? null,
       highQuote: quote?.high ?? null,
       lowQuote: quote?.low ?? null,
       quoteFetchedAt: quote?.fetchedAt ?? null,
@@ -1417,6 +1422,7 @@ function scheduleQuoteAutoFetch() {
 
 /* ============================================================
    SECTION 14.2 — AUTO BUY/SELL FETCH @ 09:15:30 IST
+   + Assign daily rank
    ============================================================ */
 async function autoFetchBS() {
   try {
@@ -1439,7 +1445,7 @@ async function autoFetchBS() {
         volume: r.volume
       });
 
-            db.query(
+      db.query(
         `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, fetched_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (date, token, strategy_id) DO UPDATE SET
@@ -1455,8 +1461,57 @@ async function autoFetchBS() {
 
     broadcastBS(fetchedAt);
     console.log(`✅ Auto-BS: ${results.length}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
+
+    /* Assign rank_no once per day */
+    await assignDailyRank(p.date);
   } catch (e) {
     console.error('Auto-BS failed:', e.message);
+  }
+}
+
+/* ---- Assign rank_no (change% desc) — only if not already assigned ---- */
+async function assignDailyRank(date) {
+  try {
+    const { rows: chk } = await db.query(
+      `SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id=$2 AND rank_no IS NOT NULL`,
+      [date, 'momentum']
+    );
+    if (+chk[0].cnt > 0) {
+      console.log(`#️⃣ Rank already assigned for ${date} (${chk[0].cnt} tokens) — skipped`);
+      return;
+    }
+
+    const rows = STOCKS.map(s => {
+      const token = String(s.token);
+      const ltp = getCachedLTP(token);
+      const prevClose = prevCloseCache.get(token) || null;
+      const changePct = (ltp && prevClose && prevClose > 0)
+        ? ((ltp - prevClose) / prevClose) * 100
+        : -Infinity;
+      return { token, changePct };
+    }).sort((a, b) => b.changePct - a.changePct);
+
+    let assigned = 0;
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const rank = i + 1;
+      db.query(
+        `UPDATE strategy_bs_snapshot SET rank_no=$1
+         WHERE date=$2 AND token=$3 AND strategy_id=$4`,
+        [rank, date, r.token, 'momentum']
+      ).catch(() => {});
+
+      /* Also update in-memory cache */
+      const cached = bsCache.get(r.token) || {};
+      cached.rank = rank;
+      bsCache.set(r.token, cached);
+
+      assigned++;
+    }
+    console.log(`#️⃣ Assigned rank 1..${assigned} for ${date}`);
+  } catch (e) {
+    console.error('Rank assign failed:', e.message);
   }
 }
 
@@ -1497,6 +1552,77 @@ function scheduleBSAutoFetch() {
 
 
 /* ============================================================
+   SECTION 14.3 — EOD VOLUME UPDATE @ 16:00 IST
+   Updates only volume — preserves 9:15:30 buy/sell/rank
+   ============================================================ */
+async function fetchEODVolume() {
+  try {
+    const p = getScreenerPhase();
+    if (!p.date) return;
+    const tokens = STOCKS.map(s => String(s.token));
+    console.log(`🔔 Fetching EOD volume for ${tokens.length} stocks...`);
+
+    const quotes = await fetchBuySellForTokens(tokens);
+    let saved = 0;
+
+    for (const q of quotes) {
+      if (!q || !q.token) continue;
+      if (!Number.isFinite(q.volume) || q.volume <= 0) continue;
+
+      db.query(
+        `UPDATE strategy_bs_snapshot
+         SET volume=$1, fetched_at=NOW()
+         WHERE date=$2 AND token=$3 AND strategy_id=$4`,
+        [q.volume, p.date, q.token, 'momentum']
+      ).catch(() => {});
+
+      /* Update in-memory cache too */
+      const cached = bsCache.get(String(q.token)) || {};
+      cached.volume = q.volume;
+      bsCache.set(String(q.token), cached);
+
+      saved++;
+    }
+    console.log(`✅ EOD volume: ${saved}/${tokens.length} updated`);
+  } catch (e) { console.error('EOD volume failed:', e.message); }
+}
+
+app.post('/api/admin/force-eod-volume', auth, adminOnly, async (req, res) => {
+  try {
+    await fetchEODVolume();
+    const p = getScreenerPhase();
+    const { rows } = await db.query(
+      `SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id=$2 AND volume IS NOT NULL`,
+      [p.date, 'momentum']
+    );
+    res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+function msUntilNext1600IST() {
+  const ist = getIST();
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  const target = new Date(ist);
+  target.setUTCHours(0, 0, 0, 0);
+  target.setUTCMinutes(960);   // 16:00 IST
+  if (mins >= 960) target.setUTCDate(target.getUTCDate() + 1);
+  const dow = target.getUTCDay();
+  if (dow === 6) target.setUTCDate(target.getUTCDate() + 2);
+  if (dow === 0) target.setUTCDate(target.getUTCDate() + 1);
+  return target.getTime() - ist.getTime();
+}
+
+function scheduleEODVolumeFetch() {
+  const ms = msUntilNext1600IST();
+  console.log(`⏰ Next EOD volume fetch in ${Math.round(ms / 60000)} min`);
+  setTimeout(async () => { await fetchEODVolume(); scheduleEODVolumeFetch(); }, ms);
+}
+
+
+/* ============================================================
    SECTION 15 — DB CACHE LOADER
    ============================================================ */
 async function loadScreenerCacheFromDB() {
@@ -1530,7 +1656,7 @@ async function loadScreenerCacheFromDB() {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server on port ${PORT} (REST + Quote + BS)`);
-  console.log(`📊 Strategy: ${STRATEGIES.advance_orb.name}`);
+  console.log(`📊 Strategies: Momentum (default) + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);
   console.log(`🔌 WS window: 09:14:55 – 15:30:00 IST`);
@@ -1568,6 +1694,11 @@ app.listen(PORT, async () => {
   if (dow >= 1 && dow <= 5 && mins >= 916 && mins <= 940) {
     console.log('🔔 Late startup — fetching day H/L/C');
     fetchDayHLC();
+  }
+
+  if (dow >= 1 && dow <= 5 && mins >= 960 && mins <= 990) {
+    console.log('🔔 Late startup — fetching EOD volume');
+    fetchEODVolume();
   }
 
   if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 570 && mins <= 585) {
@@ -1609,6 +1740,8 @@ app.listen(PORT, async () => {
   scheduleDailyFetch();
   scheduleQuoteAutoFetch();
   scheduleBSAutoFetch();
+  scheduleEODVolumeFetch();
 
-  console.log('ℹ️  Ready — REST + Quote + BS + WS + SSE + auto-quote @ 9:30:10 + day H/L @ 15:16 + BS @ 9:15:30 + WS @ 9:14:55');
+  console.log('ℹ️  Ready — Momentum (default) + Advance ORB + REST + Quote + BS + WS + SSE');
+  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15:30 | Quote@9:30:10 | HLC@15:16 | EOD-vol@16:00');
 });

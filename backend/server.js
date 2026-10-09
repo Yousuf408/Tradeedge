@@ -321,45 +321,55 @@ const NSE_PREOPEN_API  = NSE_BASE + '/api/market-data-pre-open?key=ALL';
 const NSE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 async function fetchPreopenRaw() {
-  const homeRes = await fetch(NSE_PREOPEN_PAGE, {
-    headers: {
-      'User-Agent': NSE_UA,
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9'
-    }
-  });
+async function fetchPreopenRaw() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
 
-  let cookieStr = '';
   try {
-    const setCookies = homeRes.headers.getSetCookie ? homeRes.headers.getSetCookie() : [];
-    if (setCookies.length) {
-      cookieStr = setCookies.map(c => c.split(';')[0]).join('; ');
-    } else {
-      const raw = homeRes.headers.get('set-cookie') || '';
-      cookieStr = raw.split(/,(?=[^;]+=[^;]+)/).map(c => c.split(';')[0]).join('; ');
-    }
-  } catch {}
+    const homeRes = await fetch(NSE_PREOPEN_PAGE, {
+      headers: {
+        'User-Agent': NSE_UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9'
+      },
+      signal: controller.signal
+    });
 
-  const apiRes = await fetch(NSE_PREOPEN_API, {
-    headers: {
-      'User-Agent': NSE_UA,
-      'Accept': 'application/json, text/plain, */*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Referer': NSE_PREOPEN_PAGE,
-      'X-Requested-With': 'XMLHttpRequest',
-      'Cookie': cookieStr
-    }
-  });
+    let cookieStr = '';
+    try {
+      const setCookies = homeRes.headers.getSetCookie ? homeRes.headers.getSetCookie() : [];
+      if (setCookies.length) {
+        cookieStr = setCookies.map(c => c.split(';')[0]).join('; ');
+      } else {
+        const raw = homeRes.headers.get('set-cookie') || '';
+        cookieStr = raw.split(/,(?=[^;]+=[^;]+)/).map(c => c.split(';')[0]).join('; ');
+      }
+    } catch {}
 
-  if (!apiRes.ok) throw new Error(`NSE API HTTP ${apiRes.status}`);
-  return await apiRes.json();
+    const apiRes = await fetch(NSE_PREOPEN_API, {
+      headers: {
+        'User-Agent': NSE_UA,
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': NSE_PREOPEN_PAGE,
+        'X-Requested-With': 'XMLHttpRequest',
+        'Cookie': cookieStr
+      },
+      signal: controller.signal
+    });
+
+    if (!apiRes.ok) throw new Error(`NSE API HTTP ${apiRes.status}`);
+    return await apiRes.json();
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function parsePreopen(json) {
-  const matched = [];
-  const unmatchedSyms = [];
   const items = (json && json.data) || [];
 
+  // Step 1: build NSE map — { "AAVAS": 1188.30, "COLPAL": 1842.80, ... }
+  const nseMap = new Map();
   for (const item of items) {
     const meta = item.metadata || {};
     const detail = (item.detail && item.detail.preOpenMarket) || {};
@@ -376,17 +386,30 @@ function parsePreopen(json) {
     if (!Number.isFinite(price) || price <= 0) continue;
 
     const key = nseSym.replace(/-EQ$|-BE$|-BL$|-BZ$/, '');
-    const token = TOKEN_BY_SYM[key];
+    nseMap.set(key, +price);
+  }
 
-    if (!token) {
-      unmatchedSyms.push(nseSym);
+  // Step 2: iterate OUR stocks → lookup in NSE map
+  const matched = [];
+  const missingSyms = [];
+
+  for (const s of STOCKS) {
+    const key = String(s.sym).toUpperCase().trim().replace(/-EQ$|-BE$|-BL$|-BZ$/, '');
+    const price = nseMap.get(key);
+
+    if (price == null) {
+      missingSyms.push(s.sym);
       continue;
     }
 
-    matched.push({ token, sym: nseSym, price: +price });
+    matched.push({ token: String(s.token), sym: s.sym, price });
   }
 
-  return { matched, unmatchedSyms, nseTotal: items.length };
+  return {
+    matched,
+    unmatchedSyms: missingSyms,   // ← ab sirf OUR missing stocks
+    nseTotal: items.length
+  };
 }
 
 

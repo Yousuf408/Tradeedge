@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v3.3
+   server.js — TradeAlgo Pro backend  |  v3.4
    ============================================================
 
    - REST historical → open/high/low/close
@@ -9,11 +9,13 @@
    - prevClose loaded from previous day's day_close
    - WS starts at 09:14:55 IST, stops at 15:30
    - LTP live via WS→SSE; BS via REST→SSE every 30s
+   - NSE Pre-Open manual fetch → strategy_bs_snapshot.preopen_price
 
-   v3.3 CHANGES:
-   - getScreenerPhase() now returns `date` in forming/closed phases
-     (fixes BS/Quote/HLC skip during 9:15–9:30 IST and after-hours)
-   - fetchDayHLC()/autoFetchBS() log DB errors + Angel result counts
+   v3.4 CHANGES:
+   - Added NSE pre-open manual fetch (/api/admin/fetch-preopen)
+   - preopen_price + preopen_at columns in strategy_bs_snapshot
+   - preopenPrice field in /api/screener/ltp
+   - SSE broadcast type:'preopen'
    ============================================================ */
 
 import express from 'express';
@@ -83,6 +85,13 @@ console.log(`📋 Stocks: ${STOCKS.length} active / ${ALL_STOCKS.length} total`)
 const SYM_BY_TOKEN = {};
 STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
 
+/* NSE symbol → Angel token map (for pre-open matching) */
+const TOKEN_BY_SYM = {};
+STOCKS.forEach(s => {
+  const key = String(s.sym).toUpperCase().trim().replace(/-EQ$|-BE$|-BL$|-BZ$/, '');
+  TOKEN_BY_SYM[key] = String(s.token);
+});
+
 const NIFTY50_TOKEN = '99926000';
 const ENTRY_CUTOFF_MINS = Number(process.env.ENTRY_CUTOFF_MINS || 885);
 
@@ -140,7 +149,6 @@ function getPreviousTradingDay(dateObj) {
   return d.toISOString().split('T')[0];
 }
 
-/* ✅ v3.3 FIX: always return `date` so downstream calls don't skip */
 function getScreenerPhase() {
   const ist = getIST();
   const today = ist.toISOString().split('T')[0];
@@ -289,9 +297,9 @@ async function loadLatestPivotFromDB() {
 
 
 /* ============================================================
-   SECTION 4.3 — BUY/SELL CACHE
+   SECTION 4.3 — BUY/SELL CACHE  (strategy_bs_snapshot)
    ============================================================ */
-const bsCache = new Map();
+const bsCache = new Map();   // token -> { buyQty, sellQty, ltp, volume, rank, preopenPrice, preopenAt }
 
 async function loadBSCacheFromDB() {
   try {
@@ -299,7 +307,7 @@ async function loadBSCacheFromDB() {
     if (!p.date) return;
     const activeTokens = STOCKS.map(s => String(s.token));
     const { rows } = await db.query(
-      `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no
+      `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no, preopen_price, preopen_at
        FROM strategy_bs_snapshot
        WHERE date=$1 AND strategy_id=$2 AND token = ANY($3)`,
       [p.date, 'momentum', activeTokens]
@@ -310,11 +318,105 @@ async function loadBSCacheFromDB() {
         sellQty: r.sell_qty != null ? +r.sell_qty : null,
         ltp: r.ltp != null ? +r.ltp : null,
         volume: r.volume != null ? +r.volume : null,
-        rank: r.rank_no != null ? +r.rank_no : null
+        rank: r.rank_no != null ? +r.rank_no : null,
+        preopenPrice: r.preopen_price != null ? +r.preopen_price : null,
+        preopenAt: r.preopen_at
       });
     }
     console.log(`💹 Loaded buy/sell for ${rows.length} tokens from DB`);
   } catch (e) { console.error('BS cache load failed:', e.message); }
+}
+
+
+/* ============================================================
+   SECTION 4.4 — NSE PRE-OPEN FETCHER
+   ============================================================ */
+const NSE_BASE = 'https://www.nseindia.com';
+const NSE_PREOPEN_PAGE = NSE_BASE + '/market-data/pre-open-market-cm-and-emerge-market';
+const NSE_PREOPEN_API  = NSE_BASE + '/api/market-data-pre-open?key=ALL';
+const NSE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+async function fetchPreopenRaw() {
+  // Step 1: hit pre-open page to get session cookies
+  const homeRes = await fetch(NSE_PREOPEN_PAGE, {
+    headers: {
+      'User-Agent': NSE_UA,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9'
+    }
+  });
+
+  let cookieStr = '';
+  try {
+    const setCookies = homeRes.headers.getSetCookie ? homeRes.headers.getSetCookie() : [];
+    if (setCookies.length) {
+      cookieStr = setCookies.map(c => c.split(';')[0]).join('; ');
+    } else {
+      const raw = homeRes.headers.get('set-cookie') || '';
+      cookieStr = raw.split(/,(?=[^;]+=[^;]+)/).map(c => c.split(';')[0]).join('; ');
+    }
+  } catch {}
+
+  // Step 2: call preopen API with cookies
+  const apiRes = await fetch(NSE_PREOPEN_API, {
+    headers: {
+      'User-Agent': NSE_UA,
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': NSE_PREOPEN_PAGE,
+      'X-Requested-With': 'XMLHttpRequest',
+      'Cookie': cookieStr
+    }
+  });
+
+  if (!apiRes.ok) throw new Error(`NSE API HTTP ${apiRes.status}`);
+  return await apiRes.json();
+}
+
+function parsePreopen(json) {
+  const matched = [];
+  const unmatchedSyms = [];
+  const items = (json && json.data) || [];
+
+  for (const item of items) {
+    const meta = item.metadata || {};
+    const detail = (item.detail && item.detail.preOpenMarket) || {};
+
+    const nseSym = String(meta.symbol || '').toUpperCase().trim();
+    if (!nseSym) continue;
+
+    const price =
+      detail.finalPrice ??
+      meta.lastPrice ??
+      detail.IEP ??
+      null;
+
+    if (!Number.isFinite(price) || price <= 0) continue;
+
+    const key = nseSym.replace(/-EQ$|-BE$|-BL$|-BZ$/, '');
+    const token = TOKEN_BY_SYM[key];
+
+    if (!token) {
+      unmatchedSyms.push(nseSym);
+      continue;
+    }
+
+    matched.push({ token, sym: nseSym, price: +price });
+  }
+
+  return { matched, unmatchedSyms, nseTotal: items.length };
+}
+
+function broadcastPreopen(fetchedAt) {
+  if (!sseClients.size) return;
+  const preopen = {};
+  for (const [token, v] of bsCache.entries()) {
+    if (v.preopenPrice != null) preopen[token] = { price: v.preopenPrice };
+  }
+  const payload = `data: ${JSON.stringify({ type: 'preopen', fetchedAt, preopen })}\n\n`;
+  for (const c of sseClients) {
+    try { c.res.write(payload); } catch { sseClients.delete(c); }
+  }
 }
 
 
@@ -414,7 +516,11 @@ function broadcastBS(fetchedAt) {
   if (!sseClients.size) return;
   const payload = `data: ${JSON.stringify({
     type: 'bs', fetchedAt,
-    bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => [t, { buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp, volume: v.volume, rank: v.rank }]))
+    bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => [t, {
+      buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
+      volume: v.volume, rank: v.rank,
+      preopenPrice: v.preopenPrice ?? null
+    }]))
   })}\n\n`;
   for (const c of sseClients) {
     try { c.res.write(payload); } catch { sseClients.delete(c); }
@@ -1150,7 +1256,7 @@ app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
   }
 });
 
-/* ---- LTP + ORB + quote + pivot + BS + rank ---- */
+/* ---- LTP + ORB + quote + pivot + BS + rank + preopen ---- */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1172,6 +1278,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       sellQty: bs?.sellQty ?? null,
       bsVolume: bs?.volume ?? null,
       rank: bs?.rank ?? null,
+      preopenPrice: bs?.preopenPrice ?? null,
       highQuote: quote?.high ?? null,
       lowQuote: quote?.low ?? null,
       quoteFetchedAt: quote?.fetchedAt ?? null,
@@ -1464,12 +1571,15 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
         existing.volume = r.volume;
         bsCache.set(String(r.token), existing);
       } else {
+        const existing = bsCache.get(String(r.token)) || {};
         bsCache.set(String(r.token), {
           buyQty: r.buyQty,
           sellQty: r.sellQty,
           ltp: r.ltp,
           volume: r.volume,
-          rank: bsCache.get(String(r.token))?.rank ?? null
+          rank: existing.rank ?? null,
+          preopenPrice: existing.preopenPrice ?? null,
+          preopenAt: existing.preopenAt ?? null
         });
         try {
           await db.query(
@@ -1559,6 +1669,68 @@ app.post('/api/admin/force-bs', auth, adminOnly, async (req, res) => {
   }
 });
 
+/* ---- NSE Pre-Open manual fetch ---- */
+app.post('/api/admin/fetch-preopen', auth, adminOnly, async (req, res) => {
+  try {
+    const json = await fetchPreopenRaw();
+    const { matched, unmatchedSyms, nseTotal } = parsePreopen(json);
+
+    const fetchedAt = new Date();
+    const p = getScreenerPhase();
+    const dbErrors = [];
+
+    for (const m of matched) {
+      // Update in-memory cache (bsCache)
+      const existing = bsCache.get(m.token) || {};
+      bsCache.set(m.token, {
+        buyQty: existing.buyQty ?? null,
+        sellQty: existing.sellQty ?? null,
+        ltp: existing.ltp ?? null,
+        volume: existing.volume ?? null,
+        rank: existing.rank ?? null,
+        preopenPrice: m.price,
+        preopenAt: fetchedAt
+      });
+
+      // Update DB row in strategy_bs_snapshot
+      if (p.date) {
+        try {
+          await db.query(
+            `UPDATE strategy_bs_snapshot
+             SET preopen_price=$1, preopen_at=$2
+             WHERE date=$3 AND token=$4 AND strategy_id=$5`,
+            [m.price, fetchedAt, p.date, m.token, 'momentum']
+          );
+        } catch (e) { dbErrors.push(`${m.sym}: ${e.message}`); }
+      }
+    }
+
+    broadcastPreopen(fetchedAt);
+
+    console.log(`🌅 Preopen fetch: NSE=${nseTotal}, matched=${matched.length}, unmatched=${unmatchedSyms.length}`);
+    if (unmatchedSyms.length) {
+      console.log(`🌅 Unmatched (first 20): ${unmatchedSyms.slice(0, 20).join(', ')}`);
+    }
+    if (dbErrors.length) {
+      console.log(`❌ Preopen DB errors (first 5):`, dbErrors.slice(0, 5));
+    }
+
+    res.json({
+      ok: true,
+      date: p.date,
+      nseTotal,
+      matched: matched.length,
+      unmatchedCount: unmatchedSyms.length,
+      unmatchedSample: unmatchedSyms.slice(0, 30),
+      dbErrors: dbErrors.slice(0, 5),
+      fetchedAt
+    });
+  } catch (e) {
+    console.error('Preopen fetch failed:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 /* ---- 30s BS interval (9:15:30 → 15:30) ---- */
 function startBSInterval() {
   if (bsIntervalTimer) return;
@@ -1640,7 +1812,7 @@ async function loadScreenerCacheFromDB() {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.3`);
+  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.4`);
   console.log(`📊 Strategies: Momentum (default) + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);
@@ -1701,7 +1873,6 @@ app.listen(PORT, async () => {
     }
   }
 
-  /* Late startup: BS — if within 9:15:30–15:30 window, start interval immediately */
   const bsStart = 9 * 3600 + 15 * 60 + 30;
   const bsEnd   = 15 * 3600 + 30 * 60;
   if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && secs >= bsStart && secs < bsEnd) {

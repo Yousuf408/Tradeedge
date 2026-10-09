@@ -1,21 +1,5 @@
 /* ============================================================
    server.js — TradeAlgo Pro backend  |  v3.4
-   ============================================================
-
-   - REST historical → open/high/low/close
-   - FULL Quote (9:30:10 auto) → q15_* columns
-   - 15:16 daily fetch → day_high/low/close + pivot
-   - 9:15:30 BS fetch → then every 30s refresh (buy/sell + volume)
-   - prevClose loaded from previous day's day_close
-   - WS starts at 09:14:55 IST, stops at 15:30
-   - LTP live via WS→SSE; BS via REST→SSE every 30s
-   - NSE Pre-Open manual fetch → strategy_bs_snapshot.preopen_price
-
-   v3.4 CHANGES:
-   - Added NSE pre-open manual fetch (/api/admin/fetch-preopen)
-   - preopen_price + preopen_at columns in strategy_bs_snapshot
-   - preopenPrice field in /api/screener/ltp
-   - SSE broadcast type:'preopen'
    ============================================================ */
 
 import express from 'express';
@@ -299,7 +283,7 @@ async function loadLatestPivotFromDB() {
 /* ============================================================
    SECTION 4.3 — BUY/SELL CACHE  (strategy_bs_snapshot)
    ============================================================ */
-const bsCache = new Map();   // token -> { buyQty, sellQty, ltp, volume, rank, preopenPrice, preopenAt }
+const bsCache = new Map();
 
 async function loadBSCacheFromDB() {
   try {
@@ -337,7 +321,6 @@ const NSE_PREOPEN_API  = NSE_BASE + '/api/market-data-pre-open?key=ALL';
 const NSE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 async function fetchPreopenRaw() {
-  // Step 1: hit pre-open page to get session cookies
   const homeRes = await fetch(NSE_PREOPEN_PAGE, {
     headers: {
       'User-Agent': NSE_UA,
@@ -357,7 +340,6 @@ async function fetchPreopenRaw() {
     }
   } catch {}
 
-  // Step 2: call preopen API with cookies
   const apiRes = await fetch(NSE_PREOPEN_API, {
     headers: {
       'User-Agent': NSE_UA,
@@ -405,18 +387,6 @@ function parsePreopen(json) {
   }
 
   return { matched, unmatchedSyms, nseTotal: items.length };
-}
-
-function broadcastPreopen(fetchedAt) {
-  if (!sseClients.size) return;
-  const preopen = {};
-  for (const [token, v] of bsCache.entries()) {
-    if (v.preopenPrice != null) preopen[token] = { price: v.preopenPrice };
-  }
-  const payload = `data: ${JSON.stringify({ type: 'preopen', fetchedAt, preopen })}\n\n`;
-  for (const c of sseClients) {
-    try { c.res.write(payload); } catch { sseClients.delete(c); }
-  }
 }
 
 
@@ -1163,7 +1133,6 @@ app.get('/api/screener/stream', (req, res) => {
   });
 });
 
-/* ---- REST 9:15 candle fetch ---- */
 app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1202,7 +1171,6 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* ---- FULL Quote fetch ---- */
 app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1256,7 +1224,6 @@ app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
   }
 });
 
-/* ---- LTP + ORB + quote + pivot + BS + rank + preopen ---- */
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1680,7 +1647,6 @@ app.post('/api/admin/fetch-preopen', auth, adminOnly, async (req, res) => {
     const dbErrors = [];
 
     for (const m of matched) {
-      // Update in-memory cache (bsCache)
       const existing = bsCache.get(m.token) || {};
       bsCache.set(m.token, {
         buyQty: existing.buyQty ?? null,
@@ -1692,7 +1658,6 @@ app.post('/api/admin/fetch-preopen', auth, adminOnly, async (req, res) => {
         preopenAt: fetchedAt
       });
 
-      // Update DB row in strategy_bs_snapshot
       if (p.date) {
         try {
           await db.query(
@@ -1704,8 +1669,6 @@ app.post('/api/admin/fetch-preopen', auth, adminOnly, async (req, res) => {
         } catch (e) { dbErrors.push(`${m.sym}: ${e.message}`); }
       }
     }
-
-    broadcastPreopen(fetchedAt);
 
     console.log(`🌅 Preopen fetch: NSE=${nseTotal}, matched=${matched.length}, unmatched=${unmatchedSyms.length}`);
     if (unmatchedSyms.length) {

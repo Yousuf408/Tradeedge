@@ -1,16 +1,17 @@
 /* ============================================================
-   ANGEL_REST.js  —  v2.2
+   ANGEL_REST.js  —  v2.3
    ALL Angel One REST logic lives here:
    - Login (auto, platform creds)
    - 1-min candle aggregation (9:15-9:30 window)
    - Rate-limited parallel fetch (150/min, 5 workers)
    - LTP batch (50/call, market hours only)
    - Closing price via 15:30 candle (works 24/7)
+   - Prev-day last N one-min closes (for RSI bootstrap)
    - Cache helpers (memory only — server.js persists to DB)
 
-   CHANGELOG v2.2 (2026-10-05):
-   - 403/429 cooldown reduced 8000ms → 3000ms (configurable)
-   - Everything else unchanged from v2.1
+   CHANGELOG v2.3 (2026-10-09):
+   - Added getPrevDayLastCloses(token, prevDate, count)
+   - Added getPrevDayLastClosesBatch(tokens, prevDate, count)
    ============================================================ */
 
 import crypto from 'crypto';
@@ -484,4 +485,62 @@ export async function getFullQuotesForTokens(tokens) {
   }
 
   return out;
+}
+
+/* ============================================================
+   PREV-DAY LAST N ONE-MIN CLOSES (for RSI bootstrap)
+   Fetch from 15:10–15:30, slice last N candles
+   Returns [{ ts, close }, ...] or null
+   ============================================================ */
+export async function getPrevDayLastCloses(token, prevDate, count = 20) {
+  const key = `PREV_${count}_${token}_${prevDate}`;
+  if (candleCache.has(key)) return candleCache.get(key);
+
+  const ok = await ensureLoggedIn();
+  if (!ok) return null;
+
+  try {
+    const r = await post('/rest/secure/angelbroking/historical/v1/getCandleData', {
+      exchange: 'NSE',
+      symboltoken: String(token),
+      interval: 'ONE_MINUTE',
+      fromdate: `${prevDate} 15:10`,
+      todate: `${prevDate} 15:30`
+    });
+
+    if (!r.status || !r.data?.length) return null;
+
+    const candles = r.data
+      .map(bar => ({ ts: bar[0], close: +bar[4] }))
+      .filter(x => Number.isFinite(x.close) && x.close > 0);
+
+    if (candles.length < count) return null;
+
+    const result = candles.slice(-count);
+    candleCache.set(key, result);
+    return result;
+  } catch (e) {
+    return null;
+  }
+}
+
+export async function getPrevDayLastClosesBatch(tokens, prevDate, count = 20) {
+  const results = new Map();
+  const queue = [...tokens];
+  const concurrency = Math.min(CANDLE_CONCURRENCY, Math.max(queue.length, 1));
+  const t0 = Date.now();
+
+  async function worker() {
+    while (queue.length) {
+      const token = queue.shift();
+      await acquireRateSlot();
+      const data = await getPrevDayLastCloses(token, prevDate, count);
+      if (Array.isArray(data)) results.set(String(token), data);
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, worker));
+
+  console.log(`📈 Prev-day closes: ${results.size}/${tokens.length} in ${Math.round((Date.now() - t0) / 1000)}s`);
+  return results;
 }

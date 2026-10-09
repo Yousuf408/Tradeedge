@@ -1,9 +1,9 @@
 /* ============================================================
-   SCREENER.JS  — v3.0
+   SCREENER.JS  — v3.1
    + Default strategy = Momentum
-   + Fixed # column (rank from server, doesn't shuffle)
+   + Fixed # column (rank from server)
    + Gap % filter for Top Gainers/Losers
-   + Volume column
+   + Volume column (no separate button — same BS fetch)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -28,7 +28,6 @@ let SCREENER_MOMENTUM_FILTER = 'all';
 let SCREENER_SORT_BY = 'change';
 let SCREENER_SORT_DIR = 'desc';
 
-/* ⭐ Default strategy = momentum */
 let SCREENER_ACTIVE_STRATEGY = 'momentum';
 
 const NIFTY50_TOKEN = '99926000';
@@ -81,7 +80,6 @@ function setupControls() {
     <button id="fetchQuoteBtn" class="btn btn-outline" onclick="startQuoteFetch()">📊 Fetch Quote H/L</button>
     <button id="fetchDayHLCBtn" class="btn btn-outline" onclick="startDayHLCFetch()">📅 Fetch Day H/L/C</button>
     <button id="fetchBSBtn" class="btn btn-outline" onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
-    <button id="fetchVolBtn" class="btn btn-outline" onclick="startEODVolumeFetch()">📈 Fetch Volume</button>
     <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">Per-Trade ₹</label>
     <input id="perTradeInput" type="number" value="10000" min="100"
            style="width:110px;padding:7px 12px;border:1.5px solid var(--border-soft);border-radius:8px;
@@ -751,14 +749,14 @@ async function startDayHLCFetch() {
 }
 
 /* ============================================================
-   SECTION 5.3 — MANUAL BUY/SELL
+   SECTION 5.3 — MANUAL BUY/SELL (also fetches volume)
    ============================================================ */
 async function startBSFetch() {
   const btn = document.getElementById('fetchBSBtn');
   if (!btn) return;
   if (btn.disabled) return;
 
-  const ok = confirm('Fetch Buy/Sell snapshot for all stocks now?');
+  const ok = confirm('Fetch Buy/Sell + Volume snapshot for all stocks now?');
   if (!ok) return;
 
   btn.disabled = true;
@@ -774,7 +772,7 @@ async function startBSFetch() {
     if (!r.ok) {
       showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
     } else {
-      showToast('✅ Buy/Sell Saved', `${d.saved}/${d.total} stocks · ${d.date}`);
+      showToast('✅ Buy/Sell + Volume Saved', `${d.saved}/${d.total} stocks · ${d.date}`);
       await loadLTP();
     }
   } catch (e) {
@@ -783,41 +781,6 @@ async function startBSFetch() {
 
   btn.disabled = false;
   btn.textContent = '💹 Fetch Buy/Sell';
-}
-
-/* ============================================================
-   SECTION 5.4 — MANUAL EOD VOLUME
-   ============================================================ */
-async function startEODVolumeFetch() {
-  const btn = document.getElementById('fetchVolBtn');
-  if (!btn) return;
-  if (btn.disabled) return;
-
-  const ok = confirm('Fetch latest volume for all stocks now?');
-  if (!ok) return;
-
-  btn.disabled = true;
-  btn.textContent = '⏳ Fetching volume...';
-
-  try {
-    const r = await fetch(API + '/api/admin/force-eod-volume', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
-    });
-    const d = await r.json();
-
-    if (!r.ok) {
-      showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
-    } else {
-      showToast('✅ Volume Saved', `${d.saved}/${d.total} stocks · ${d.date}`);
-      await loadLTP();
-    }
-  } catch (e) {
-    showToast('⚠️ Error', e.message);
-  }
-
-  btn.disabled = false;
-  btn.textContent = '📈 Fetch Volume';
 }
 
 function updateProgress(done, total) {
@@ -1069,7 +1032,6 @@ function renderScreenerTable() {
         pivotCell = '<span style="color:var(--text-muted)">—</span>';
       }
 
-      /* Fixed rank # from server */
       const rank = bs?.rank ?? '—';
 
       const lastUpdate = formatTimeIST(orb.serverTime);

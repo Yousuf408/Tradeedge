@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v3.4
+   server.js — TradeAlgo Pro backend  |  v3.5
    ============================================================ */
 
 import express from 'express';
@@ -291,7 +291,7 @@ async function loadBSCacheFromDB() {
     if (!p.date) return;
     const activeTokens = STOCKS.map(s => String(s.token));
     const { rows } = await db.query(
-      `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no, preopen_price, preopen_at
+      `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no, preopen_price, preopen_at, day_open
        FROM strategy_bs_snapshot
        WHERE date=$1 AND strategy_id=$2 AND token = ANY($3)`,
       [p.date, 'momentum', activeTokens]
@@ -304,7 +304,8 @@ async function loadBSCacheFromDB() {
         volume: r.volume != null ? +r.volume : null,
         rank: r.rank_no != null ? +r.rank_no : null,
         preopenPrice: r.preopen_price != null ? +r.preopen_price : null,
-        preopenAt: r.preopen_at
+        preopenAt: r.preopen_at,
+        dayOpen: r.day_open != null ? +r.day_open : null
       });
     }
     console.log(`💹 Loaded buy/sell for ${rows.length} tokens from DB`);
@@ -406,7 +407,7 @@ function parsePreopen(json) {
 
   return {
     matched,
-    unmatchedSyms: missingSyms,   // ← ab sirf OUR missing stocks
+    unmatchedSyms: missingSyms,
     nseTotal: items.length
   };
 }
@@ -511,7 +512,8 @@ function broadcastBS(fetchedAt) {
     bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => [t, {
       buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
       volume: v.volume, rank: v.rank,
-      preopenPrice: v.preopenPrice ?? null
+      preopenPrice: v.preopenPrice ?? null,
+      dayOpen: v.dayOpen ?? null
     }]))
   })}\n\n`;
   for (const c of sseClients) {
@@ -1268,6 +1270,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       bsVolume: bs?.volume ?? null,
       rank: bs?.rank ?? null,
       preopenPrice: bs?.preopenPrice ?? null,
+      dayOpen: bs?.dayOpen ?? null,
       highQuote: quote?.high ?? null,
       lowQuote: quote?.low ?? null,
       quoteFetchedAt: quote?.fetchedAt ?? null,
@@ -1566,22 +1569,24 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
           sellQty: r.sellQty,
           ltp: r.ltp,
           volume: r.volume,
+          dayOpen: r.dayOpen ?? existing.dayOpen ?? null,
           rank: existing.rank ?? null,
           preopenPrice: existing.preopenPrice ?? null,
           preopenAt: existing.preopenAt ?? null
         });
         try {
           await db.query(
-            `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, fetched_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, day_open, fetched_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
              ON CONFLICT (date, token, strategy_id) DO UPDATE SET
                sym=EXCLUDED.sym,
                buy_qty=EXCLUDED.buy_qty,
                sell_qty=EXCLUDED.sell_qty,
                ltp=EXCLUDED.ltp,
                volume=EXCLUDED.volume,
+               day_open=COALESCE(EXCLUDED.day_open, strategy_bs_snapshot.day_open),
                fetched_at=EXCLUDED.fetched_at`,
-            [p.date, SYM_BY_TOKEN[r.token] || '?', r.token, 'momentum', r.buyQty, r.sellQty, r.ltp, r.volume, fetchedAt]
+            [p.date, SYM_BY_TOKEN[r.token] || '?', r.token, 'momentum', r.buyQty, r.sellQty, r.ltp, r.volume, r.dayOpen ?? null, fetchedAt]
           );
         } catch (e) { dbErrors.push(`${r.token}: ${e.message}`); }
       }
@@ -1677,7 +1682,8 @@ app.post('/api/admin/fetch-preopen', auth, adminOnly, async (req, res) => {
         volume: existing.volume ?? null,
         rank: existing.rank ?? null,
         preopenPrice: m.price,
-        preopenAt: fetchedAt
+        preopenAt: fetchedAt,
+        dayOpen: existing.dayOpen ?? null
       });
 
       if (p.date) {
@@ -1797,7 +1803,7 @@ async function loadScreenerCacheFromDB() {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.4`);
+  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.5`);
   console.log(`📊 Strategies: Momentum (default) + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);

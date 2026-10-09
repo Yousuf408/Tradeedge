@@ -1,11 +1,12 @@
 /* ============================================================
-   SCREENER.JS  — v3.2
+   SCREENER.JS  — v3.5
    + Default strategy = Momentum
    + Fixed # column (rank from server)
    + Gap % filter for Top Gainers/Losers
-   + Volume column (no separate button — same BS fetch)
+   + Volume column (same BS fetch)
    + 30s REST LTP poll REMOVED — SSE only (WS → LTP, 30s BS → Buy/Sell/Vol)
    + Strategy-specific control buttons
+   + PRE-OPEN column (Momentum) — NSE pre-open final price
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -18,6 +19,7 @@ let SCREENER_QUOTE = {};
 let SCREENER_PIVOT = {};
 let SCREENER_BS = {};
 let SCREENER_ORB = {};
+let SCREENER_PREOPEN = {};         // token -> { price }
 let SCREENER_INIT_DONE = false;
 let SCREENER_SSE = null;
 let FETCHING = false;
@@ -78,7 +80,8 @@ function renderStrategyControls() {
   let strategyButtons = '';
   if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
     strategyButtons = `
-      <button id="fetchBSBtn" class="btn btn-primary" onclick="startBSFetch()">💹 Fetch Buy/Sell</button>`;
+      <button id="fetchBSBtn" class="btn btn-primary" onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
+      <button id="fetchPreopenBtn" class="btn btn-outline" onclick="startPreopenFetch()">📡 Fetch Pre-Open</button>`;
   } else {
     strategyButtons = `
       <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
@@ -546,7 +549,10 @@ async function loadCachedData() {
       headers: { Authorization: 'Bearer ' + getToken() }
     });
     const d = await r.json();
-    if (!d.ok) return;
+    if (!d.ok) {
+      renderScreenerTable();
+      return;
+    }
 
     SCREENER_ALL_CANDLES = {};
     if (d.results) {
@@ -571,9 +577,6 @@ async function loadCachedData() {
     }
 
     recomputeFilteredStocks();
-
-    await loadLTP();
-
     renderScreenerTable();
   } catch (e) { console.error(e); }
 }
@@ -796,6 +799,41 @@ async function startBSFetch() {
   btn.textContent = '💹 Fetch Buy/Sell';
 }
 
+/* ============================================================
+   SECTION 5.4 — MANUAL PRE-OPEN FETCH  [Momentum]
+   ============================================================ */
+async function startPreopenFetch() {
+  const btn = document.getElementById('fetchPreopenBtn');
+  if (!btn) return;
+  if (btn.disabled) return;
+
+  const ok = confirm('Fetch NSE pre-open prices for all stocks now?');
+  if (!ok) return;
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Fetching pre-open...';
+
+  try {
+    const r = await fetch(API + '/api/admin/fetch-preopen', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
+    });
+    const d = await r.json();
+
+    if (!r.ok) {
+      showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
+    } else {
+      showToast('✅ Pre-Open Saved', `${d.matched} matched / ${d.nseTotal} NSE · ${d.unmatchedCount} unmatched`);
+      await loadLTP();
+    }
+  } catch (e) {
+    showToast('⚠️ Error', e.message);
+  }
+
+  btn.disabled = false;
+  btn.textContent = '📡 Fetch Pre-Open';
+}
+
 function updateProgress(done, total) {
   const fill = document.getElementById('progressFill');
   const text = document.getElementById('progressText');
@@ -828,6 +866,7 @@ async function loadLTP() {
         if (item.ltp) SCREENER_LTP[item.token] = item.ltp;
         if (item.prevClose) SCREENER_PREV_CLOSE[item.token] = item.prevClose;
         if (item.pivot) SCREENER_PIVOT[item.token] = item.pivot;
+        if (item.preopenPrice != null) SCREENER_PREOPEN[item.token] = { price: item.preopenPrice };
         if (item.buyQty != null || item.sellQty != null || item.rank != null) {
           const existing = SCREENER_BS[item.token] || {};
           SCREENER_BS[item.token] = {
@@ -904,6 +943,7 @@ function startSSE() {
       else if (msg.type === 'bs' && msg.bs) {
         for (const [token, v] of Object.entries(msg.bs)) {
           SCREENER_BS[token] = { buyQty: v.buyQty, sellQty: v.sellQty, volume: v.volume, rank: v.rank };
+          if (v.preopenPrice != null) SCREENER_PREOPEN[token] = { price: v.preopenPrice };
         }
         renderScreenerTable();
       }
@@ -956,6 +996,7 @@ function renderScreenerTable() {
       <th>Stock / Company</th>
       <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
           <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
+      <th>PRE-OPEN</th>
       <th>Buy / Sell</th>
       <th>Volume</th>
       <th>Pivot</th>
@@ -995,7 +1036,7 @@ function renderScreenerTable() {
     const sorted = sortStocks(filtered);
 
     if (!sorted.length) {
-      body.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:60px;color:var(--text-muted)">
+      body.innerHTML = `<tr><td colspan="12" style="text-align:center;padding:60px;color:var(--text-muted)">
         Loading stocks...<br>Please wait a few seconds.
       </td></tr>`;
       if (count) count.textContent = `0 / ${SCREENER_ALL_STOCKS.length}`;
@@ -1009,6 +1050,7 @@ function renderScreenerTable() {
       const orb = SCREENER_ORB[s.token] || {};
       const pivot = SCREENER_PIVOT[s.token];
       const bs = SCREENER_BS[s.token];
+      const preopen = SCREENER_PREOPEN[s.token];
 
       const sl = c ? c.low : null;
       const high = c ? c.high : null;
@@ -1040,6 +1082,10 @@ function renderScreenerTable() {
         pivotCell = '<span style="color:var(--text-muted)">—</span>';
       }
 
+      const preopenCell = preopen
+        ? `<span style="color:#F5A623;font-weight:700">₹${(+preopen.price).toFixed(2)}</span>`
+        : '<span style="color:var(--text-muted)">—</span>';
+
       const rank = bs?.rank ?? '—';
 
       const lastUpdate = formatTimeIST(orb.serverTime);
@@ -1052,6 +1098,7 @@ function renderScreenerTable() {
           <span class="cell-primary ltp-cell">${ltp ? '₹' + (+ltp).toFixed(2) : '—'}</span>
           <span class="cell-sub change-cell">${changeLine}</span>
         </td>
+        <td style="white-space:nowrap">${preopenCell}</td>
         <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
         <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">${bs?.volume ? formatQty(bs.volume) : '—'}</td>
         <td class="pivot-cell" style="white-space:nowrap">${pivotCell}</td>

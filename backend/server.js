@@ -1,12 +1,12 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v3.0
+   server.js — TradeAlgo Pro backend  |  v3.1
    ============================================================
 
    - REST historical → open/high/low/close
    - FULL Quote (9:30:10 auto) → q15_* columns
    - 15:16 daily fetch → day_high/low/close + pivot
    - 9:15:30 BS fetch → strategy_bs_snapshot + rank_no assign
-   - 16:00 EOD volume-only update
+   - 16:00 EOD volume-only update (reuses autoFetchBS with flag)
    - prevClose loaded from previous day's day_close
    - WS starts at 09:14:55 IST, stops at 15:30
    ============================================================ */
@@ -283,7 +283,7 @@ async function loadLatestPivotFromDB() {
 
 
 /* ============================================================
-   SECTION 4.3 — BUY/SELL CACHE (from strategy_bs_snapshot)
+   SECTION 4.3 — BUY/SELL CACHE
    ============================================================ */
 const bsCache = new Map();
 
@@ -1262,11 +1262,6 @@ async function fetchDayHLC() {
     await flushLtpWrites();
     const totalTime = Math.round((Date.now() - t0) / 1000);
     console.log(`✅ Day H/L/C: ${savedTokens.size}/${allTokens.length} saved in ${totalTime}s`);
-
-    const stillMissing = allTokens.filter(t => !savedTokens.has(t));
-    if (stillMissing.length) {
-      console.log(`⚠️  Still missing (${stillMissing.length}):`, stillMissing.slice(0, 20).join(','));
-    }
   } catch (e) { console.error('Day H/L/C fetch failed:', e.message); }
 }
 
@@ -1275,8 +1270,7 @@ app.post('/api/admin/force-day-hlc', auth, adminOnly, async (req, res) => {
     await fetchDayHLC();
     const p = getScreenerPhase();
     const { rows } = await db.query(
-      `SELECT COUNT(*) AS cnt FROM angel_15m_candle
-       WHERE date=$1 AND day_high IS NOT NULL`,
+      `SELECT COUNT(*) AS cnt FROM angel_15m_candle WHERE date=$1 AND day_high IS NOT NULL`,
       [p.date]
     );
     res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
@@ -1389,11 +1383,6 @@ async function autoFetchQuote() {
 
     broadcastQuote(fetchedAt);
     console.log(`✅ Auto-quote: ${savedTokens.size}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
-
-    const stillMissing = allTokens.filter(t => !savedTokens.has(t));
-    if (stillMissing.length) {
-      console.log(`⚠️  Auto-quote still missing (${stillMissing.length}):`, stillMissing.slice(0, 20).join(','));
-    }
   } catch (e) {
     console.error('Auto-quote failed:', e.message);
   }
@@ -1421,49 +1410,68 @@ function scheduleQuoteAutoFetch() {
 
 
 /* ============================================================
-   SECTION 14.2 — AUTO BUY/SELL FETCH @ 09:15:30 IST
-   + Assign daily rank
+   SECTION 14.2 — BS FETCH (9:15:30 auto + 16:00 volume-only)
+   Single function with `volumeOnly` flag
    ============================================================ */
-async function autoFetchBS() {
+async function autoFetchBS({ volumeOnly = false } = {}) {
   try {
     if (!isTradingDay(getIST())) { console.log('💹 Auto-BS: non-trading day, skip'); return; }
     const p = getScreenerPhase();
     if (!p.date) { console.log('💹 Auto-BS: no trading date, skip'); return; }
 
     const allTokens = STOCKS.map(s => String(s.token));
-    console.log(`💹 Auto-BS: fetching ${allTokens.length} tokens...`);
+    console.log(`💹 Auto-BS (${volumeOnly ? 'volume-only' : 'full'}): fetching ${allTokens.length} tokens...`);
     const t0 = Date.now();
 
     const fetchedAt = new Date();
     const results = await fetchBuySellForTokens(allTokens);
 
     for (const r of results) {
-      bsCache.set(r.token, {
-        buyQty: r.buyQty,
-        sellQty: r.sellQty,
-        ltp: r.ltp,
-        volume: r.volume
-      });
+      if (volumeOnly) {
+        /* 16:00 EOD: only volume, preserve 9:15:30 buy/sell/rank */
+        if (!Number.isFinite(r.volume) || r.volume <= 0) continue;
 
-      db.query(
-        `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, fetched_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         ON CONFLICT (date, token, strategy_id) DO UPDATE SET
-           sym=EXCLUDED.sym,
-           buy_qty=EXCLUDED.buy_qty,
-           sell_qty=EXCLUDED.sell_qty,
-           ltp=EXCLUDED.ltp,
-           volume=EXCLUDED.volume,
-           fetched_at=EXCLUDED.fetched_at`,
-        [p.date, SYM_BY_TOKEN[r.token] || '?', r.token, 'momentum', r.buyQty, r.sellQty, r.ltp, r.volume, fetchedAt]
-      ).catch(() => {});
+        db.query(
+          `UPDATE strategy_bs_snapshot SET volume=$1, fetched_at=NOW()
+           WHERE date=$2 AND token=$3 AND strategy_id=$4`,
+          [r.volume, p.date, r.token, 'momentum']
+        ).catch(() => {});
+
+        /* Update memory */
+        const existing = bsCache.get(String(r.token)) || {};
+        existing.volume = r.volume;
+        bsCache.set(String(r.token), existing);
+      } else {
+        /* 9:15:30: full upsert */
+        bsCache.set(r.token, {
+          buyQty: r.buyQty,
+          sellQty: r.sellQty,
+          ltp: r.ltp,
+          volume: r.volume
+        });
+
+        db.query(
+          `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, fetched_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+           ON CONFLICT (date, token, strategy_id) DO UPDATE SET
+             sym=EXCLUDED.sym,
+             buy_qty=EXCLUDED.buy_qty,
+             sell_qty=EXCLUDED.sell_qty,
+             ltp=EXCLUDED.ltp,
+             volume=EXCLUDED.volume,
+             fetched_at=EXCLUDED.fetched_at`,
+          [p.date, SYM_BY_TOKEN[r.token] || '?', r.token, 'momentum', r.buyQty, r.sellQty, r.ltp, r.volume, fetchedAt]
+        ).catch(() => {});
+      }
     }
 
     broadcastBS(fetchedAt);
-    console.log(`✅ Auto-BS: ${results.length}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
+    console.log(`✅ Auto-BS (${volumeOnly ? 'volume' : 'full'}): ${results.length}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
 
-    /* Assign rank_no once per day */
-    await assignDailyRank(p.date);
+    /* Rank assign — only on full BS */
+    if (!volumeOnly) {
+      await assignDailyRank(p.date);
+    }
   } catch (e) {
     console.error('Auto-BS failed:', e.message);
   }
@@ -1502,7 +1510,6 @@ async function assignDailyRank(date) {
         [rank, date, r.token, 'momentum']
       ).catch(() => {});
 
-      /* Also update in-memory cache */
       const cached = bsCache.get(r.token) || {};
       cached.rank = rank;
       bsCache.set(r.token, cached);
@@ -1553,55 +1560,8 @@ function scheduleBSAutoFetch() {
 
 /* ============================================================
    SECTION 14.3 — EOD VOLUME UPDATE @ 16:00 IST
-   Updates only volume — preserves 9:15:30 buy/sell/rank
+   Reuses autoFetchBS with volumeOnly flag
    ============================================================ */
-async function fetchEODVolume() {
-  try {
-    const p = getScreenerPhase();
-    if (!p.date) return;
-    const tokens = STOCKS.map(s => String(s.token));
-    console.log(`🔔 Fetching EOD volume for ${tokens.length} stocks...`);
-
-    const quotes = await fetchBuySellForTokens(tokens);
-    let saved = 0;
-
-    for (const q of quotes) {
-      if (!q || !q.token) continue;
-      if (!Number.isFinite(q.volume) || q.volume <= 0) continue;
-
-      db.query(
-        `UPDATE strategy_bs_snapshot
-         SET volume=$1, fetched_at=NOW()
-         WHERE date=$2 AND token=$3 AND strategy_id=$4`,
-        [q.volume, p.date, q.token, 'momentum']
-      ).catch(() => {});
-
-      /* Update in-memory cache too */
-      const cached = bsCache.get(String(q.token)) || {};
-      cached.volume = q.volume;
-      bsCache.set(String(q.token), cached);
-
-      saved++;
-    }
-    console.log(`✅ EOD volume: ${saved}/${tokens.length} updated`);
-  } catch (e) { console.error('EOD volume failed:', e.message); }
-}
-
-app.post('/api/admin/force-eod-volume', auth, adminOnly, async (req, res) => {
-  try {
-    await fetchEODVolume();
-    const p = getScreenerPhase();
-    const { rows } = await db.query(
-      `SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id=$2 AND volume IS NOT NULL`,
-      [p.date, 'momentum']
-    );
-    res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 function msUntilNext1600IST() {
   const ist = getIST();
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
@@ -1618,7 +1578,10 @@ function msUntilNext1600IST() {
 function scheduleEODVolumeFetch() {
   const ms = msUntilNext1600IST();
   console.log(`⏰ Next EOD volume fetch in ${Math.round(ms / 60000)} min`);
-  setTimeout(async () => { await fetchEODVolume(); scheduleEODVolumeFetch(); }, ms);
+  setTimeout(async () => {
+    await autoFetchBS({ volumeOnly: true });
+    scheduleEODVolumeFetch();
+  }, ms);
 }
 
 
@@ -1698,7 +1661,7 @@ app.listen(PORT, async () => {
 
   if (dow >= 1 && dow <= 5 && mins >= 960 && mins <= 990) {
     console.log('🔔 Late startup — fetching EOD volume');
-    fetchEODVolume();
+    autoFetchBS({ volumeOnly: true }).catch(e => console.error('EOD vol failed:', e.message));
   }
 
   if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 570 && mins <= 585) {
@@ -1742,6 +1705,6 @@ app.listen(PORT, async () => {
   scheduleBSAutoFetch();
   scheduleEODVolumeFetch();
 
-  console.log('ℹ️  Ready — Momentum (default) + Advance ORB + REST + Quote + BS + WS + SSE');
+  console.log('ℹ️  Ready — Momentum (default) + Advance ORB');
   console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15:30 | Quote@9:30:10 | HLC@15:16 | EOD-vol@16:00');
 });

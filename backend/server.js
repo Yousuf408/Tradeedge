@@ -1,14 +1,14 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v3.1
+   server.js — TradeAlgo Pro backend  |  v3.2
    ============================================================
 
    - REST historical → open/high/low/close
    - FULL Quote (9:30:10 auto) → q15_* columns
    - 15:16 daily fetch → day_high/low/close + pivot
-   - 9:15:30 BS fetch → strategy_bs_snapshot + rank_no assign
-   - 16:00 EOD volume-only update (reuses autoFetchBS with flag)
+   - 9:15:30 BS fetch → then every 30s refresh (buy/sell + volume)
    - prevClose loaded from previous day's day_close
    - WS starts at 09:14:55 IST, stops at 15:30
+   - LTP live via WS→SSE; BS via REST→SSE every 30s
    ============================================================ */
 
 import express from 'express';
@@ -1026,7 +1026,6 @@ app.get('/api/screener/data', auth, (req, res) => {
   });
 });
 
-/* ---- SSE stream ---- */
 app.get('/api/screener/stream', (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(401).end();
@@ -1410,17 +1409,18 @@ function scheduleQuoteAutoFetch() {
 
 
 /* ============================================================
-   SECTION 14.2 — BS FETCH (9:15:30 auto + 16:00 volume-only)
-   Single function with `volumeOnly` flag
+   SECTION 14.2 — BS FETCH (9:15:30 + 30s interval during market)
    ============================================================ */
-async function autoFetchBS({ volumeOnly = false } = {}) {
+let bsIntervalTimer = null;
+
+async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
   try {
-    if (!isTradingDay(getIST())) { console.log('💹 Auto-BS: non-trading day, skip'); return; }
+    if (!isTradingDay(getIST())) { if (!silent) console.log('💹 Auto-BS: non-trading day, skip'); return; }
     const p = getScreenerPhase();
-    if (!p.date) { console.log('💹 Auto-BS: no trading date, skip'); return; }
+    if (!p.date) { if (!silent) console.log('💹 Auto-BS: no trading date, skip'); return; }
 
     const allTokens = STOCKS.map(s => String(s.token));
-    console.log(`💹 Auto-BS (${volumeOnly ? 'volume-only' : 'full'}): fetching ${allTokens.length} tokens...`);
+    if (!silent) console.log(`💹 Auto-BS (${volumeOnly ? 'volume-only' : 'full'}): fetching ${allTokens.length} tokens...`);
     const t0 = Date.now();
 
     const fetchedAt = new Date();
@@ -1428,28 +1428,23 @@ async function autoFetchBS({ volumeOnly = false } = {}) {
 
     for (const r of results) {
       if (volumeOnly) {
-        /* 16:00 EOD: only volume, preserve 9:15:30 buy/sell/rank */
         if (!Number.isFinite(r.volume) || r.volume <= 0) continue;
-
         db.query(
           `UPDATE strategy_bs_snapshot SET volume=$1, fetched_at=NOW()
            WHERE date=$2 AND token=$3 AND strategy_id=$4`,
           [r.volume, p.date, r.token, 'momentum']
         ).catch(() => {});
-
-        /* Update memory */
         const existing = bsCache.get(String(r.token)) || {};
         existing.volume = r.volume;
         bsCache.set(String(r.token), existing);
       } else {
-        /* 9:15:30: full upsert */
         bsCache.set(r.token, {
           buyQty: r.buyQty,
           sellQty: r.sellQty,
           ltp: r.ltp,
-          volume: r.volume
+          volume: r.volume,
+          rank: bsCache.get(String(r.token))?.rank ?? null
         });
-
         db.query(
           `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, fetched_at)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
@@ -1466,9 +1461,8 @@ async function autoFetchBS({ volumeOnly = false } = {}) {
     }
 
     broadcastBS(fetchedAt);
-    console.log(`✅ Auto-BS (${volumeOnly ? 'volume' : 'full'}): ${results.length}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
+    if (!silent) console.log(`✅ Auto-BS (${volumeOnly ? 'volume' : 'full'}): ${results.length}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
 
-    /* Rank assign — only on full BS */
     if (!volumeOnly) {
       await assignDailyRank(p.date);
     }
@@ -1477,7 +1471,6 @@ async function autoFetchBS({ volumeOnly = false } = {}) {
   }
 }
 
-/* ---- Assign rank_no (change% desc) — only if not already assigned ---- */
 async function assignDailyRank(date) {
   try {
     const { rows: chk } = await db.query(
@@ -1513,7 +1506,6 @@ async function assignDailyRank(date) {
       const cached = bsCache.get(r.token) || {};
       cached.rank = rank;
       bsCache.set(r.token, cached);
-
       assigned++;
     }
     console.log(`#️⃣ Assigned rank 1..${assigned} for ${date}`);
@@ -1537,6 +1529,29 @@ app.post('/api/admin/force-bs', auth, adminOnly, async (req, res) => {
   }
 });
 
+/* ---- 30s BS interval (9:15:30 → 15:30) ---- */
+function startBSInterval() {
+  if (bsIntervalTimer) return;
+  bsIntervalTimer = setInterval(async () => {
+    const ist = getIST();
+    if (!isTradingDay(ist)) return;
+    const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
+    const end = 15 * 3600 + 30 * 60;
+    if (secs >= end) {
+      clearInterval(bsIntervalTimer);
+      bsIntervalTimer = null;
+      console.log('💹 BS 30s interval stopped (end of day)');
+      return;
+    }
+    try {
+      await autoFetchBS({ silent: true });
+    } catch (e) {
+      console.error('BS interval error:', e.message);
+    }
+  }, 30000);
+  console.log('💹 BS 30s interval started');
+}
+
 function msUntilNext91530IST() {
   const ist = getIST();
   const daySecs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
@@ -1554,33 +1569,10 @@ function msUntilNext91530IST() {
 function scheduleBSAutoFetch() {
   const ms = msUntilNext91530IST();
   console.log(`⏰ Next auto-BS fetch in ${Math.round(ms / 60000)} min`);
-  setTimeout(async () => { await autoFetchBS(); scheduleBSAutoFetch(); }, ms);
-}
-
-
-/* ============================================================
-   SECTION 14.3 — EOD VOLUME UPDATE @ 16:00 IST
-   Reuses autoFetchBS with volumeOnly flag
-   ============================================================ */
-function msUntilNext1600IST() {
-  const ist = getIST();
-  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  const target = new Date(ist);
-  target.setUTCHours(0, 0, 0, 0);
-  target.setUTCMinutes(960);   // 16:00 IST
-  if (mins >= 960) target.setUTCDate(target.getUTCDate() + 1);
-  const dow = target.getUTCDay();
-  if (dow === 6) target.setUTCDate(target.getUTCDate() + 2);
-  if (dow === 0) target.setUTCDate(target.getUTCDate() + 1);
-  return target.getTime() - ist.getTime();
-}
-
-function scheduleEODVolumeFetch() {
-  const ms = msUntilNext1600IST();
-  console.log(`⏰ Next EOD volume fetch in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
-    await autoFetchBS({ volumeOnly: true });
-    scheduleEODVolumeFetch();
+    await autoFetchBS();
+    startBSInterval();
+    scheduleBSAutoFetch();
   }, ms);
 }
 
@@ -1623,6 +1615,7 @@ app.listen(PORT, async () => {
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);
   console.log(`🔌 WS window: 09:14:55 – 15:30:00 IST`);
+  console.log(`💹 BS interval: 09:15:30 – 15:30:00 IST (every 30s)`);
 
   try {
     await loginREST();
@@ -1652,16 +1645,12 @@ app.listen(PORT, async () => {
 
   const nowIST = getIST();
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
+  const secs = nowIST.getUTCHours() * 3600 + nowIST.getUTCMinutes() * 60 + nowIST.getUTCSeconds();
   const dow = nowIST.getUTCDay();
 
   if (dow >= 1 && dow <= 5 && mins >= 916 && mins <= 940) {
     console.log('🔔 Late startup — fetching day H/L/C');
     fetchDayHLC();
-  }
-
-  if (dow >= 1 && dow <= 5 && mins >= 960 && mins <= 990) {
-    console.log('🔔 Late startup — fetching EOD volume');
-    autoFetchBS({ volumeOnly: true }).catch(e => console.error('EOD vol failed:', e.message));
   }
 
   if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 570 && mins <= 585) {
@@ -1682,7 +1671,10 @@ app.listen(PORT, async () => {
     }
   }
 
-  if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 555 && mins <= 585) {
+  /* Late startup: BS — if within 9:15:30–15:30 window, start interval immediately */
+  const bsStart = 9 * 3600 + 15 * 60 + 30;
+  const bsEnd   = 15 * 3600 + 30 * 60;
+  if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && secs >= bsStart && secs < bsEnd) {
     const pB = getScreenerPhase();
     if (pB.date) {
       try {
@@ -1692,19 +1684,20 @@ app.listen(PORT, async () => {
         );
         if (+rows[0].cnt === 0) {
           console.log('🔔 Late startup — running auto-BS catch-up');
-          autoFetchBS().catch(e => console.error('BS catch-up failed:', e.message));
+          await autoFetchBS();
         } else {
           console.log(`✅ Today's BS already fetched (${rows[0].cnt} tokens)`);
         }
       } catch (e) { console.error('BS catch-up check failed:', e.message); }
     }
+    console.log('🔔 Late startup — starting BS 30s interval');
+    startBSInterval();
   }
 
   scheduleDailyFetch();
   scheduleQuoteAutoFetch();
   scheduleBSAutoFetch();
-  scheduleEODVolumeFetch();
 
   console.log('ℹ️  Ready — Momentum (default) + Advance ORB');
-  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15:30 | Quote@9:30:10 | HLC@15:16 | EOD-vol@16:00');
+  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15:30 (then every 30s) | Quote@9:30:10 | HLC@15:16');
 });

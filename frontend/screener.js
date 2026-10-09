@@ -1,9 +1,9 @@
 /* ============================================================
-   SCREENER.JS  — v2.9
-   + Gap % filter for Top Gainers / Top Losers
-   + Momentum uses all 387 stocks
-   + LTP loaded before first render
-   + Buy/Sell column + Pivot + 20 EMA placeholder
+   SCREENER.JS  — v3.0
+   + Default strategy = Momentum
+   + Fixed # column (rank from server, doesn't shuffle)
+   + Gap % filter for Top Gainers/Losers
+   + Volume column
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -27,10 +27,12 @@ let SCREENER_STAGE_FILTER = 'all';
 let SCREENER_MOMENTUM_FILTER = 'all';
 let SCREENER_SORT_BY = 'change';
 let SCREENER_SORT_DIR = 'desc';
-let SCREENER_ACTIVE_STRATEGY = 'advance_orb';
+
+/* ⭐ Default strategy = momentum */
+let SCREENER_ACTIVE_STRATEGY = 'momentum';
 
 const NIFTY50_TOKEN = '99926000';
-const CURRENT_STRATEGY = 'advance_orb';
+const CURRENT_STRATEGY = 'momentum';
 const STRATEGY_FILTER = { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 };
 
 let PER_TRADE = 10000;
@@ -72,13 +74,14 @@ function setupControls() {
             style="padding:7px 14px;border:1.5px solid var(--border-soft);border-radius:8px;
                    font-size:13px;font-weight:600;font-family:inherit;
                    background:var(--bg-secondary);color:var(--text-primary);cursor:pointer">
-      <option value="advance_orb">🔍 Advance ORB</option>
       <option value="momentum">🚀 Momentum</option>
+      <option value="advance_orb">🔍 Advance ORB</option>
     </select>
     <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
     <button id="fetchQuoteBtn" class="btn btn-outline" onclick="startQuoteFetch()">📊 Fetch Quote H/L</button>
     <button id="fetchDayHLCBtn" class="btn btn-outline" onclick="startDayHLCFetch()">📅 Fetch Day H/L/C</button>
     <button id="fetchBSBtn" class="btn btn-outline" onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
+    <button id="fetchVolBtn" class="btn btn-outline" onclick="startEODVolumeFetch()">📈 Fetch Volume</button>
     <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">Per-Trade ₹</label>
     <input id="perTradeInput" type="number" value="10000" min="100"
            style="width:110px;padding:7px 12px;border:1.5px solid var(--border-soft);border-radius:8px;
@@ -274,7 +277,6 @@ function computeChangePct(token) {
   return ((ltp - prevClose) / prevClose) * 100;
 }
 
-/* Gap % = (today open − prev close) / prev close × 100 */
 function computeGapPct(token) {
   const c = SCREENER_ALL_CANDLES[token];
   const prev = SCREENER_PREV_CLOSE[token];
@@ -555,7 +557,6 @@ async function loadCachedData() {
 
     recomputeFilteredStocks();
 
-    /* Load LTP FIRST so change% is ready before first render */
     if (Object.keys(SCREENER_ALL_CANDLES).length) {
       await loadLTP();
       startLTPRefresh();
@@ -720,12 +721,7 @@ async function startDayHLCFetch() {
   if (!btn) return;
   if (DAYHLC_FETCHING) return;
 
-  const ok = confirm(
-    'Fetch day High/Low/Close + Pivot for all stocks now?\n\n' +
-    '• Server will call Quote API for all 387 stocks\n' +
-    '• Takes ~5–8 seconds\n\n' +
-    'Continue?'
-  );
+  const ok = confirm('Fetch day High/Low/Close + Pivot for all stocks now?');
   if (!ok) return;
 
   DAYHLC_FETCHING = true;
@@ -762,12 +758,7 @@ async function startBSFetch() {
   if (!btn) return;
   if (btn.disabled) return;
 
-  const ok = confirm(
-    'Fetch Buy/Sell snapshot for all stocks now?\n\n' +
-    '• Server will call Quote API for all 387 stocks\n' +
-    '• Takes ~5–8 seconds\n\n' +
-    'Continue?'
-  );
+  const ok = confirm('Fetch Buy/Sell snapshot for all stocks now?');
   if (!ok) return;
 
   btn.disabled = true;
@@ -792,6 +783,41 @@ async function startBSFetch() {
 
   btn.disabled = false;
   btn.textContent = '💹 Fetch Buy/Sell';
+}
+
+/* ============================================================
+   SECTION 5.4 — MANUAL EOD VOLUME
+   ============================================================ */
+async function startEODVolumeFetch() {
+  const btn = document.getElementById('fetchVolBtn');
+  if (!btn) return;
+  if (btn.disabled) return;
+
+  const ok = confirm('Fetch latest volume for all stocks now?');
+  if (!ok) return;
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Fetching volume...';
+
+  try {
+    const r = await fetch(API + '/api/admin/force-eod-volume', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
+    });
+    const d = await r.json();
+
+    if (!r.ok) {
+      showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
+    } else {
+      showToast('✅ Volume Saved', `${d.saved}/${d.total} stocks · ${d.date}`);
+      await loadLTP();
+    }
+  } catch (e) {
+    showToast('⚠️ Error', e.message);
+  }
+
+  btn.disabled = false;
+  btn.textContent = '📈 Fetch Volume';
 }
 
 function updateProgress(done, total) {
@@ -826,8 +852,14 @@ async function loadLTP() {
         if (item.ltp) SCREENER_LTP[item.token] = item.ltp;
         if (item.prevClose) SCREENER_PREV_CLOSE[item.token] = item.prevClose;
         if (item.pivot) SCREENER_PIVOT[item.token] = item.pivot;
-        if (item.buyQty != null || item.sellQty != null) {
-          SCREENER_BS[item.token] = { buyQty: item.buyQty, sellQty: item.sellQty, volume: item.bsVolume };
+        if (item.buyQty != null || item.sellQty != null || item.rank != null) {
+          const existing = SCREENER_BS[item.token] || {};
+          SCREENER_BS[item.token] = {
+            buyQty: item.buyQty ?? existing.buyQty,
+            sellQty: item.sellQty ?? existing.sellQty,
+            volume: item.bsVolume ?? existing.volume,
+            rank: item.rank ?? existing.rank
+          };
         }
         if (item.highQuote) {
           SCREENER_QUOTE[item.token] = {
@@ -900,7 +932,7 @@ function startSSE() {
       }
       else if (msg.type === 'bs' && msg.bs) {
         for (const [token, v] of Object.entries(msg.bs)) {
-          SCREENER_BS[token] = { buyQty: v.buyQty, sellQty: v.sellQty, volume: v.volume };
+          SCREENER_BS[token] = { buyQty: v.buyQty, sellQty: v.sellQty, volume: v.volume, rank: v.rank };
         }
         renderScreenerTable();
       }
@@ -945,10 +977,11 @@ function renderScreenerTable() {
   if (!head || !body) return;
 
   /* ============================================================
-     MOMENTUM strategy branch
+     MOMENTUM strategy branch (default)
      ============================================================ */
   if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
     head.innerHTML = `<tr>
+      <th style="width:36px">#</th>
       <th>Stock / Company</th>
       <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
           <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
@@ -962,7 +995,6 @@ function renderScreenerTable() {
       <th>ACTION</th>
     </tr>`;
 
-    /* All 387 stocks, no candle-range filter */
     let filtered = [...SCREENER_ALL_STOCKS];
 
     if (SCREENER_MOMENTUM_FILTER === 'top_gainers') {
@@ -971,7 +1003,6 @@ function renderScreenerTable() {
           const chg = computeChangePct(s.token);
           const gap = computeGapPct(s.token);
           if (chg === null || chg <= 0) return false;
-          /* Exclude 2%+ gap up */
           if (gap !== null && gap >= 2) return false;
           return true;
         })
@@ -983,7 +1014,6 @@ function renderScreenerTable() {
           const chg = computeChangePct(s.token);
           const gap = computeGapPct(s.token);
           if (chg === null || chg >= 0) return false;
-          /* Exclude 2%+ gap down */
           if (gap !== null && gap <= -2) return false;
           return true;
         })
@@ -994,7 +1024,7 @@ function renderScreenerTable() {
     const sorted = sortStocks(filtered);
 
     if (!sorted.length) {
-      body.innerHTML = `<tr><td colspan="9" style="text-align:center;padding:60px;color:var(--text-muted)">
+      body.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:60px;color:var(--text-muted)">
         Loading stocks...<br>Please wait a few seconds.
       </td></tr>`;
       if (count) count.textContent = `0 / ${SCREENER_ALL_STOCKS.length}`;
@@ -1007,6 +1037,7 @@ function renderScreenerTable() {
       const ltp = SCREENER_LTP[s.token];
       const orb = SCREENER_ORB[s.token] || {};
       const pivot = SCREENER_PIVOT[s.token];
+      const bs = SCREENER_BS[s.token];
 
       const sl = c ? c.low : null;
       const high = c ? c.high : null;
@@ -1038,17 +1069,21 @@ function renderScreenerTable() {
         pivotCell = '<span style="color:var(--text-muted)">—</span>';
       }
 
+      /* Fixed rank # from server */
+      const rank = bs?.rank ?? '—';
+
       const lastUpdate = formatTimeIST(orb.serverTime);
       const rowClass = orb.entrySignal ? 'row-signal' : '';
 
       return `<tr class="${rowClass}" data-token="${s.token}">
+        <td style="font-weight:700;color:var(--text-muted);font-size:12px">${rank}</td>
         <td><span class="sym">${s.sym}</span><span class="tok">${s.token}</span></td>
         <td style="white-space:nowrap">
           <span class="cell-primary ltp-cell">${ltp ? '₹' + (+ltp).toFixed(2) : '—'}</span>
           <span class="cell-sub change-cell">${changeLine}</span>
         </td>
         <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
-        <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">${SCREENER_BS[s.token]?.volume ? formatQty(SCREENER_BS[s.token].volume) : '—'}</td>
+        <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">${bs?.volume ? formatQty(bs.volume) : '—'}</td>
         <td class="pivot-cell" style="white-space:nowrap">${pivotCell}</td>
         <td style="white-space:nowrap"><span style="color:var(--text-muted)">—</span></td>
         <td style="white-space:nowrap" class="cell-targetsl">${c ? renderTargetSL(c, orb) : '<span style="color:var(--text-muted)">—</span>'}</td>

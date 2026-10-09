@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v3.6
+   server.js — TradeAlgo Pro backend  |  v3.7
    ============================================================ */
 
 import express from 'express';
@@ -70,7 +70,6 @@ console.log(`📋 Stocks: ${STOCKS.length} active / ${ALL_STOCKS.length} total`)
 const SYM_BY_TOKEN = {};
 STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
 
-/* NSE symbol → Angel token map (for pre-open matching) */
 const TOKEN_BY_SYM = {};
 STOCKS.forEach(s => {
   const key = String(s.sym).toUpperCase().trim().replace(/-EQ$|-BE$|-BL$|-BZ$/, '');
@@ -285,7 +284,7 @@ async function loadLatestPivotFromDB() {
    SECTION 4.3 — BUY/SELL CACHE  (strategy_bs_snapshot)
    ============================================================ */
 const bsCache = new Map();
-const prevClosesCache = new Map();   // token -> [{ ts, close }, ...]
+const prevClosesCache = new Map();
 
 function computeRSI(prevCloses, currentClose) {
   if (!Array.isArray(prevCloses) || prevCloses.length < 13) return null;
@@ -332,7 +331,6 @@ async function loadBSCacheFromDB() {
   } catch (e) { console.error('BS cache load failed:', e.message); }
 }
 
-/* Load prev-day min_1_close from DB into prevClosesCache (morning preload) */
 async function loadPrevClosesFromDB() {
   try {
     const prevDate = getPreviousTradingDay(getIST());
@@ -1592,7 +1590,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
       } else {
         const existing = bsCache.get(String(r.token)) || {};
 
-        /* Compute RSI on first BS tick of the day */
         let rsi = existing.rsi ?? null;
         if (rsi == null && Number.isFinite(r.ltp)) {
           const prev = prevClosesCache.get(String(r.token));
@@ -1823,6 +1820,43 @@ app.post('/api/admin/force-eod-closes', auth, adminOnly, async (req, res) => {
   }
 });
 
+/* ---- Compute RSI from min_1_close array (today) ---- */
+app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
+  try {
+    const today = getIST().toISOString().split('T')[0];
+    const { rows } = await db.query(
+      `SELECT token, sym, min_1_close FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL`,
+      [today]
+    );
+
+    const out = [];
+    for (const r of rows) {
+      const closes = r.min_1_close.map(Number);
+      if (closes.length < 14) continue;
+      const prev13 = closes.slice(-14, -1);
+      const current = closes[closes.length - 1];
+      const rsi = computeRSI(prev13, current);
+      if (rsi == null) continue;
+
+      const v = +rsi.toFixed(2);
+      try {
+        await db.query(
+          `UPDATE strategy_bs_snapshot SET rsi=$1
+           WHERE date=$2 AND token=$3 AND strategy_id='momentum'`,
+          [v, today, r.token]
+        );
+      } catch {}
+
+      out.push({ sym: r.sym, rsi: v });
+    }
+
+    out.sort((a, b) => b.rsi - a.rsi);
+    console.log(`🧪 Compute-RSI: ${out.length} saved`);
+    res.json({ ok: true, date: today, count: out.length, top10: out.slice(0, 10), bottom10: out.slice(-10) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* ---- 30s BS interval (9:15:00 → 15:30) ---- */
 function startBSInterval() {
   if (bsIntervalTimer) return;
@@ -1904,7 +1938,7 @@ async function loadScreenerCacheFromDB() {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.6`);
+  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.7`);
   console.log(`📊 Strategies: Momentum (default) + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);

@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v3.2
+   server.js — TradeAlgo Pro backend  |  v3.3
    ============================================================
 
    - REST historical → open/high/low/close
@@ -9,6 +9,11 @@
    - prevClose loaded from previous day's day_close
    - WS starts at 09:14:55 IST, stops at 15:30
    - LTP live via WS→SSE; BS via REST→SSE every 30s
+
+   v3.3 CHANGES:
+   - getScreenerPhase() now returns `date` in forming/closed phases
+     (fixes BS/Quote/HLC skip during 9:15–9:30 IST and after-hours)
+   - fetchDayHLC()/autoFetchBS() log DB errors + Angel result counts
    ============================================================ */
 
 import express from 'express';
@@ -135,14 +140,15 @@ function getPreviousTradingDay(dateObj) {
   return d.toISOString().split('T')[0];
 }
 
+/* ✅ v3.3 FIX: always return `date` so downstream calls don't skip */
 function getScreenerPhase() {
   const ist = getIST();
   const today = ist.toISOString().split('T')[0];
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
 
   if (!isTradingDay(ist)) return { phase: 'weekend', date: getPreviousTradingDay(ist) };
-  if (mins < 555) return { phase: 'closed' };
-  if (mins < 570) return { phase: 'forming' };
+  if (mins < 555) return { phase: 'closed',  date: getPreviousTradingDay(ist) };
+  if (mins < 570) return { phase: 'forming', date: today };
   return { phase: 'ready', date: today };
 }
 
@@ -997,8 +1003,8 @@ app.get('/api/screener/status', auth, (req, res) => {
 app.get('/api/screener/data', auth, (req, res) => {
   const strategy = getStrategy(req.query.strategy || 'momentum');
   const p = getScreenerPhase();
-  if (p.phase === 'closed')  return res.json({ ok: false, phase: 'closed' });
-  if (p.phase === 'forming') return res.json({ ok: false, phase: 'forming' });
+  if (p.phase === 'closed' && !p.date)  return res.json({ ok: false, phase: 'closed' });
+  if (!p.date) return res.json({ ok: false, phase: p.phase });
 
   const allCandles = getCachedCandles(STOCKS.map(s => s.token), p.date);
   const cachedTokens = allCandles
@@ -1056,9 +1062,10 @@ app.post('/api/screener/fetch-batch', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
   const p = getScreenerPhase();
-  if (p.phase !== 'ready' && p.phase !== 'weekend') {
+  if (p.phase !== 'ready' && p.phase !== 'weekend' && p.phase !== 'forming') {
     return res.status(400).json({ error: `Cannot fetch in phase: ${p.phase}` });
   }
+  if (!p.date) return res.status(400).json({ error: 'No date available' });
 
   try {
     const results = await getCandlesForTokens(tokens, p.date);
@@ -1195,14 +1202,21 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 async function fetchDayHLC() {
   try {
     const p = getScreenerPhase();
-    if (!p.date) return;
+    if (!p.date) { console.log('❌ [HLC] No date — returning'); return; }
     const allTokens = STOCKS.map(s => String(s.token));
-    console.log(`🔔 Fetching day H/L/C (Quote) for ${allTokens.length} stocks...`);
+    console.log(`🔔 [HLC] Fetching day H/L/C for ${allTokens.length} stocks (date=${p.date})...`);
 
     const savedTokens = new Set();
     const t0 = Date.now();
+    const dbErrors = [];
 
     let quotes = await fetchQuotesForTokens(allTokens);
+    console.log(`🔍 [HLC] Angel returned ${quotes?.length || 0} quotes`);
+    if (!quotes || !quotes.length) {
+      console.log('❌ [HLC] Angel returned 0 quotes — check login / rate limit');
+      return;
+    }
+
     for (const q of quotes) {
       if (!q || !q.token) continue;
       if (!Number.isFinite(q.high) || !Number.isFinite(q.low) || q.high <= 0 || q.low <= 0) continue;
@@ -1211,26 +1225,27 @@ async function fetchDayHLC() {
       const close = q.ltp || q.close;
       const pivot = (+q.high + +q.low + +close) / 3;
 
-      db.query(
-        `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-         ON CONFLICT (date, token) DO UPDATE SET
-           day_high=EXCLUDED.day_high,
-           day_low=EXCLUDED.day_low,
-           day_close=EXCLUDED.day_close,
-           pivot=EXCLUDED.pivot,
-           updated_at=NOW()`,
-        [p.date, token, SYM_BY_TOKEN[token] || '?', q.high, q.low, close, pivot]
-      ).catch(() => {});
-
-      savedTokens.add(token);
+      try {
+        await db.query(
+          `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+           ON CONFLICT (date, token) DO UPDATE SET
+             day_high=EXCLUDED.day_high,
+             day_low=EXCLUDED.day_low,
+             day_close=EXCLUDED.day_close,
+             pivot=EXCLUDED.pivot,
+             updated_at=NOW()`,
+          [p.date, token, SYM_BY_TOKEN[token] || '?', q.high, q.low, close, pivot]
+        );
+        savedTokens.add(token);
+      } catch (e) { dbErrors.push(`${token}: ${e.message}`); }
     }
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       const missing = allTokens.filter(t => !savedTokens.has(t));
       if (!missing.length) break;
 
-      console.log(`🔁 Retry ${attempt}: ${missing.length} missing tokens...`);
+      console.log(`🔁 [HLC] Retry ${attempt}: ${missing.length} missing tokens...`);
       await new Promise(r => setTimeout(r, 1500));
 
       const retry = await fetchQuotesForTokens(missing);
@@ -1242,26 +1257,29 @@ async function fetchDayHLC() {
         const close = q.ltp || q.close;
         const pivot = (+q.high + +q.low + +close) / 3;
 
-        db.query(
-          `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-           ON CONFLICT (date, token) DO UPDATE SET
-             day_high=EXCLUDED.day_high,
-             day_low=EXCLUDED.day_low,
-             day_close=EXCLUDED.day_close,
-             pivot=EXCLUDED.pivot,
-             updated_at=NOW()`,
-          [p.date, token, SYM_BY_TOKEN[token] || '?', q.high, q.low, close, pivot]
-        ).catch(() => {});
-
-        savedTokens.add(token);
+        try {
+          await db.query(
+            `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+             ON CONFLICT (date, token) DO UPDATE SET
+               day_high=EXCLUDED.day_high,
+               day_low=EXCLUDED.day_low,
+               day_close=EXCLUDED.day_close,
+               pivot=EXCLUDED.pivot,
+               updated_at=NOW()`,
+            [p.date, token, SYM_BY_TOKEN[token] || '?', q.high, q.low, close, pivot]
+          );
+          savedTokens.add(token);
+        } catch (e) { dbErrors.push(`${token}: ${e.message}`); }
       }
     }
+
+    if (dbErrors.length) console.log(`❌ [HLC] DB errors (first 5):`, dbErrors.slice(0, 5));
 
     await flushLtpWrites();
     const totalTime = Math.round((Date.now() - t0) / 1000);
     console.log(`✅ Day H/L/C: ${savedTokens.size}/${allTokens.length} saved in ${totalTime}s`);
-  } catch (e) { console.error('Day H/L/C fetch failed:', e.message); }
+  } catch (e) { console.error('❌ Day H/L/C fetch failed:', e); }
 }
 
 app.post('/api/admin/force-day-hlc', auth, adminOnly, async (req, res) => {
@@ -1417,7 +1435,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
   try {
     if (!isTradingDay(getIST())) { if (!silent) console.log('💹 Auto-BS: non-trading day, skip'); return; }
     const p = getScreenerPhase();
-    if (!p.date) { if (!silent) console.log('💹 Auto-BS: no trading date, skip'); return; }
+    if (!p.date) { if (!silent) console.log('❌ [BS] No date — returning'); return; }
 
     const allTokens = STOCKS.map(s => String(s.token));
     if (!silent) console.log(`💹 Auto-BS (${volumeOnly ? 'volume-only' : 'full'}): fetching ${allTokens.length} tokens...`);
@@ -1425,40 +1443,52 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
 
     const fetchedAt = new Date();
     const results = await fetchBuySellForTokens(allTokens);
+    if (!silent) console.log(`🔍 [BS] Angel returned ${results?.length || 0} results`);
+    if (!results || !results.length) {
+      if (!silent) console.log('❌ [BS] Angel returned 0 — check login / rate limit');
+      return;
+    }
 
+    const dbErrors = [];
     for (const r of results) {
       if (volumeOnly) {
         if (!Number.isFinite(r.volume) || r.volume <= 0) continue;
-        db.query(
-          `UPDATE strategy_bs_snapshot SET volume=$1, fetched_at=NOW()
-           WHERE date=$2 AND token=$3 AND strategy_id=$4`,
-          [r.volume, p.date, r.token, 'momentum']
-        ).catch(() => {});
+        try {
+          await db.query(
+            `UPDATE strategy_bs_snapshot SET volume=$1, fetched_at=NOW()
+             WHERE date=$2 AND token=$3 AND strategy_id=$4`,
+            [r.volume, p.date, r.token, 'momentum']
+          );
+        } catch (e) { dbErrors.push(`${r.token}: ${e.message}`); }
         const existing = bsCache.get(String(r.token)) || {};
         existing.volume = r.volume;
         bsCache.set(String(r.token), existing);
       } else {
-        bsCache.set(r.token, {
+        bsCache.set(String(r.token), {
           buyQty: r.buyQty,
           sellQty: r.sellQty,
           ltp: r.ltp,
           volume: r.volume,
           rank: bsCache.get(String(r.token))?.rank ?? null
         });
-        db.query(
-          `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, fetched_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-           ON CONFLICT (date, token, strategy_id) DO UPDATE SET
-             sym=EXCLUDED.sym,
-             buy_qty=EXCLUDED.buy_qty,
-             sell_qty=EXCLUDED.sell_qty,
-             ltp=EXCLUDED.ltp,
-             volume=EXCLUDED.volume,
-             fetched_at=EXCLUDED.fetched_at`,
-          [p.date, SYM_BY_TOKEN[r.token] || '?', r.token, 'momentum', r.buyQty, r.sellQty, r.ltp, r.volume, fetchedAt]
-        ).catch(() => {});
+        try {
+          await db.query(
+            `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, fetched_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+             ON CONFLICT (date, token, strategy_id) DO UPDATE SET
+               sym=EXCLUDED.sym,
+               buy_qty=EXCLUDED.buy_qty,
+               sell_qty=EXCLUDED.sell_qty,
+               ltp=EXCLUDED.ltp,
+               volume=EXCLUDED.volume,
+               fetched_at=EXCLUDED.fetched_at`,
+            [p.date, SYM_BY_TOKEN[r.token] || '?', r.token, 'momentum', r.buyQty, r.sellQty, r.ltp, r.volume, fetchedAt]
+          );
+        } catch (e) { dbErrors.push(`${r.token}: ${e.message}`); }
       }
     }
+
+    if (dbErrors.length) console.log(`❌ [BS] DB errors (first 5):`, dbErrors.slice(0, 5));
 
     broadcastBS(fetchedAt);
     if (!silent) console.log(`✅ Auto-BS (${volumeOnly ? 'volume' : 'full'}): ${results.length}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
@@ -1610,7 +1640,7 @@ async function loadScreenerCacheFromDB() {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} (REST + Quote + BS)`);
+  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.3`);
   console.log(`📊 Strategies: Momentum (default) + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);

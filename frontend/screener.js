@@ -53,6 +53,7 @@ async function initScreener() {
   setupControls();
   await loadStockList();
   await loadCachedData();
+  await loadLTP();
   SCREENER_INIT_DONE = true;
   startSSE();
 }

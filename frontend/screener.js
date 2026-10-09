@@ -1,9 +1,11 @@
 /* ============================================================
-   SCREENER.JS  — v3.1
+   SCREENER.JS  — v3.2
    + Default strategy = Momentum
    + Fixed # column (rank from server)
    + Gap % filter for Top Gainers/Losers
    + Volume column (no separate button — same BS fetch)
+   + 30s REST LTP poll REMOVED — SSE only (WS → LTP, 30s BS → Buy/Sell/Vol)
+   + Strategy-specific control buttons
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -66,6 +68,24 @@ function setupControls() {
   });
   controls.querySelectorAll('button, label').forEach(el => el.style.display = 'none');
 
+  renderStrategyControls();
+}
+
+function renderStrategyControls() {
+  const controls = document.querySelector('.screener-controls');
+  if (!controls) return;
+
+  let strategyButtons = '';
+  if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
+    strategyButtons = `
+      <button id="fetchBSBtn" class="btn btn-primary" onclick="startBSFetch()">💹 Fetch Buy/Sell</button>`;
+  } else {
+    strategyButtons = `
+      <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
+      <button id="fetchQuoteBtn" class="btn btn-outline" onclick="startQuoteFetch()">📊 Fetch Quote H/L</button>
+      <button id="fetchDayHLCBtn" class="btn btn-outline" onclick="startDayHLCFetch()">📅 Fetch Day H/L/C</button>`;
+  }
+
   controls.innerHTML = `
     <select id="strategyDropdown" onchange="onStrategyChange(this.value)"
             style="padding:7px 14px;border:1.5px solid var(--border-soft);border-radius:8px;
@@ -74,10 +94,7 @@ function setupControls() {
       <option value="momentum">🚀 Momentum</option>
       <option value="advance_orb">🔍 Advance ORB</option>
     </select>
-    <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
-    <button id="fetchQuoteBtn" class="btn btn-outline" onclick="startQuoteFetch()">📊 Fetch Quote H/L</button>
-    <button id="fetchDayHLCBtn" class="btn btn-outline" onclick="startDayHLCFetch()">📅 Fetch Day H/L/C</button>
-    <button id="fetchBSBtn" class="btn btn-outline" onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
+    ${strategyButtons}
     <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">Per-Trade ₹</label>
     <input id="perTradeInput" type="number" value="10000" min="100"
            style="width:110px;padding:7px 12px;border:1.5px solid var(--border-soft);border-radius:8px;
@@ -114,6 +131,8 @@ async function onStrategyChange(value) {
   SCREENER_SORT_DIR = 'desc';
   SCREENER_STAGE_FILTER = 'all';
   SCREENER_MOMENTUM_FILTER = 'all';
+
+  renderStrategyControls();
   await loadLTP();
   renderScreenerTable();
 }
@@ -560,14 +579,15 @@ async function loadCachedData() {
 }
 
 /* ============================================================
-   SECTION 5 — FETCH 9:15 (REST)
+   SECTION 5 — FETCH 9:15 (REST)  [Advance ORB only]
    ============================================================ */
 async function startFetch() {
   if (FETCHING) return;
+  const btn = document.getElementById('fetch915Btn');
+  if (!btn) return;
   if (!SCREENER_ALL_STOCKS.length) { showToast('⚠️ No stocks', ''); return; }
 
   FETCHING = true;
-  const btn = document.getElementById('fetch915Btn');
   btn.disabled = true;
   btn.textContent = '⏳ Fetching...';
   document.getElementById('progressBar').style.display = 'block';
@@ -634,14 +654,15 @@ async function startFetch() {
 }
 
 /* ============================================================
-   SECTION 5.1 — FETCH QUOTE
+   SECTION 5.1 — FETCH QUOTE  [Advance ORB only]
    ============================================================ */
 async function startQuoteFetch() {
   if (QUOTE_FETCHING) return;
+  const btn = document.getElementById('fetchQuoteBtn');
+  if (!btn) return;
   if (!SCREENER_ALL_STOCKS.length) { showToast('⚠️ No stocks', ''); return; }
 
   QUOTE_FETCHING = true;
-  const btn = document.getElementById('fetchQuoteBtn');
   btn.disabled = true;
   btn.textContent = '⏳ Quote fetch...';
   document.getElementById('progressBar').style.display = 'block';
@@ -704,7 +725,7 @@ async function startQuoteFetch() {
 }
 
 /* ============================================================
-   SECTION 5.2 — MANUAL DAY H/L/C
+   SECTION 5.2 — MANUAL DAY H/L/C  [Advance ORB only]
    ============================================================ */
 async function startDayHLCFetch() {
   const btn = document.getElementById('fetchDayHLCBtn');
@@ -741,7 +762,7 @@ async function startDayHLCFetch() {
 }
 
 /* ============================================================
-   SECTION 5.3 — MANUAL BUY/SELL (also fetches volume)
+   SECTION 5.3 — MANUAL BUY/SELL  [Momentum]
    ============================================================ */
 async function startBSFetch() {
   const btn = document.getElementById('fetchBSBtn');
@@ -784,7 +805,7 @@ function updateProgress(done, total) {
 }
 
 /* ============================================================
-   SECTION 6 — LTP POLL (initial only, no 30s timer)
+   SECTION 6 — LTP (initial load only; live updates via SSE)
    ============================================================ */
 async function loadLTP() {
   const baseList = SCREENER_ACTIVE_STRATEGY === 'momentum'

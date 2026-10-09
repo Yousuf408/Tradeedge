@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v3.6
+   SCREENER.JS  — v3.7
    + Default strategy = Momentum
    + Fixed # column (rank from server)
    + Gap % filter for Top Gainers/Losers
@@ -8,6 +8,8 @@
    + Strategy-specific control buttons
    + PRE-OPEN column (Momentum) — NSE pre-open final price
    + DAY OPEN column (Momentum) — from Angel BS quote.open
+   + RSI column (Momentum) — first tick 9:15, freeze after
+   + EOD closes fetch button (manual for first-time setup)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -22,11 +24,13 @@ let SCREENER_BS = {};
 let SCREENER_ORB = {};
 let SCREENER_PREOPEN = {};         // token -> { price }
 let SCREENER_DAY_OPEN = {};        // token -> number
+let SCREENER_RSI = {};             // token -> number
 let SCREENER_INIT_DONE = false;
 let SCREENER_SSE = null;
 let FETCHING = false;
 let QUOTE_FETCHING = false;
 let DAYHLC_FETCHING = false;
+let EOD_FETCHING = false;
 
 let SCREENER_STAGE_FILTER = 'all';
 let SCREENER_MOMENTUM_FILTER = 'all';
@@ -84,7 +88,8 @@ function renderStrategyControls() {
   if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
     strategyButtons = `
       <button id="fetchBSBtn" class="btn btn-primary" onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
-      <button id="fetchPreopenBtn" class="btn btn-outline" onclick="startPreopenFetch()">📡 Fetch Pre-Open</button>`;
+      <button id="fetchPreopenBtn" class="btn btn-outline" onclick="startPreopenFetch()">📡 Fetch Pre-Open</button>
+      <button id="fetchEODBtn" class="btn btn-outline" onclick="startEODClosesFetch()">⚙️ Fetch EOD Closes</button>`;
   } else {
     strategyButtons = `
       <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
@@ -245,6 +250,7 @@ function getSortValue(stock, field) {
     return v === null ? -Infinity : v;
   }
   if (field === 'ltp') return SCREENER_LTP[stock.token] ?? -Infinity;
+  if (field === 'rsi') return SCREENER_RSI[stock.token] ?? -Infinity;
   if (field === 'range') {
     if (!candle) return -Infinity;
     return ((candle.high - candle.low) / candle.low) * 100;
@@ -442,7 +448,24 @@ function renderBuySellCell(token) {
 }
 
 /* ============================================================
-   SECTION 3.5 — ORB ROW FAST UPDATE
+   SECTION 3.5 — RSI CELL
+   ============================================================ */
+function renderRSICell(token) {
+  const rsi = SCREENER_RSI[token];
+  if (rsi == null) return '<span style="color:var(--text-muted)">—</span>';
+
+  const v = +rsi;
+  let color = 'var(--text-primary)';
+  let badge = '';
+  if (v >= 70) { color = 'var(--danger)'; badge = ' 🔥'; }
+  else if (v >= 65) { color = '#F5A623'; }
+  else if (v <= 30) { color = 'var(--success)'; }
+
+  return `<span style="color:${color};font-weight:700">${v.toFixed(1)}${badge}</span>`;
+}
+
+/* ============================================================
+   SECTION 3.6 — ORB ROW FAST UPDATE
    ============================================================ */
 function updateORBRow(token, state) {
   SCREENER_ORB[token] = {
@@ -837,6 +860,44 @@ async function startPreopenFetch() {
   btn.textContent = '📡 Fetch Pre-Open';
 }
 
+/* ============================================================
+   SECTION 5.5 — MANUAL EOD CLOSES FETCH  [Momentum]
+   First-time setup: fetch prev-day last 20 one-min closes for RSI
+   ============================================================ */
+async function startEODClosesFetch() {
+  const btn = document.getElementById('fetchEODBtn');
+  if (!btn) return;
+  if (EOD_FETCHING) return;
+
+  const ok = confirm('Fetch EOD closes (last 20 one-min) for all stocks now?\nThis will take ~3-5 minutes. Use this for first-time setup.');
+  if (!ok) return;
+
+  EOD_FETCHING = true;
+  btn.disabled = true;
+  btn.textContent = '⏳ Fetching EOD... (~3-5 min)';
+
+  try {
+    const r = await fetch(API + '/api/admin/force-eod-closes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
+    });
+    const d = await r.json();
+
+    if (!r.ok) {
+      showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
+    } else {
+      showToast('✅ EOD Closes Saved', 'RSI-ready for next trading day');
+      await loadLTP();
+    }
+  } catch (e) {
+    showToast('⚠️ Error', e.message);
+  }
+
+  EOD_FETCHING = false;
+  btn.disabled = false;
+  btn.textContent = '⚙️ Fetch EOD Closes';
+}
+
 function updateProgress(done, total) {
   const fill = document.getElementById('progressFill');
   const text = document.getElementById('progressText');
@@ -871,6 +932,8 @@ async function loadLTP() {
         if (item.pivot) SCREENER_PIVOT[item.token] = item.pivot;
         if (item.preopenPrice != null) SCREENER_PREOPEN[item.token] = { price: item.preopenPrice };
         if (item.dayOpen != null) SCREENER_DAY_OPEN[item.token] = item.dayOpen;
+        if (item.rsi != null) SCREENER_RSI[item.token] = item.rsi;
+
         if (item.buyQty != null || item.sellQty != null || item.rank != null) {
           const existing = SCREENER_BS[item.token] || {};
           SCREENER_BS[item.token] = {
@@ -949,6 +1012,7 @@ function startSSE() {
           SCREENER_BS[token] = { buyQty: v.buyQty, sellQty: v.sellQty, volume: v.volume, rank: v.rank };
           if (v.preopenPrice != null) SCREENER_PREOPEN[token] = { price: v.preopenPrice };
           if (v.dayOpen != null) SCREENER_DAY_OPEN[token] = v.dayOpen;
+          if (v.rsi != null) SCREENER_RSI[token] = v.rsi;
         }
         renderScreenerTable();
       }
@@ -1003,6 +1067,7 @@ function renderScreenerTable() {
           <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
       <th>PRE-OPEN</th>
       <th>DAY OPEN</th>
+      <th class="th-sortable" onclick="setSort('rsi')">RSI ${sortIndicator('rsi')}</th>
       <th>Buy / Sell</th>
       <th>Volume</th>
       <th>Pivot</th>
@@ -1042,7 +1107,7 @@ function renderScreenerTable() {
     const sorted = sortStocks(filtered);
 
     if (!sorted.length) {
-      body.innerHTML = `<tr><td colspan="13" style="text-align:center;padding:60px;color:var(--text-muted)">
+      body.innerHTML = `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
         Loading stocks...<br>Please wait a few seconds.
       </td></tr>`;
       if (count) count.textContent = `0 / ${SCREENER_ALL_STOCKS.length}`;
@@ -1111,6 +1176,7 @@ function renderScreenerTable() {
         </td>
         <td style="white-space:nowrap">${preopenCell}</td>
         <td style="white-space:nowrap">${dayOpenCell}</td>
+        <td style="white-space:nowrap">${renderRSICell(s.token)}</td>
         <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
         <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">${bs?.volume ? formatQty(bs.volume) : '—'}</td>
         <td class="pivot-cell" style="white-space:nowrap">${pivotCell}</td>

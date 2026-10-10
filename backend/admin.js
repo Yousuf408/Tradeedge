@@ -1,7 +1,6 @@
 /* ============================================================
-   admin.js — Admin + Auth + Users + Triggers
-   Ek jagah saara admin/user related kaam.
-   server.js se sirf deps lega, kuch bhi wapas import nahi.
+   admin.js — Auth + Users + Holidays + Audit + Prices
+   (Trigger endpoints moved to server.js)
    ============================================================ */
 
 import bcrypt from 'bcryptjs';
@@ -12,16 +11,11 @@ export function registerAdminRoutes(app, deps) {
   const {
     db, SECRET,
     auth, adminOnly, log,
-    getIST, getPreviousTradingDay, getScreenerPhase,
-    STOCKS, bsCache,
-    fetchDayHLC, autoFetchBS,
-    fetchPreopenRaw, parsePreopen,
-    computeRSI,
     loadHolidaysFromDB
   } = deps;
 
   /* ============================================================
-     TOTP HELPERS (local to admin)
+     TOTP HELPERS
      ============================================================ */
   const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
@@ -57,7 +51,7 @@ export function registerAdminRoutes(app, deps) {
   }
 
   /* ============================================================
-     USER HELPERS (local to admin)
+     USER HELPERS
      ============================================================ */
   async function generateUsername(fullName, mobile) {
     const first = (fullName || '').trim().split(/\s+/)[0].toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -427,136 +421,6 @@ export function registerAdminRoutes(app, deps) {
       await loadHolidaysFromDB();
       await log(req.user.username, 'HOLIDAY_REMOVED', req.params.date, 'warn');
       res.json({ ok: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-  });
-
-  /* ============================================================
-     ADMIN TRIGGERS
-     ============================================================ */
-
-  /* Force Day H/L/C */
-  app.post('/api/admin/force-day-hlc', auth, adminOnly, async (req, res) => {
-    try {
-      await fetchDayHLC();
-      const p = getScreenerPhase();
-      const { rows } = await db.query(
-        `SELECT COUNT(*) AS cnt FROM angel_15m_candle WHERE date=$1 AND day_high IS NOT NULL`,
-        [p.date]
-      );
-      res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-  });
-
-  /* Force Buy/Sell */
-  app.post('/api/admin/force-bs', auth, adminOnly, async (req, res) => {
-    try {
-      await autoFetchBS();
-      const p = getScreenerPhase();
-      const { rows } = await db.query(
-        `SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot
-         WHERE date=$1 AND strategy_id=$2 AND buy_qty IS NOT NULL`,
-        [p.date, 'momentum']
-      );
-      res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-  });
-
-  /* Force Pre-Open */
-  app.post('/api/admin/fetch-preopen', auth, adminOnly, async (req, res) => {
-    try {
-      const json = await fetchPreopenRaw();
-      const { matched, unmatchedSyms, nseTotal } = parsePreopen(json);
-      const fetchedAt = new Date();
-      const p = getScreenerPhase();
-      const dbErrors = [];
-
-      for (const m of matched) {
-        const existing = bsCache.get(m.token) || {};
-        bsCache.set(m.token, {
-          buyQty: existing.buyQty ?? null,
-          sellQty: existing.sellQty ?? null,
-          ltp: existing.ltp ?? null,
-          volume: existing.volume ?? null,
-          rank: existing.rank ?? null,
-          preopenPrice: m.price,
-          preopenAt: fetchedAt,
-          dayOpen: existing.dayOpen ?? null,
-          rsi: existing.rsi ?? null
-        });
-
-        if (p.date) {
-          try {
-            await db.query(
-              `UPDATE strategy_bs_snapshot SET preopen_price=$1, preopen_at=$2
-               WHERE date=$3 AND token=$4 AND strategy_id=$5`,
-              [m.price, fetchedAt, p.date, m.token, 'momentum']
-            );
-          } catch (e) { dbErrors.push(`${m.sym}: ${e.message}`); }
-        }
-      }
-
-      console.log(`🌅 Preopen fetch: NSE=${nseTotal}, matched=${matched.length}, unmatched=${unmatchedSyms.length}`);
-      if (unmatchedSyms.length) console.log(`🌅 Unmatched (first 20): ${unmatchedSyms.slice(0, 20).join(', ')}`);
-      if (dbErrors.length) console.log(`❌ Preopen DB errors (first 5):`, dbErrors.slice(0, 5));
-
-      res.json({
-        ok: true, date: p.date, nseTotal,
-        matched: matched.length,
-        unmatchedCount: unmatchedSyms.length,
-        unmatchedSample: unmatchedSyms.slice(0, 30),
-        dbErrors: dbErrors.slice(0, 5),
-        fetchedAt
-      });
-    } catch (e) {
-      console.error('Preopen fetch failed:', e);
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  /* Compute RSI (auto-detect latest date) */
-  app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
-    try {
-      const dateParam = req.body?.date || req.query?.date;
-      let targetDate = dateParam;
-
-      if (!targetDate) {
-        const { rows } = await db.query(
-          `SELECT date::text AS d FROM strategy_bs_snapshot
-           WHERE strategy_id='momentum' AND min_1_close IS NOT NULL
-           ORDER BY date DESC LIMIT 1`
-        );
-        if (!rows.length) return res.json({ ok: false, error: 'No min_1_close data found' });
-        targetDate = rows[0].d;
-      }
-
-      const { rows: dataRows } = await db.query(
-        `SELECT token, sym, min_1_close FROM strategy_bs_snapshot
-         WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL`,
-        [targetDate]
-      );
-
-      const out = [];
-      for (const r of dataRows) {
-        const closes = r.min_1_close.map(Number);
-        if (closes.length < 14) continue;
-        const prev13 = closes.slice(-14, -1);
-        const current = closes[closes.length - 1];
-        const rsi = computeRSI(prev13, current);
-        if (rsi == null) continue;
-        const v = +rsi.toFixed(2);
-        try {
-          await db.query(
-            `UPDATE strategy_bs_snapshot SET rsi=$1
-             WHERE date=$2 AND token=$3 AND strategy_id='momentum'`,
-            [v, targetDate, r.token]
-          );
-        } catch {}
-        out.push({ sym: r.sym, rsi: v });
-      }
-
-      out.sort((a, b) => b.rsi - a.rsi);
-      console.log(`🧪 Compute-RSI: ${out.length} saved for ${targetDate}`);
-      res.json({ ok: true, date: targetDate, count: out.length, top10: out.slice(0, 10), bottom10: out.slice(-10) });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 }

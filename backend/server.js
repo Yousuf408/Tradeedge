@@ -1,6 +1,8 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v4.1
-   Self-collect minute closes from BS ticks (no historical API)
+   server.js — TradeAlgo Pro backend  |  v4.2
+   - Self-collect minute closes from BS ticks
+   - Sliding window RSI (prev day + today)
+   - Auto pre-market fetch @ 9:13:30
    ============================================================ */
 
 import express from 'express';
@@ -285,23 +287,34 @@ async function loadLatestPivotFromDB() {
    ============================================================ */
 const bsCache = new Map();
 const prevClosesCache = new Map();
-const minuteBuffer = new Map();  // token -> { minuteKey, ts, close }
+const todayCloses = new Map();     // token -> [completed minute closes today, incl. premarket]
+const minuteBuffer = new Map();    // token -> { minuteKey, ts, close }
 
-function computeRSI(prevCloses, currentClose) {
-  if (!Array.isArray(prevCloses) || prevCloses.length < 13) return null;
-  if (!Number.isFinite(currentClose) || currentClose <= 0) return null;
-
-  const closes = [...prevCloses, currentClose];
+function computeRSI(closes14) {
+  if (!Array.isArray(closes14) || closes14.length !== 14) return null;
   let gains = 0, losses = 0;
-  for (let i = 1; i < closes.length; i++) {
-    const d = closes[i] - closes[i - 1];
+  for (let i = 1; i < closes14.length; i++) {
+    const d = closes14[i] - closes14[i - 1];
     if (d > 0) gains += d; else losses -= d;
   }
-  const n = closes.length - 1;
+  const n = closes14.length - 1;
   const avgGain = gains / n;
   const avgLoss = losses / n;
   if (avgLoss === 0) return 100;
   return 100 - (100 / (1 + avgGain / avgLoss));
+}
+
+/* Build 14 closes using sliding window: prev day + today */
+function buildCloses14(token) {
+  const todayArr = todayCloses.get(String(token)) || [];
+  if (todayArr.length >= 14) return todayArr.slice(-14);
+
+  const prevArr = prevClosesCache.get(String(token)) || [];
+  const needed = 14 - todayArr.length;
+  if (prevArr.length < needed) return null;
+
+  const prevSlice = prevArr.slice(-needed).map(x => x.close);
+  return [...prevSlice, ...todayArr];
 }
 
 /* Update minute buffer; returns flushed previous-minute data if minute changed */
@@ -322,7 +335,7 @@ function updateMinuteBuffer(token, ltp) {
     return null;
   }
   if (existing.minuteKey === minuteKey) {
-    existing.close = ltp;   // keep last tick of current minute
+    existing.close = ltp;
     return null;
   }
   const flushed = { ts: existing.ts, close: existing.close };
@@ -345,6 +358,13 @@ async function bulkFlushMinuteChanges(changes, date) {
        WHERE s.date = $4 AND s.token = v.token AND s.strategy_id = 'momentum'`,
       [tokens, closes, tss, date]
     );
+    // Mirror to in-memory todayCloses
+    for (const c of changes) {
+      const key = String(c.token);
+      const arr = todayCloses.get(key) || [];
+      arr.push(Number(c.close));
+      todayCloses.set(key, arr);
+    }
   } catch (e) { console.error('Minute bulk flush failed:', e.message); }
 }
 
@@ -396,6 +416,57 @@ async function loadPrevClosesFromDB() {
     }
     console.log(`📈 Loaded prev closes for ${prevClosesCache.size} tokens (from ${prevDate})`);
   } catch (e) { console.error('prevCloses load failed:', e.message); }
+}
+
+async function loadTodayClosesFromDB() {
+  try {
+    const today = getIST().toISOString().split('T')[0];
+    const activeTokens = STOCKS.map(s => String(s.token));
+    const { rows } = await db.query(
+      `SELECT token, min_1_close FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL
+         AND token = ANY($2)`,
+      [today, activeTokens]
+    );
+    todayCloses.clear();
+    for (const r of rows) {
+      if (Array.isArray(r.min_1_close) && r.min_1_close.length > 0) {
+        todayCloses.set(String(r.token), r.min_1_close.map(c => +c));
+      }
+    }
+    console.log(`📊 Loaded today closes for ${todayCloses.size} tokens`);
+  } catch (e) { console.error('todayCloses load failed:', e.message); }
+}
+
+/* Recompute RSI for all stocks that have 14+ closes in min_1_close */
+async function recomputeAllRSI(date) {
+  try {
+    const { rows } = await db.query(
+      `SELECT token, min_1_close FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL
+         AND array_length(min_1_close, 1) >= 14`,
+      [date]
+    );
+    let count = 0;
+    for (const r of rows) {
+      const closes = r.min_1_close.map(Number);
+      const last14 = closes.slice(-14);
+      const rsi = computeRSI(last14);
+      if (rsi == null) continue;
+      const v = +rsi.toFixed(2);
+      try {
+        await db.query(
+          `UPDATE strategy_bs_snapshot SET rsi=$1 WHERE date=$2 AND token=$3 AND strategy_id='momentum'`,
+          [v, date, r.token]
+        );
+        const existing = bsCache.get(String(r.token)) || {};
+        existing.rsi = v;
+        bsCache.set(String(r.token), existing);
+        count++;
+      } catch {}
+    }
+    console.log(`🧪 recomputeAllRSI: ${count} stocks updated for ${date}`);
+  } catch (e) { console.error('recomputeAllRSI failed:', e.message); }
 }
 
 
@@ -1088,7 +1159,48 @@ async function autoFetchQuote() {
 
 
 /* ============================================================
-   SECTION 10 — BS FETCH (9:15:00 + 30s interval) + MINUTE SELF-COLLECT
+   SECTION 10 — AUTO PRE-OPEN @ 9:13:30 IST
+   ============================================================ */
+async function autoFetchPreopen() {
+  try {
+    if (!isTradingDay(getIST())) return;
+    console.log('🌅 Auto-preopen @9:13:30 starting...');
+    const json = await fetchPreopenRaw();
+    const { matched, unmatchedSyms, nseTotal } = parsePreopen(json);
+    const fetchedAt = new Date();
+    const today = getIST().toISOString().split('T')[0];
+
+    let saved = 0;
+    for (const m of matched) {
+      const existing = bsCache.get(m.token) || {};
+      bsCache.set(m.token, { ...existing, preopenPrice: m.price, preopenAt: fetchedAt });
+
+      // Only init todayCloses with premarket if empty
+      const key = String(m.token);
+      if (!todayCloses.has(key) || todayCloses.get(key).length === 0) {
+        todayCloses.set(key, [m.price]);
+      }
+
+      try {
+        await db.query(
+          `INSERT INTO strategy_bs_snapshot
+             (date, sym, token, strategy_id, preopen_price, preopen_at, min_1_close, min_1_ts, fetched_at)
+           VALUES ($1, $2, $3, 'momentum', $4, $5, ARRAY[$4]::numeric[], ARRAY[$5]::timestamptz[], NOW())
+           ON CONFLICT (date, token, strategy_id) DO UPDATE SET
+             preopen_price = EXCLUDED.preopen_price,
+             preopen_at = EXCLUDED.preopen_at`,
+          [today, m.sym, m.token, m.price, fetchedAt]
+        );
+        saved++;
+      } catch {}
+    }
+    console.log(`✅ Auto-preopen: NSE=${nseTotal}, matched=${matched.length}, saved=${saved}, unmatched=${unmatchedSyms.length}`);
+  } catch (e) { console.error('Auto-preopen failed:', e.message); }
+}
+
+
+/* ============================================================
+   SECTION 11 — BS FETCH (9:15:00 + 30s interval) + MINUTE SELF-COLLECT
    ============================================================ */
 let bsIntervalTimer = null;
 
@@ -1128,14 +1240,11 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
       } else {
         const existing = bsCache.get(String(r.token)) || {};
 
-        // RSI compute on first tick of the day
+        // RSI compute — sliding window (today first, then prev day)
         let rsi = existing.rsi ?? null;
-        if (rsi == null && Number.isFinite(r.ltp)) {
-          const prev = prevClosesCache.get(String(r.token));
-          if (prev && prev.length >= 13) {
-            const last13 = prev.slice(-13).map(x => x.close);
-            rsi = computeRSI(last13, r.ltp);
-          }
+        if (rsi == null) {
+          const closes14 = buildCloses14(r.token);
+          if (closes14) rsi = computeRSI(closes14);
         }
 
         bsCache.set(String(r.token), {
@@ -1173,7 +1282,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
       }
     }
 
-    // Flush minute changes to DB (bulk)
+    // Flush minute changes (bulk) + mirror to todayCloses
     if (minuteChanges.length) {
       await bulkFlushMinuteChanges(minuteChanges, p.date);
       if (!silent) console.log(`💾 Minute flush: ${minuteChanges.length} tokens`);
@@ -1236,7 +1345,7 @@ async function flushFinalMinuteBuffer() {
 
 
 /* ============================================================
-   SECTION 11 — SCHEDULERS
+   SECTION 12 — SCHEDULERS
    ============================================================ */
 function msUntil(targetHour, targetMin, dayOffsetIfPassed = 1) {
   const ist = getIST();
@@ -1244,7 +1353,6 @@ function msUntil(targetHour, targetMin, dayOffsetIfPassed = 1) {
   const target = targetHour * 3600 + targetMin * 60;
   let diff = target - secs;
   if (diff <= 0) diff += dayOffsetIfPassed * 86400;
-  // Skip weekends for trading-day schedulers
   for (let i = 0; i < 15; i++) {
     const candidate = new Date(ist.getTime() + diff * 1000);
     if (isTradingDay(candidate)) break;
@@ -1260,9 +1368,18 @@ function scheduleDailyHLC() {
 }
 
 function scheduleQuoteAutoFetch() {
-  const ms = msUntil(9, 30, 1) + 10000; // 9:30:10
+  const ms = msUntil(9, 30, 1) + 10000;
   console.log(`⏰ Next auto-quote in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => { await autoFetchQuote(); scheduleQuoteAutoFetch(); }, ms);
+}
+
+function schedulePreopenFetch() {
+  const ms = msUntil(9, 13, 1) + 30000;
+  console.log(`⏰ Next auto-preopen in ${Math.round(ms / 60000)} min`);
+  setTimeout(async () => {
+    await autoFetchPreopen();
+    schedulePreopenFetch();
+  }, ms);
 }
 
 function startBSInterval() {
@@ -1307,13 +1424,16 @@ function scheduleMorningPreload() {
   console.log(`⏰ Next morning preload in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
     await loadPrevClosesFromDB();
+    await loadTodayClosesFromDB();
+    const today = getIST().toISOString().split('T')[0];
+    await recomputeAllRSI(today);
     scheduleMorningPreload();
   }, ms);
 }
 
 
 /* ============================================================
-   SECTION 12 — DB CACHE LOADER
+   SECTION 13 — DB CACHE LOADER
    ============================================================ */
 async function loadScreenerCacheFromDB() {
   try {
@@ -1341,7 +1461,7 @@ async function loadScreenerCacheFromDB() {
 
 
 /* ============================================================
-   REGISTER ADMIN ROUTES (login, users, holidays, triggers)
+   REGISTER ADMIN ROUTES
    ============================================================ */
 registerAdminRoutes(app, {
   db, SECRET,
@@ -1350,21 +1470,19 @@ registerAdminRoutes(app, {
   STOCKS, bsCache,
   fetchDayHLC, autoFetchBS,
   fetchPreopenRaw, parsePreopen,
-  computeRSI,
+  computeRSI: (prev13, current) => computeRSI([...prev13, current]),
   loadHolidaysFromDB
 });
 
 
 /* ============================================================
-   SECTION 13 — START
+   SECTION 14 — START
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v4.1 (self-collect)`);
-  console.log(`📊 Strategies: Momentum (default) + Advance ORB`);
+  console.log(`✅ Server on port ${PORT} — v4.2 (self-collect + sliding RSI)`);
+  console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
-  console.log(`💹 BS interval: 09:15:00 – 15:30:00 IST (every 30s)`);
-  console.log(`🌅 RSI: self-collect from BS ticks + morning 9:00 preload`);
 
   try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }
   await new Promise(r => setTimeout(r, 4000));
@@ -1379,6 +1497,11 @@ app.listen(PORT, async () => {
   await loadLatestPivotFromDB();
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
+  await loadTodayClosesFromDB();
+
+  // Auto-compute RSI for stocks that already have 14+ closes today
+  const todayDate = getIST().toISOString().split('T')[0];
+  await recomputeAllRSI(todayDate);
 
   const nowIST = getIST();
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
@@ -1428,9 +1551,10 @@ app.listen(PORT, async () => {
 
   scheduleDailyHLC();
   scheduleQuoteAutoFetch();
+  schedulePreopenFetch();
   scheduleBSAutoFetch();
   scheduleFinalFlush();
   scheduleMorningPreload();
 
-  console.log('ℹ️  Ready. Schedule: WS@9:14:55 | BS@9:15 (30s) | Quote@9:30 | HLC@15:16 | FinalFlush@15:31 | Preload@9:00');
+  console.log('ℹ️  Schedule: WS@9:14:55 | Preopen@9:13:30 | BS@9:15 (30s) | Quote@9:30 | HLC@15:16 | FinalFlush@15:31 | Preload@9:00');
 });

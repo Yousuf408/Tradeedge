@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v3.8
+   server.js — TradeAlgo Pro backend  |  v3.9
    ============================================================ */
 
 import express from 'express';
@@ -1790,12 +1790,10 @@ async function fetchPrevDayClosesEOD() {
     console.log(`📈 EOD: fetching 20 one-min closes for ${allTokens.length} stocks (${today})...`);
     const t0 = Date.now();
 
-    // Pass 1
     const pass1 = await saveEODClosesForTokens(allTokens, today);
     let saved = pass1.saved;
     const savedSet = new Set(pass1.savedTokens);
 
-    // Retry missing (pass 2)
     const missing1 = allTokens.filter(t => !savedSet.has(String(t)));
     if (missing1.length) {
       console.log(`🔁 EOD retry: ${missing1.length} missing tokens...`);
@@ -1804,7 +1802,6 @@ async function fetchPrevDayClosesEOD() {
       saved += pass2.saved;
       for (const t of pass2.savedTokens) savedSet.add(String(t));
 
-      // Retry missing (pass 3) — last chance
       const missing2 = allTokens.filter(t => !savedSet.has(String(t)));
       if (missing2.length) {
         console.log(`🔁 EOD final retry: ${missing2.length} tokens...`);
@@ -1852,7 +1849,52 @@ app.post('/api/admin/force-eod-closes', auth, adminOnly, async (req, res) => {
   }
 });
 
-/* ---- Morning 9:00 AM preload (fixes stale cache across days) ---- */
+/* ---- Manual EOD fetch for SPECIFIC date (bypasses trading-day check) ---- */
+app.post('/api/admin/force-eod-closes-date', auth, adminOnly, async (req, res) => {
+  try {
+    const date = req.body?.date || req.query?.date;
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
+    }
+    const onlyMissing = req.body?.onlyMissing !== false && req.query?.onlyMissing !== 'false';
+
+    let tokensToFetch = STOCKS.map(s => String(s.token));
+    if (onlyMissing) {
+      const { rows } = await db.query(
+        `SELECT token FROM strategy_bs_snapshot
+         WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL`,
+        [date]
+      );
+      const saved = new Set(rows.map(r => String(r.token)));
+      tokensToFetch = tokensToFetch.filter(t => !saved.has(t));
+    }
+
+    console.log(`📈 EOD[${date}]: fetching ${tokensToFetch.length} tokens (onlyMissing=${onlyMissing})...`);
+    const t0 = Date.now();
+
+    const data = await getPrevDayLastClosesBatch(tokensToFetch, date, 20);
+    let saved = 0;
+
+    for (const [token, candles] of data) {
+      const closes = candles.map(c => c.close);
+      const ts = candles.map(c => c.ts);
+      try {
+        await db.query(
+          `UPDATE strategy_bs_snapshot SET min_1_close=$1, min_1_ts=$2
+           WHERE date=$3 AND token=$4 AND strategy_id='momentum'`,
+          [closes, ts, date, token]
+        );
+        saved++;
+      } catch {}
+    }
+    console.log(`✅ EOD[${date}]: saved ${saved}/${tokensToFetch.length} in ${Math.round((Date.now() - t0) / 1000)}s`);
+    res.json({ ok: true, date, requested: tokensToFetch.length, saved, elapsedSec: Math.round((Date.now() - t0) / 1000) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---- Morning 9:00 AM preload ---- */
 function msUntilMorning9AM() {
   const ist = getIST();
   const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
@@ -2001,7 +2043,7 @@ async function loadScreenerCacheFromDB() {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.8`);
+  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.9`);
   console.log(`📊 Strategies: Momentum (default) + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);

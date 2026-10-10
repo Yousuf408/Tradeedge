@@ -1,8 +1,9 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v4.2
+   server.js — TradeAlgo Pro backend  |  v4.3
    - Self-collect minute closes from BS ticks
    - Sliding window RSI (prev day + today)
    - Auto pre-market fetch @ 9:13:30
+   - All admin triggers + RSI logic in server.js
    ============================================================ */
 
 import express from 'express';
@@ -287,21 +288,31 @@ async function loadLatestPivotFromDB() {
    ============================================================ */
 const bsCache = new Map();
 const prevClosesCache = new Map();
-const todayCloses = new Map();     // token -> [completed minute closes today, incl. premarket]
-const minuteBuffer = new Map();    // token -> { minuteKey, ts, close }
+const todayCloses = new Map();
+const minuteBuffer = new Map();
 
-function computeRSI(closes14) {
-  if (!Array.isArray(closes14) || closes14.length !== 14) return null;
+/* RSI formula — accepts 13 previous closes + 1 current (TradingView-style signature) */
+function computeRSI(prevCloses, currentClose) {
+  if (!Array.isArray(prevCloses) || prevCloses.length < 13) return null;
+  if (!Number.isFinite(currentClose) || currentClose <= 0) return null;
+
+  const closes = [...prevCloses, currentClose];
   let gains = 0, losses = 0;
-  for (let i = 1; i < closes14.length; i++) {
-    const d = closes14[i] - closes14[i - 1];
+  for (let i = 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
     if (d > 0) gains += d; else losses -= d;
   }
-  const n = closes14.length - 1;
+  const n = closes.length - 1;
   const avgGain = gains / n;
   const avgLoss = losses / n;
   if (avgLoss === 0) return 100;
   return 100 - (100 / (1 + avgGain / avgLoss));
+}
+
+/* Convenience wrapper for 14-array input */
+function computeRSIFromArray(closes14) {
+  if (!Array.isArray(closes14) || closes14.length !== 14) return null;
+  return computeRSI(closes14.slice(0, 13), closes14[13]);
 }
 
 /* Build 14 closes using sliding window: prev day + today */
@@ -317,7 +328,6 @@ function buildCloses14(token) {
   return [...prevSlice, ...todayArr];
 }
 
-/* Update minute buffer; returns flushed previous-minute data if minute changed */
 function updateMinuteBuffer(token, ltp) {
   if (!Number.isFinite(ltp) || ltp <= 0) return null;
   const ist = getIST();
@@ -358,7 +368,6 @@ async function bulkFlushMinuteChanges(changes, date) {
        WHERE s.date = $4 AND s.token = v.token AND s.strategy_id = 'momentum'`,
       [tokens, closes, tss, date]
     );
-    // Mirror to in-memory todayCloses
     for (const c of changes) {
       const key = String(c.token);
       const arr = todayCloses.get(key) || [];
@@ -438,7 +447,6 @@ async function loadTodayClosesFromDB() {
   } catch (e) { console.error('todayCloses load failed:', e.message); }
 }
 
-/* Recompute RSI for all stocks that have 14+ closes in min_1_close */
 async function recomputeAllRSI(date) {
   try {
     const { rows } = await db.query(
@@ -451,7 +459,7 @@ async function recomputeAllRSI(date) {
     for (const r of rows) {
       const closes = r.min_1_close.map(Number);
       const last14 = closes.slice(-14);
-      const rsi = computeRSI(last14);
+      const rsi = computeRSIFromArray(last14);
       if (rsi == null) continue;
       const v = +rsi.toFixed(2);
       try {
@@ -594,7 +602,6 @@ async function flushLtpWrites() {
 process.on('SIGTERM', async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
 process.on('SIGINT',  async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
 
-/* ---- SSE ---- */
 const sseClients = new Set();
 let ssePending = new Map();
 let sseFlushTimer = null;
@@ -763,7 +770,7 @@ function startWebSocketForReadyPhase() {
 
 function stopWebSocketIfNeeded() {
   if (!wsStarted) return;
-  if (shouldStartWS()) return;
+  if (!shouldStartWS()) return;
 
   stopWS();
   wsStarted = false;
@@ -1025,6 +1032,131 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 
 
 /* ============================================================
+   SECTION 7.1 — ADMIN TRIGGERS (moved from admin.js)
+   ============================================================ */
+
+app.post('/api/admin/force-day-hlc', auth, adminOnly, async (req, res) => {
+  try {
+    await fetchDayHLC();
+    const p = getScreenerPhase();
+    const { rows } = await db.query(
+      `SELECT COUNT(*) AS cnt FROM angel_15m_candle WHERE date=$1 AND day_high IS NOT NULL`,
+      [p.date]
+    );
+    res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/force-bs', auth, adminOnly, async (req, res) => {
+  try {
+    await autoFetchBS();
+    const p = getScreenerPhase();
+    const { rows } = await db.query(
+      `SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id=$2 AND buy_qty IS NOT NULL`,
+      [p.date, 'momentum']
+    );
+    res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/fetch-preopen', auth, adminOnly, async (req, res) => {
+  try {
+    const json = await fetchPreopenRaw();
+    const { matched, unmatchedSyms, nseTotal } = parsePreopen(json);
+    const fetchedAt = new Date();
+    const p = getScreenerPhase();
+    const dbErrors = [];
+
+    for (const m of matched) {
+      const existing = bsCache.get(m.token) || {};
+      bsCache.set(m.token, {
+        ...existing,
+        preopenPrice: m.price,
+        preopenAt: fetchedAt
+      });
+
+      if (p.date) {
+        try {
+          await db.query(
+            `UPDATE strategy_bs_snapshot SET preopen_price=$1, preopen_at=$2
+             WHERE date=$3 AND token=$4 AND strategy_id='momentum'`,
+            [m.price, fetchedAt, p.date, m.token]
+          );
+        } catch (e) { dbErrors.push(`${m.sym}: ${e.message}`); }
+      }
+    }
+
+    console.log(`🌅 Preopen fetch: NSE=${nseTotal}, matched=${matched.length}, unmatched=${unmatchedSyms.length}`);
+    if (unmatchedSyms.length) console.log(`🌅 Unmatched (first 20): ${unmatchedSyms.slice(0, 20).join(', ')}`);
+    if (dbErrors.length) console.log(`❌ Preopen DB errors (first 5):`, dbErrors.slice(0, 5));
+
+    res.json({
+      ok: true, date: p.date, nseTotal,
+      matched: matched.length,
+      unmatchedCount: unmatchedSyms.length,
+      unmatchedSample: unmatchedSyms.slice(0, 30),
+      dbErrors: dbErrors.slice(0, 5),
+      fetchedAt
+    });
+  } catch (e) {
+    console.error('Preopen fetch failed:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
+  try {
+    const dateParam = req.body?.date || req.query?.date;
+    let targetDate = dateParam;
+
+    if (!targetDate) {
+      const { rows } = await db.query(
+        `SELECT date::text AS d FROM strategy_bs_snapshot
+         WHERE strategy_id='momentum' AND min_1_close IS NOT NULL
+         ORDER BY date DESC LIMIT 1`
+      );
+      if (!rows.length) return res.json({ ok: false, error: 'No min_1_close data found' });
+      targetDate = rows[0].d;
+    }
+
+    const { rows: dataRows } = await db.query(
+      `SELECT token, sym, min_1_close FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL`,
+      [targetDate]
+    );
+
+    const out = [];
+    for (const r of dataRows) {
+      const closes = r.min_1_close.map(Number);
+      if (closes.length < 14) continue;
+      const last14 = closes.slice(-14);
+      const rsi = computeRSIFromArray(last14);
+      if (rsi == null) continue;
+      const v = +rsi.toFixed(2);
+
+      try {
+        await db.query(
+          `UPDATE strategy_bs_snapshot SET rsi=$1
+           WHERE date=$2 AND token=$3 AND strategy_id='momentum'`,
+          [v, targetDate, r.token]
+        );
+        // Sync in-memory cache
+        const cached = bsCache.get(String(r.token)) || {};
+        cached.rsi = v;
+        bsCache.set(String(r.token), cached);
+      } catch {}
+      out.push({ sym: r.sym, rsi: v });
+    }
+
+    out.sort((a, b) => b.rsi - a.rsi);
+    console.log(`🧪 Compute-RSI: ${out.length} saved for ${targetDate}`);
+    res.json({ ok: true, date: targetDate, count: out.length, top10: out.slice(0, 10), bottom10: out.slice(-10) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+/* ============================================================
    SECTION 8 — DAY H/L/C FETCH (15:16 IST)
    ============================================================ */
 async function fetchDayHLC() {
@@ -1175,7 +1307,6 @@ async function autoFetchPreopen() {
       const existing = bsCache.get(m.token) || {};
       bsCache.set(m.token, { ...existing, preopenPrice: m.price, preopenAt: fetchedAt });
 
-      // Only init todayCloses with premarket if empty
       const key = String(m.token);
       if (!todayCloses.has(key) || todayCloses.get(key).length === 0) {
         todayCloses.set(key, [m.price]);
@@ -1240,11 +1371,10 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
       } else {
         const existing = bsCache.get(String(r.token)) || {};
 
-        // RSI compute — sliding window (today first, then prev day)
         let rsi = existing.rsi ?? null;
         if (rsi == null) {
           const closes14 = buildCloses14(r.token);
-          if (closes14) rsi = computeRSI(closes14);
+          if (closes14) rsi = computeRSIFromArray(closes14);
         }
 
         bsCache.set(String(r.token), {
@@ -1259,7 +1389,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
           rsi
         });
 
-        // Minute self-collect
         const flushed = updateMinuteBuffer(r.token, r.ltp);
         if (flushed) minuteChanges.push({ token: String(r.token), ts: flushed.ts, close: flushed.close });
 
@@ -1282,7 +1411,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
       }
     }
 
-    // Flush minute changes (bulk) + mirror to todayCloses
     if (minuteChanges.length) {
       await bulkFlushMinuteChanges(minuteChanges, p.date);
       if (!silent) console.log(`💾 Minute flush: ${minuteChanges.length} tokens`);
@@ -1466,11 +1594,6 @@ async function loadScreenerCacheFromDB() {
 registerAdminRoutes(app, {
   db, SECRET,
   auth, adminOnly, log,
-  getIST, getPreviousTradingDay, getScreenerPhase,
-  STOCKS, bsCache,
-  fetchDayHLC, autoFetchBS,
-  fetchPreopenRaw, parsePreopen,
-  computeRSI: (prev13, current) => computeRSI([...prev13, current]),
   loadHolidaysFromDB
 });
 
@@ -1480,7 +1603,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v4.2 (self-collect + sliding RSI)`);
+  console.log(`✅ Server on port ${PORT} — v4.3`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 
@@ -1499,7 +1622,6 @@ app.listen(PORT, async () => {
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();
 
-  // Auto-compute RSI for stocks that already have 14+ closes today
   const todayDate = getIST().toISOString().split('T')[0];
   await recomputeAllRSI(todayDate);
 

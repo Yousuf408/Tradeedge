@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v3.7
+   server.js — TradeAlgo Pro backend  |  v3.8
    ============================================================ */
 
 import express from 'express';
@@ -1760,7 +1760,28 @@ app.post('/api/admin/fetch-preopen', auth, adminOnly, async (req, res) => {
   }
 });
 
-/* ---- EOD 3:35 PM — fetch & save prev-day 20 one-min closes ---- */
+/* ---- EOD 3:35 PM — fetch & save prev-day closes with retry ---- */
+async function saveEODClosesForTokens(tokens, date) {
+  const data = await getPrevDayLastClosesBatch(tokens, date, 20);
+  let saved = 0;
+  const savedTokens = new Set();
+
+  for (const [token, candles] of data) {
+    const closes = candles.map(c => c.close);
+    const ts = candles.map(c => c.ts);
+    try {
+      await db.query(
+        `UPDATE strategy_bs_snapshot SET min_1_close=$1, min_1_ts=$2
+         WHERE date=$3 AND token=$4 AND strategy_id='momentum'`,
+        [closes, ts, date, token]
+      );
+      saved++;
+      savedTokens.add(String(token));
+    } catch {}
+  }
+  return { saved, savedTokens };
+}
+
 async function fetchPrevDayClosesEOD() {
   try {
     if (!isTradingDay(getIST())) { console.log('📈 EOD closes: non-trading day, skip'); return; }
@@ -1769,22 +1790,33 @@ async function fetchPrevDayClosesEOD() {
     console.log(`📈 EOD: fetching 20 one-min closes for ${allTokens.length} stocks (${today})...`);
     const t0 = Date.now();
 
-    const data = await getPrevDayLastClosesBatch(allTokens, today, 20);
-    let saved = 0;
+    // Pass 1
+    const pass1 = await saveEODClosesForTokens(allTokens, today);
+    let saved = pass1.saved;
+    const savedSet = new Set(pass1.savedTokens);
 
-    for (const [token, candles] of data) {
-      const closes = candles.map(c => c.close);
-      const ts = candles.map(c => c.ts);
-      try {
-        await db.query(
-          `UPDATE strategy_bs_snapshot SET min_1_close=$1, min_1_ts=$2
-           WHERE date=$3 AND token=$4 AND strategy_id='momentum'`,
-          [closes, ts, today, token]
-        );
-        saved++;
-      } catch {}
+    // Retry missing (pass 2)
+    const missing1 = allTokens.filter(t => !savedSet.has(String(t)));
+    if (missing1.length) {
+      console.log(`🔁 EOD retry: ${missing1.length} missing tokens...`);
+      await new Promise(r => setTimeout(r, 3000));
+      const pass2 = await saveEODClosesForTokens(missing1, today);
+      saved += pass2.saved;
+      for (const t of pass2.savedTokens) savedSet.add(String(t));
+
+      // Retry missing (pass 3) — last chance
+      const missing2 = allTokens.filter(t => !savedSet.has(String(t)));
+      if (missing2.length) {
+        console.log(`🔁 EOD final retry: ${missing2.length} tokens...`);
+        await new Promise(r => setTimeout(r, 5000));
+        const pass3 = await saveEODClosesForTokens(missing2, today);
+        saved += pass3.saved;
+        for (const t of pass3.savedTokens) savedSet.add(String(t));
+      }
     }
-    console.log(`✅ EOD closes saved: ${saved}/${allTokens.length} in ${Math.round((Date.now() - t0) / 1000)}s`);
+
+    const stillMissing = allTokens.length - savedSet.size;
+    console.log(`✅ EOD closes saved: ${savedSet.size}/${allTokens.length} in ${Math.round((Date.now() - t0) / 1000)}s (missing: ${stillMissing})`);
   } catch (e) { console.error('EOD closes failed:', e.message); }
 }
 
@@ -1820,18 +1852,49 @@ app.post('/api/admin/force-eod-closes', auth, adminOnly, async (req, res) => {
   }
 });
 
-/* ---- Compute RSI from min_1_close array (today) ---- */
+/* ---- Morning 9:00 AM preload (fixes stale cache across days) ---- */
+function msUntilMorning9AM() {
+  const ist = getIST();
+  const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
+  const target = 9 * 3600;
+  let diff = target - secs;
+  if (diff <= 0) diff += 86400;
+  return diff * 1000;
+}
+
+function scheduleMorningPreload() {
+  const ms = msUntilMorning9AM();
+  console.log(`⏰ Next morning preload in ${Math.round(ms / 60000)} min`);
+  setTimeout(async () => {
+    await loadPrevClosesFromDB();
+    scheduleMorningPreload();
+  }, ms);
+}
+
+/* ---- Compute RSI from min_1_close array (auto-detect latest date) ---- */
 app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
   try {
-    const today = getIST().toISOString().split('T')[0];
-    const { rows } = await db.query(
+    const dateParam = req.body?.date || req.query?.date;
+    let targetDate = dateParam;
+
+    if (!targetDate) {
+      const { rows } = await db.query(
+        `SELECT date::text AS d FROM strategy_bs_snapshot
+         WHERE strategy_id='momentum' AND min_1_close IS NOT NULL
+         ORDER BY date DESC LIMIT 1`
+      );
+      if (!rows.length) return res.json({ ok: false, error: 'No min_1_close data found' });
+      targetDate = rows[0].d;
+    }
+
+    const { rows: dataRows } = await db.query(
       `SELECT token, sym, min_1_close FROM strategy_bs_snapshot
        WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL`,
-      [today]
+      [targetDate]
     );
 
     const out = [];
-    for (const r of rows) {
+    for (const r of dataRows) {
       const closes = r.min_1_close.map(Number);
       if (closes.length < 14) continue;
       const prev13 = closes.slice(-14, -1);
@@ -1844,7 +1907,7 @@ app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
         await db.query(
           `UPDATE strategy_bs_snapshot SET rsi=$1
            WHERE date=$2 AND token=$3 AND strategy_id='momentum'`,
-          [v, today, r.token]
+          [v, targetDate, r.token]
         );
       } catch {}
 
@@ -1852,8 +1915,8 @@ app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
     }
 
     out.sort((a, b) => b.rsi - a.rsi);
-    console.log(`🧪 Compute-RSI: ${out.length} saved`);
-    res.json({ ok: true, date: today, count: out.length, top10: out.slice(0, 10), bottom10: out.slice(-10) });
+    console.log(`🧪 Compute-RSI: ${out.length} saved for ${targetDate}`);
+    res.json({ ok: true, date: targetDate, count: out.length, top10: out.slice(0, 10), bottom10: out.slice(-10) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1938,13 +2001,13 @@ async function loadScreenerCacheFromDB() {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.7`);
+  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v3.8`);
   console.log(`📊 Strategies: Momentum (default) + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
   console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);
   console.log(`🔌 WS window: 09:14:55 – 15:30:00 IST`);
   console.log(`💹 BS interval: 09:15:00 – 15:30:00 IST (every 30s)`);
-  console.log(`🌅 RSI: EOD 15:35 fetch + morning preload`);
+  console.log(`🌅 RSI: EOD 15:35 fetch + morning 9:00 preload`);
 
   try {
     await loginREST();
@@ -2027,7 +2090,8 @@ app.listen(PORT, async () => {
   scheduleQuoteAutoFetch();
   scheduleBSAutoFetch();
   scheduleEODFetch();
+  scheduleMorningPreload();
 
   console.log('ℹ️  Ready — Momentum (default) + Advance ORB');
-  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15:00 (30s) | Quote@9:30:10 | HLC@15:16 | EOD-RSI@15:35');
+  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15:00 (30s) | Quote@9:30:10 | HLC@15:16 | EOD-RSI@15:35 | Preload@9:00');
 });

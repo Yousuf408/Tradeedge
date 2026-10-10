@@ -16,8 +16,7 @@ export function registerAdminRoutes(app, deps) {
     STOCKS, bsCache,
     fetchDayHLC, autoFetchBS,
     fetchPreopenRaw, parsePreopen,
-    fetchPrevDayClosesEOD, computeRSI,
-    getPrevDayLastClosesBatch,
+    computeRSI,
     loadHolidaysFromDB
   } = deps;
 
@@ -512,56 +511,6 @@ export function registerAdminRoutes(app, deps) {
       console.error('Preopen fetch failed:', e);
       res.status(500).json({ error: e.message });
     }
-  });
-
-  /* Force EOD Closes (today) */
-  app.post('/api/admin/force-eod-closes', auth, adminOnly, async (req, res) => {
-    try {
-      await fetchPrevDayClosesEOD();
-      res.json({ ok: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-  });
-
-  /* Force EOD Closes (specific date) */
-  app.post('/api/admin/force-eod-closes-date', auth, adminOnly, async (req, res) => {
-    try {
-      const date = req.body?.date || req.query?.date;
-      if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-        return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
-      }
-      const onlyMissing = req.body?.onlyMissing !== false && req.query?.onlyMissing !== 'false';
-
-      let tokensToFetch = STOCKS.map(s => String(s.token));
-      if (onlyMissing) {
-        const { rows } = await db.query(
-          `SELECT token FROM strategy_bs_snapshot
-           WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL`,
-          [date]
-        );
-        const saved = new Set(rows.map(r => String(r.token)));
-        tokensToFetch = tokensToFetch.filter(t => !saved.has(t));
-      }
-
-      console.log(`📈 EOD[${date}]: fetching ${tokensToFetch.length} tokens (onlyMissing=${onlyMissing})...`);
-      const t0 = Date.now();
-      const data = await getPrevDayLastClosesBatch(tokensToFetch, date, 20);
-      let saved = 0;
-
-      for (const [token, candles] of data) {
-        const closes = candles.map(c => c.close);
-        const ts = candles.map(c => c.ts);
-        try {
-          await db.query(
-            `UPDATE strategy_bs_snapshot SET min_1_close=$1, min_1_ts=$2
-             WHERE date=$3 AND token=$4 AND strategy_id='momentum'`,
-            [closes, ts, date, token]
-          );
-          saved++;
-        } catch {}
-      }
-      console.log(`✅ EOD[${date}]: saved ${saved}/${tokensToFetch.length} in ${Math.round((Date.now() - t0) / 1000)}s`);
-      res.json({ ok: true, date, requested: tokensToFetch.length, saved, elapsedSec: Math.round((Date.now() - t0) / 1000) });
-    } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
   /* Compute RSI (auto-detect latest date) */

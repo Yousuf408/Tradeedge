@@ -514,9 +514,8 @@ export async function getPrevDayLastCloses(token, prevDate, count = 20) {
       .map(bar => ({ ts: bar[0], close: +bar[4] }))
       .filter(x => Number.isFinite(x.close) && x.close > 0);
 
-    if (candles.length < count) return null;
-
-    const result = candles.slice(-count);
+        if (candles.length < 14) return null;
+    const result = candles.slice(-Math.min(count, candles.length));
     candleCache.set(key, result);
     return result;
   } catch (e) {

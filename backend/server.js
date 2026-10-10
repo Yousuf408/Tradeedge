@@ -215,7 +215,7 @@ const prevCloseCache = new Map();
 async function loadPrevCloseFromDB() {
   try {
     const activeTokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
-    const today = getIST().toISOString().split('T')[0];
+    const latestDate = getScreenerPhase().date;   // Friday on weekend, today on weekday
     const { rows } = await db.query(
       `SELECT DISTINCT ON (token) token, day_close
        FROM angel_15m_candle
@@ -223,7 +223,7 @@ async function loadPrevCloseFromDB() {
          AND token = ANY($1)
          AND date < $2
        ORDER BY token, date DESC`,
-      [activeTokens, today]
+      [activeTokens, latestDate]
     );
     for (const r of rows) prevCloseCache.set(String(r.token), +r.day_close);
     console.log(`💾 Loaded prevClose for ${rows.length} tokens`);

@@ -1,5 +1,6 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v4.0 (modular)
+   server.js — TradeAlgo Pro backend  |  v4.1
+   Self-collect minute closes from BS ticks (no historical API)
    ============================================================ */
 
 import express from 'express';
@@ -15,12 +16,10 @@ import { dirname, join } from 'path';
 import {
   loginPlatform as loginREST,
   getCandlesForTokens,
-  getPrevDayLastClosesBatch,
   getCachedCandles,
   setCachedCandle,
   setCachedLTP,
   getCachedLTP,
-  fetchAllClosingPrices,
   getSessionStatus as getSessionStatusREST,
   getFeedToken as getFeedTokenREST
 } from './brokers/angelone/Angel_REST.js';
@@ -224,7 +223,7 @@ async function loadPrevCloseFromDB() {
       [activeTokens, today]
     );
     for (const r of rows) prevCloseCache.set(String(r.token), +r.day_close);
-    console.log(`💾 Loaded prevClose for ${rows.length} tokens (from day_close < ${today})`);
+    console.log(`💾 Loaded prevClose for ${rows.length} tokens`);
   } catch (e) { console.error('prevClose load failed:', e.message); }
 }
 
@@ -252,13 +251,13 @@ async function loadQuoteCacheFromDB() {
         fetchedAt: r.quote_fetched_at
       });
     }
-    console.log(`📊 Loaded quote H/L for ${rows.length} tokens from DB`);
+    console.log(`📊 Loaded quote H/L for ${rows.length} tokens`);
   } catch (e) { console.error('quoteCache load failed:', e.message); }
 }
 
 
 /* ============================================================
-   SECTION 4.2b — PIVOT CACHE
+   SECTION 4.3 — PIVOT CACHE
    ============================================================ */
 const pivotCache = new Map();
 
@@ -276,16 +275,17 @@ async function loadLatestPivotFromDB() {
       [activeTokens, today]
     );
     for (const r of rows) pivotCache.set(String(r.token), +r.pivot);
-    console.log(`📐 Loaded pivot for ${rows.length} tokens (from dates < ${today})`);
+    console.log(`📐 Loaded pivot for ${rows.length} tokens`);
   } catch (e) { console.error('pivot load failed:', e.message); }
 }
 
 
 /* ============================================================
-   SECTION 4.3 — BUY/SELL CACHE  (strategy_bs_snapshot)
+   SECTION 4.4 — BUY/SELL CACHE + RSI + MINUTE SELF-COLLECT
    ============================================================ */
 const bsCache = new Map();
 const prevClosesCache = new Map();
+const minuteBuffer = new Map();  // token -> { minuteKey, ts, close }
 
 function computeRSI(prevCloses, currentClose) {
   if (!Array.isArray(prevCloses) || prevCloses.length < 13) return null;
@@ -302,6 +302,50 @@ function computeRSI(prevCloses, currentClose) {
   const avgLoss = losses / n;
   if (avgLoss === 0) return 100;
   return 100 - (100 / (1 + avgGain / avgLoss));
+}
+
+/* Update minute buffer; returns flushed previous-minute data if minute changed */
+function updateMinuteBuffer(token, ltp) {
+  if (!Number.isFinite(ltp) || ltp <= 0) return null;
+  const ist = getIST();
+  const hh = String(ist.getUTCHours()).padStart(2, '0');
+  const mm = String(ist.getUTCMinutes()).padStart(2, '0');
+  const minuteKey = `${hh}:${mm}`;
+
+  ist.setUTCSeconds(0, 0);
+  const ts = ist.toISOString().replace('Z', '+05:30');
+
+  const key = String(token);
+  const existing = minuteBuffer.get(key);
+  if (!existing) {
+    minuteBuffer.set(key, { minuteKey, ts, close: ltp });
+    return null;
+  }
+  if (existing.minuteKey === minuteKey) {
+    existing.close = ltp;   // keep last tick of current minute
+    return null;
+  }
+  const flushed = { ts: existing.ts, close: existing.close };
+  minuteBuffer.set(key, { minuteKey, ts, close: ltp });
+  return flushed;
+}
+
+async function bulkFlushMinuteChanges(changes, date) {
+  if (!changes.length) return;
+  const tokens = changes.map(c => String(c.token));
+  const closes = changes.map(c => Number(c.close));
+  const tss    = changes.map(c => c.ts);
+  try {
+    await db.query(
+      `UPDATE strategy_bs_snapshot AS s
+       SET min_1_close = COALESCE(s.min_1_close, ARRAY[]::numeric[]) || v.close_val,
+           min_1_ts    = COALESCE(s.min_1_ts,    ARRAY[]::timestamptz[]) || v.ts_val
+       FROM unnest($1::text[], $2::numeric[], $3::timestamptz[])
+         AS v(token, close_val, ts_val)
+       WHERE s.date = $4 AND s.token = v.token AND s.strategy_id = 'momentum'`,
+      [tokens, closes, tss, date]
+    );
+  } catch (e) { console.error('Minute bulk flush failed:', e.message); }
 }
 
 async function loadBSCacheFromDB() {
@@ -328,7 +372,7 @@ async function loadBSCacheFromDB() {
         rsi: r.rsi != null ? +r.rsi : null
       });
     }
-    console.log(`💹 Loaded buy/sell for ${rows.length} tokens from DB`);
+    console.log(`💹 Loaded buy/sell for ${rows.length} tokens`);
   } catch (e) { console.error('BS cache load failed:', e.message); }
 }
 
@@ -356,17 +400,15 @@ async function loadPrevClosesFromDB() {
 
 
 /* ============================================================
-   SECTION 4.4 — NSE PRE-OPEN FETCHER
+   SECTION 4.5 — NSE PRE-OPEN FETCHER
    ============================================================ */
-const NSE_BASE = 'https://www.nseindia.com';
-const NSE_PREOPEN_PAGE = NSE_BASE + '/market-data/pre-open-market-cm-and-emerge-market';
-const NSE_PREOPEN_API  = NSE_BASE + '/api/market-data-pre-open?key=ALL';
+const NSE_PREOPEN_PAGE = 'https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market';
+const NSE_PREOPEN_API  = 'https://www.nseindia.com/api/market-data-pre-open?key=ALL';
 const NSE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 async function fetchPreopenRaw() {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
-
   try {
     const homeRes = await fetch(NSE_PREOPEN_PAGE, {
       headers: {
@@ -380,9 +422,8 @@ async function fetchPreopenRaw() {
     let cookieStr = '';
     try {
       const setCookies = homeRes.headers.getSetCookie ? homeRes.headers.getSetCookie() : [];
-      if (setCookies.length) {
-        cookieStr = setCookies.map(c => c.split(';')[0]).join('; ');
-      } else {
+      if (setCookies.length) cookieStr = setCookies.map(c => c.split(';')[0]).join('; ');
+      else {
         const raw = homeRes.headers.get('set-cookie') || '';
         cookieStr = raw.split(/,(?=[^;]+=[^;]+)/).map(c => c.split(';')[0]).join('; ');
       }
@@ -487,6 +528,12 @@ const sseClients = new Set();
 let ssePending = new Map();
 let sseFlushTimer = null;
 
+function sseSend(payload) {
+  for (const c of sseClients) {
+    try { c.res.write(payload); } catch { sseClients.delete(c); }
+  }
+}
+
 function broadcastLTP(token, ltp) {
   if (!sseClients.size) return;
   ssePending.set(String(token), ltp);
@@ -496,15 +543,13 @@ function broadcastLTP(token, ltp) {
     if (!ssePending.size) return;
     const payload = `data: ${JSON.stringify({ type: 'ltp', ticks: Object.fromEntries(ssePending) })}\n\n`;
     ssePending.clear();
-    for (const c of sseClients) {
-      try { c.res.write(payload); } catch { sseClients.delete(c); }
-    }
+    sseSend(payload);
   }, 100);
 }
 
 function broadcastORB(token, state) {
   if (!sseClients.size) return;
-  const payload = `data: ${JSON.stringify({
+  sseSend(`data: ${JSON.stringify({
     type: 'orb', token,
     state: {
       lowBroken: state.lowBroken, pullbackConfirmed: state.pullbackConfirmed, entrySignal: state.entrySignal,
@@ -512,26 +557,20 @@ function broadcastORB(token, state) {
       firstLowBreakPrice: state.firstLowBreakPrice, firstPullbackPrice: state.firstPullbackPrice, firstEntryPrice: state.firstEntryPrice,
       targetHit: state.targetHit, targetHitAt: state.targetHitAt, slHit: state.slHit, slHitAt: state.slHitAt
     }
-  })}\n\n`;
-  for (const c of sseClients) {
-    try { c.res.write(payload); } catch { sseClients.delete(c); }
-  }
+  })}\n\n`);
 }
 
 function broadcastQuote(fetchedAt) {
   if (!sseClients.size) return;
-  const payload = `data: ${JSON.stringify({
+  sseSend(`data: ${JSON.stringify({
     type: 'quote', fetchedAt,
     quotes: Object.fromEntries([...quoteCache.entries()].map(([t, v]) => [t, { high: v.high, low: v.low, fetchedAt: v.fetchedAt }]))
-  })}\n\n`;
-  for (const c of sseClients) {
-    try { c.res.write(payload); } catch { sseClients.delete(c); }
-  }
+  })}\n\n`);
 }
 
 function broadcastBS(fetchedAt) {
   if (!sseClients.size) return;
-  const payload = `data: ${JSON.stringify({
+  sseSend(`data: ${JSON.stringify({
     type: 'bs', fetchedAt,
     bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => [t, {
       buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
@@ -540,10 +579,7 @@ function broadcastBS(fetchedAt) {
       dayOpen: v.dayOpen ?? null,
       rsi: v.rsi ?? null
     }]))
-  })}\n\n`;
-  for (const c of sseClients) {
-    try { c.res.write(payload); } catch { sseClients.delete(c); }
-  }
+  })}\n\n`);
 }
 
 function handleTick(token, ltp) {
@@ -694,7 +730,7 @@ async function log(actor, action, details = '', level = 'info') {
 
 
 /* ============================================================
-   SECTION 13 — SCREENER ROUTES (public)
+   SECTION 7 — SCREENER ROUTES (public)
    ============================================================ */
 app.get('/api/stocks', auth, (req, res) => res.json(STOCKS));
 
@@ -918,25 +954,21 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
 
 
 /* ============================================================
-   SECTION 14 — DAY H/L/C FETCH (15:16 IST)
+   SECTION 8 — DAY H/L/C FETCH (15:16 IST)
    ============================================================ */
 async function fetchDayHLC() {
   try {
     const p = getScreenerPhase();
-    if (!p.date) { console.log('❌ [HLC] No date — returning'); return; }
+    if (!p.date) { console.log('❌ [HLC] No date'); return; }
     const allTokens = STOCKS.map(s => String(s.token));
-    console.log(`🔔 [HLC] Fetching day H/L/C for ${allTokens.length} stocks (date=${p.date})...`);
+    console.log(`🔔 [HLC] Fetching day H/L/C for ${allTokens.length} stocks...`);
 
     const savedTokens = new Set();
     const t0 = Date.now();
     const dbErrors = [];
 
-    let quotes = await fetchQuotesForTokens(allTokens);
-    console.log(`🔍 [HLC] Angel returned ${quotes?.length || 0} quotes`);
-    if (!quotes || !quotes.length) {
-      console.log('❌ [HLC] Angel returned 0 quotes — check login / rate limit');
-      return;
-    }
+    const quotes = await fetchQuotesForTokens(allTokens);
+    if (!quotes || !quotes.length) { console.log('❌ [HLC] Angel returned 0'); return; }
 
     for (const q of quotes) {
       if (!q || !q.token) continue;
@@ -966,9 +998,7 @@ async function fetchDayHLC() {
       const missing = allTokens.filter(t => !savedTokens.has(t));
       if (!missing.length) break;
 
-      console.log(`🔁 [HLC] Retry ${attempt}: ${missing.length} missing tokens...`);
       await new Promise(r => setTimeout(r, 1500));
-
       const retry = await fetchQuotesForTokens(missing);
       for (const q of retry) {
         if (!q || !q.token) continue;
@@ -996,22 +1026,20 @@ async function fetchDayHLC() {
     }
 
     if (dbErrors.length) console.log(`❌ [HLC] DB errors (first 5):`, dbErrors.slice(0, 5));
-
     await flushLtpWrites();
-    const totalTime = Math.round((Date.now() - t0) / 1000);
-    console.log(`✅ Day H/L/C: ${savedTokens.size}/${allTokens.length} saved in ${totalTime}s`);
+    console.log(`✅ Day H/L/C: ${savedTokens.size}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
   } catch (e) { console.error('❌ Day H/L/C fetch failed:', e); }
 }
 
 
 /* ============================================================
-   SECTION 14.1 — AUTO QUOTE FETCH @ 09:30:10 IST
+   SECTION 9 — AUTO QUOTE FETCH @ 09:30:10 IST
    ============================================================ */
 async function autoFetchQuote() {
   try {
-    if (!isTradingDay(getIST())) { console.log('📊 Auto-quote: non-trading day, skip'); return; }
+    if (!isTradingDay(getIST())) { console.log('📊 Auto-quote: non-trading day'); return; }
     const p = getScreenerPhase();
-    if (!p.date) { console.log('📊 Auto-quote: no trading date, skip'); return; }
+    if (!p.date) return;
 
     const allTokens = STOCKS.map(s => String(s.token));
     console.log(`📊 Auto-quote: fetching ${allTokens.length} tokens...`);
@@ -1020,7 +1048,7 @@ async function autoFetchQuote() {
     const savedTokens = new Set();
     const fetchedAt = new Date();
 
-    let quotes = await fetchQuotesForTokens(allTokens);
+    const quotes = await fetchQuotesForTokens(allTokens);
     for (const q of quotes) {
       if (!q || !q.token) continue;
       if (!Number.isFinite(q.high) || !Number.isFinite(q.low) || q.high <= 0 || q.low <= 0) continue;
@@ -1053,71 +1081,37 @@ async function autoFetchQuote() {
       savedTokens.add(token);
     }
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const missing = allTokens.filter(t => !savedTokens.has(t));
-      if (!missing.length) break;
-
-      console.log(`🔁 Auto-quote retry ${attempt}: ${missing.length} missing tokens...`);
-      await new Promise(r => setTimeout(r, 1500));
-
-      const retry = await fetchQuotesForTokens(missing);
-      for (const q of retry) {
-        if (!q || !q.token) continue;
-        if (!Number.isFinite(q.high) || !Number.isFinite(q.low) || q.high <= 0 || q.low <= 0) continue;
-
-        const token = String(q.token);
-        quoteCache.set(token, { high: q.high, low: q.low, fetchedAt });
-
-        db.query(
-          `INSERT INTO angel_15m_candle (date, token, sym, q15_open, q15_high, q15_low, q15_close, quote_fetched_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-           ON CONFLICT (date, token) DO UPDATE SET
-             sym=EXCLUDED.sym,
-             q15_open=EXCLUDED.q15_open, q15_high=EXCLUDED.q15_high,
-             q15_low=EXCLUDED.q15_low, q15_close=EXCLUDED.q15_close,
-             quote_fetched_at=EXCLUDED.quote_fetched_at, updated_at=NOW()`,
-          [p.date, token, SYM_BY_TOKEN[token] || '?', q.open || q.low, q.high, q.low, q.ltp || q.high, fetchedAt]
-        ).catch(() => {});
-
-        setCachedCandle(token, p.date, [0, q.open || q.low, q.high, q.low, q.ltp || q.high, 0]);
-        if (q.ltp) setCachedLTP(token, q.ltp);
-
-        savedTokens.add(token);
-      }
-    }
-
     broadcastQuote(fetchedAt);
     console.log(`✅ Auto-quote: ${savedTokens.size}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
-  } catch (e) {
-    console.error('Auto-quote failed:', e.message);
-  }
+  } catch (e) { console.error('Auto-quote failed:', e.message); }
 }
 
 
 /* ============================================================
-   SECTION 14.2 — BS FETCH (9:15:00 + 30s interval)
+   SECTION 10 — BS FETCH (9:15:00 + 30s interval) + MINUTE SELF-COLLECT
    ============================================================ */
 let bsIntervalTimer = null;
 
 async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
   try {
-    if (!isTradingDay(getIST())) { if (!silent) console.log('💹 Auto-BS: non-trading day, skip'); return; }
+    if (!isTradingDay(getIST())) { if (!silent) console.log('💹 Auto-BS: non-trading day'); return; }
     const p = getScreenerPhase();
-    if (!p.date) { if (!silent) console.log('❌ [BS] No date — returning'); return; }
+    if (!p.date) { if (!silent) console.log('❌ [BS] No date'); return; }
 
     const allTokens = STOCKS.map(s => String(s.token));
-    if (!silent) console.log(`💹 Auto-BS (${volumeOnly ? 'volume-only' : 'full'}): fetching ${allTokens.length} tokens...`);
+    if (!silent) console.log(`💹 Auto-BS: fetching ${allTokens.length} tokens...`);
     const t0 = Date.now();
 
     const fetchedAt = new Date();
     const results = await fetchBuySellForTokens(allTokens);
-    if (!silent) console.log(`🔍 [BS] Angel returned ${results?.length || 0} results`);
     if (!results || !results.length) {
-      if (!silent) console.log('❌ [BS] Angel returned 0 — check login / rate limit');
+      if (!silent) console.log('❌ [BS] Angel returned 0');
       return;
     }
 
     const dbErrors = [];
+    const minuteChanges = [];
+
     for (const r of results) {
       if (volumeOnly) {
         if (!Number.isFinite(r.volume) || r.volume <= 0) continue;
@@ -1134,6 +1128,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
       } else {
         const existing = bsCache.get(String(r.token)) || {};
 
+        // RSI compute on first tick of the day
         let rsi = existing.rsi ?? null;
         if (rsi == null && Number.isFinite(r.ltp)) {
           const prev = prevClosesCache.get(String(r.token));
@@ -1154,6 +1149,11 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
           preopenAt: existing.preopenAt ?? null,
           rsi
         });
+
+        // Minute self-collect
+        const flushed = updateMinuteBuffer(r.token, r.ltp);
+        if (flushed) minuteChanges.push({ token: String(r.token), ts: flushed.ts, close: flushed.close });
+
         try {
           await db.query(
             `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, day_open, rsi, fetched_at)
@@ -1173,17 +1173,19 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
       }
     }
 
+    // Flush minute changes to DB (bulk)
+    if (minuteChanges.length) {
+      await bulkFlushMinuteChanges(minuteChanges, p.date);
+      if (!silent) console.log(`💾 Minute flush: ${minuteChanges.length} tokens`);
+    }
+
     if (dbErrors.length) console.log(`❌ [BS] DB errors (first 5):`, dbErrors.slice(0, 5));
 
     broadcastBS(fetchedAt);
-    if (!silent) console.log(`✅ Auto-BS (${volumeOnly ? 'volume' : 'full'}): ${results.length}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
+    if (!silent) console.log(`✅ Auto-BS: ${results.length}/${allTokens.length} in ${Math.round((Date.now() - t0) / 1000)}s`);
 
-    if (!volumeOnly) {
-      await assignDailyRank(p.date);
-    }
-  } catch (e) {
-    console.error('Auto-BS failed:', e.message);
-  }
+    if (!volumeOnly) await assignDailyRank(p.date);
+  } catch (e) { console.error('Auto-BS failed:', e.message); }
 }
 
 async function assignDailyRank(date) {
@@ -1193,142 +1195,73 @@ async function assignDailyRank(date) {
        WHERE date=$1 AND strategy_id=$2 AND rank_no IS NOT NULL`,
       [date, 'momentum']
     );
-    if (+chk[0].cnt > 0) {
-      console.log(`#️⃣ Rank already assigned for ${date} (${chk[0].cnt} tokens) — skipped`);
-      return;
-    }
+    if (+chk[0].cnt > 0) { console.log(`#️⃣ Rank already assigned for ${date}`); return; }
 
     const rows = STOCKS.map(s => {
       const token = String(s.token);
       const ltp = getCachedLTP(token);
       const prevClose = prevCloseCache.get(token) || null;
-      const changePct = (ltp && prevClose && prevClose > 0)
-        ? ((ltp - prevClose) / prevClose) * 100
-        : -Infinity;
+      const changePct = (ltp && prevClose && prevClose > 0) ? ((ltp - prevClose) / prevClose) * 100 : -Infinity;
       return { token, changePct };
     }).sort((a, b) => b.changePct - a.changePct);
 
-    let assigned = 0;
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
       const rank = i + 1;
       db.query(
-        `UPDATE strategy_bs_snapshot SET rank_no=$1
-         WHERE date=$2 AND token=$3 AND strategy_id=$4`,
+        `UPDATE strategy_bs_snapshot SET rank_no=$1 WHERE date=$2 AND token=$3 AND strategy_id=$4`,
         [rank, date, r.token, 'momentum']
       ).catch(() => {});
-
       const cached = bsCache.get(r.token) || {};
       cached.rank = rank;
       bsCache.set(r.token, cached);
-      assigned++;
     }
-    console.log(`#️⃣ Assigned rank 1..${assigned} for ${date}`);
-  } catch (e) {
-    console.error('Rank assign failed:', e.message);
+    console.log(`#️⃣ Assigned rank 1..${rows.length} for ${date}`);
+  } catch (e) { console.error('Rank assign failed:', e.message); }
+}
+
+async function flushFinalMinuteBuffer() {
+  const p = getScreenerPhase();
+  if (!p.date) return;
+  const changes = [];
+  for (const [token, buf] of minuteBuffer.entries()) {
+    if (buf && Number.isFinite(buf.close)) changes.push({ token, ts: buf.ts, close: buf.close });
+  }
+  minuteBuffer.clear();
+  if (changes.length) {
+    await bulkFlushMinuteChanges(changes, p.date);
+    console.log(`💾 Final minute flush: ${changes.length} tokens`);
   }
 }
 
 
 /* ============================================================
-   SECTION 14.3 — EOD CLOSES FETCH (15:35 IST)
+   SECTION 11 — SCHEDULERS
    ============================================================ */
-async function saveEODClosesForTokens(tokens, date) {
-  const data = await getPrevDayLastClosesBatch(tokens, date, 20);
-  let saved = 0;
-  const savedTokens = new Set();
-
-  for (const [token, candles] of data) {
-    const closes = candles.map(c => c.close);
-    const ts = candles.map(c => c.ts);
-    try {
-      await db.query(
-        `UPDATE strategy_bs_snapshot SET min_1_close=$1, min_1_ts=$2
-         WHERE date=$3 AND token=$4 AND strategy_id='momentum'`,
-        [closes, ts, date, token]
-      );
-      saved++;
-      savedTokens.add(String(token));
-    } catch {}
-  }
-  return { saved, savedTokens };
-}
-
-async function fetchPrevDayClosesEOD() {
-  try {
-    if (!isTradingDay(getIST())) { console.log('📈 EOD closes: non-trading day, skip'); return; }
-    const today = getIST().toISOString().split('T')[0];
-    const allTokens = STOCKS.map(s => String(s.token));
-    console.log(`📈 EOD: fetching 20 one-min closes for ${allTokens.length} stocks (${today})...`);
-    const t0 = Date.now();
-
-    const pass1 = await saveEODClosesForTokens(allTokens, today);
-    let saved = pass1.saved;
-    const savedSet = new Set(pass1.savedTokens);
-
-    const missing1 = allTokens.filter(t => !savedSet.has(String(t)));
-    if (missing1.length) {
-      console.log(`🔁 EOD retry: ${missing1.length} missing tokens...`);
-      await new Promise(r => setTimeout(r, 3000));
-      const pass2 = await saveEODClosesForTokens(missing1, today);
-      saved += pass2.saved;
-      for (const t of pass2.savedTokens) savedSet.add(String(t));
-
-      const missing2 = allTokens.filter(t => !savedSet.has(String(t)));
-      if (missing2.length) {
-        console.log(`🔁 EOD final retry: ${missing2.length} tokens...`);
-        await new Promise(r => setTimeout(r, 5000));
-        const pass3 = await saveEODClosesForTokens(missing2, today);
-        saved += pass3.saved;
-        for (const t of pass3.savedTokens) savedSet.add(String(t));
-      }
-    }
-
-    const stillMissing = allTokens.length - savedSet.size;
-    console.log(`✅ EOD closes saved: ${savedSet.size}/${allTokens.length} in ${Math.round((Date.now() - t0) / 1000)}s (missing: ${stillMissing})`);
-  } catch (e) { console.error('EOD closes failed:', e.message); }
-}
-
-
-/* ============================================================
-   SECTION 14.4 — SCHEDULERS
-   ============================================================ */
-function msUntilNext1516IST() {
+function msUntil(targetHour, targetMin, dayOffsetIfPassed = 1) {
   const ist = getIST();
-  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  const target = new Date(ist);
-  target.setUTCHours(0, 0, 0, 0);
-  target.setUTCMinutes(916);
-  if (mins >= 916) target.setUTCDate(target.getUTCDate() + 1);
-  const dow = target.getUTCDay();
-  if (dow === 6) target.setUTCDate(target.getUTCDate() + 2);
-  if (dow === 0) target.setUTCDate(target.getUTCDate() + 1);
-  return target.getTime() - ist.getTime();
-}
-
-function scheduleDailyFetch() {
-  const ms = msUntilNext1516IST();
-  console.log(`⏰ Next daily H/L/C fetch in ${Math.round(ms / 60000)} min`);
-  setTimeout(async () => { await fetchDayHLC(); scheduleDailyFetch(); }, ms);
-}
-
-function msUntilNext93010IST() {
-  const ist = getIST();
-  const daySecs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
-  const target = 9 * 3600 + 30 * 60 + 10;
-  let diffSecs = target - daySecs;
-  if (diffSecs <= 0) diffSecs += 86400;
+  const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
+  const target = targetHour * 3600 + targetMin * 60;
+  let diff = target - secs;
+  if (diff <= 0) diff += dayOffsetIfPassed * 86400;
+  // Skip weekends for trading-day schedulers
   for (let i = 0; i < 15; i++) {
-    const candidate = new Date(ist.getTime() + diffSecs * 1000);
+    const candidate = new Date(ist.getTime() + diff * 1000);
     if (isTradingDay(candidate)) break;
-    diffSecs += 86400;
+    diff += 86400;
   }
-  return diffSecs * 1000;
+  return diff * 1000;
+}
+
+function scheduleDailyHLC() {
+  const ms = msUntil(15, 16);
+  console.log(`⏰ Next HLC fetch in ${Math.round(ms / 60000)} min`);
+  setTimeout(async () => { await fetchDayHLC(); scheduleDailyHLC(); }, ms);
 }
 
 function scheduleQuoteAutoFetch() {
-  const ms = msUntilNext93010IST();
-  console.log(`⏰ Next auto-quote fetch in ${Math.round(ms / 60000)} min`);
+  const ms = msUntil(9, 30, 1) + 10000; // 9:30:10
+  console.log(`⏰ Next auto-quote in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => { await autoFetchQuote(); scheduleQuoteAutoFetch(); }, ms);
 }
 
@@ -1342,35 +1275,17 @@ function startBSInterval() {
     if (secs >= end) {
       clearInterval(bsIntervalTimer);
       bsIntervalTimer = null;
-      console.log('💹 BS 30s interval stopped (end of day)');
+      console.log('💹 BS interval stopped (EOD)');
       return;
     }
-    try {
-      await autoFetchBS({ silent: true });
-    } catch (e) {
-      console.error('BS interval error:', e.message);
-    }
+    try { await autoFetchBS({ silent: true }); } catch (e) { console.error('BS interval error:', e.message); }
   }, 30000);
   console.log('💹 BS 30s interval started');
 }
 
-function msUntilNext915IST() {
-  const ist = getIST();
-  const daySecs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
-  const target = 9 * 3600 + 15 * 60;
-  let diffSecs = target - daySecs;
-  if (diffSecs <= 0) diffSecs += 86400;
-  for (let i = 0; i < 15; i++) {
-    const candidate = new Date(ist.getTime() + diffSecs * 1000);
-    if (isTradingDay(candidate)) break;
-    diffSecs += 86400;
-  }
-  return diffSecs * 1000;
-}
-
 function scheduleBSAutoFetch() {
-  const ms = msUntilNext915IST();
-  console.log(`⏰ Next auto-BS fetch in ${Math.round(ms / 60000)} min`);
+  const ms = msUntil(9, 15);
+  console.log(`⏰ Next auto-BS in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
     await autoFetchBS();
     startBSInterval();
@@ -1378,40 +1293,17 @@ function scheduleBSAutoFetch() {
   }, ms);
 }
 
-function msUntilEOD() {
-  const ist = getIST();
-  const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
-  const target = 15 * 3600 + 35 * 60;
-  let diff = target - secs;
-  if (diff <= 0) diff += 86400;
-  for (let i = 0; i < 15; i++) {
-    const candidate = new Date(ist.getTime() + diff * 1000);
-    if (isTradingDay(candidate)) break;
-    diff += 86400;
-  }
-  return diff * 1000;
-}
-
-function scheduleEODFetch() {
-  const ms = msUntilEOD();
-  console.log(`⏰ Next EOD closes fetch in ${Math.round(ms / 60000)} min`);
+function scheduleFinalFlush() {
+  const ms = msUntil(15, 31);
+  console.log(`⏰ Next final minute flush in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
-    await fetchPrevDayClosesEOD();
-    scheduleEODFetch();
+    await flushFinalMinuteBuffer();
+    scheduleFinalFlush();
   }, ms);
 }
 
-function msUntilMorning9AM() {
-  const ist = getIST();
-  const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
-  const target = 9 * 3600;
-  let diff = target - secs;
-  if (diff <= 0) diff += 86400;
-  return diff * 1000;
-}
-
 function scheduleMorningPreload() {
-  const ms = msUntilMorning9AM();
+  const ms = msUntil(9, 0);
   console.log(`⏰ Next morning preload in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
     await loadPrevClosesFromDB();
@@ -1421,7 +1313,7 @@ function scheduleMorningPreload() {
 
 
 /* ============================================================
-   SECTION 15 — DB CACHE LOADER
+   SECTION 12 — DB CACHE LOADER
    ============================================================ */
 async function loadScreenerCacheFromDB() {
   try {
@@ -1458,43 +1350,27 @@ registerAdminRoutes(app, {
   STOCKS, bsCache,
   fetchDayHLC, autoFetchBS,
   fetchPreopenRaw, parsePreopen,
-  fetchPrevDayClosesEOD, computeRSI,
-  getPrevDayLastClosesBatch,
+  computeRSI,
   loadHolidaysFromDB
 });
 
 
 /* ============================================================
-   SECTION 16 — START
+   SECTION 13 — START
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} (REST + Quote + BS) — v4.0`);
+  console.log(`✅ Server on port ${PORT} — v4.1 (self-collect)`);
   console.log(`📊 Strategies: Momentum (default) + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
-  console.log(`📈 NIFTY 50 token: ${NIFTY50_TOKEN}`);
-  console.log(`🔌 WS window: 09:14:55 – 15:30:00 IST`);
   console.log(`💹 BS interval: 09:15:00 – 15:30:00 IST (every 30s)`);
-  console.log(`🌅 RSI: EOD 15:35 fetch + morning 9:00 preload`);
+  console.log(`🌅 RSI: self-collect from BS ticks + morning 9:00 preload`);
 
-  try {
-    await loginREST();
-    console.log('✅ [REST] session started');
-  } catch (e) { console.error('⚠️  [REST] login failed:', e.message); }
-
+  try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }
   await new Promise(r => setTimeout(r, 4000));
-
-  try {
-    await loginQuote();
-    console.log('✅ [Quote] session started');
-  } catch (e) { console.error('⚠️  [Quote] login failed:', e.message); }
-
+  try { await loginQuote(); console.log('✅ [Quote] session'); } catch (e) { console.error('⚠️ [Quote] login failed:', e.message); }
   await new Promise(r => setTimeout(r, 4000));
-
-  try {
-    await loginBS();
-    console.log('✅ [BS] session started');
-  } catch (e) { console.error('⚠️  [BS] login failed:', e.message); }
+  try { await loginBS(); console.log('✅ [BS] session'); } catch (e) { console.error('⚠️ [BS] login failed:', e.message); }
 
   await loadHolidaysFromDB();
   await loadScreenerCacheFromDB();
@@ -1525,10 +1401,8 @@ app.listen(PORT, async () => {
         if (+rows[0].cnt === 0) {
           console.log('🔔 Late startup — running auto-quote catch-up');
           autoFetchQuote().catch(e => console.error('catch-up failed:', e.message));
-        } else {
-          console.log(`✅ Today's quote already fetched (${rows[0].cnt} tokens)`);
         }
-      } catch (e) { console.error('catch-up check failed:', e.message); }
+      } catch (e) { console.error('catch-up failed:', e.message); }
     }
   }
 
@@ -1545,21 +1419,18 @@ app.listen(PORT, async () => {
         if (+rows[0].cnt === 0) {
           console.log('🔔 Late startup — running auto-BS catch-up');
           await autoFetchBS();
-        } else {
-          console.log(`✅ Today's BS already fetched (${rows[0].cnt} tokens)`);
         }
-      } catch (e) { console.error('BS catch-up check failed:', e.message); }
+      } catch (e) { console.error('BS catch-up failed:', e.message); }
     }
     console.log('🔔 Late startup — starting BS 30s interval');
     startBSInterval();
   }
 
-  scheduleDailyFetch();
+  scheduleDailyHLC();
   scheduleQuoteAutoFetch();
   scheduleBSAutoFetch();
-  scheduleEODFetch();
+  scheduleFinalFlush();
   scheduleMorningPreload();
 
-  console.log('ℹ️  Ready — Momentum (default) + Advance ORB');
-  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15:00 (30s) | Quote@9:30:10 | HLC@15:16 | EOD-RSI@15:35 | Preload@9:00');
+  console.log('ℹ️  Ready. Schedule: WS@9:14:55 | BS@9:15 (30s) | Quote@9:30 | HLC@15:16 | FinalFlush@15:31 | Preload@9:00');
 });

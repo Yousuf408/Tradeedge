@@ -355,10 +355,28 @@ function updateMinuteBuffer(token, ltp) {
 
 async function bulkFlushMinuteChanges(changes, date) {
   if (!changes.length) return;
-  const tokens = changes.map(c => String(c.token));
-  const closes = changes.map(c => Number(c.close));
-  const tss    = changes.map(c => c.ts);
+
+  // Split: har change 1-min me jaayega, aur agar minute 5-min boundary pe hai to 5-min me bhi
+  const tokens1 = [], closes1 = [], tss1 = [];
+  const tokens5 = [], closes5 = [], tss5 = [];
+
+  for (const c of changes) {
+    const close = Number(c.close);
+    tokens1.push(String(c.token));
+    closes1.push(close);
+    tss1.push(c.ts);
+
+    // 5-min boundary check — minute 4, 9, 14, 19, 24, 29, ... (matlab 5th minute of window)
+    const minute = new Date(c.ts).getUTCMinutes();
+    if (minute % 5 === 4) {
+      tokens5.push(String(c.token));
+      closes5.push(close);
+      tss5.push(c.ts);
+    }
+  }
+
   try {
+    // Always push to min_1
     await db.query(
       `UPDATE strategy_bs_snapshot AS s
        SET min_1_close = COALESCE(s.min_1_close, ARRAY[]::numeric[]) || v.close_val,
@@ -366,8 +384,23 @@ async function bulkFlushMinuteChanges(changes, date) {
        FROM unnest($1::text[], $2::numeric[], $3::timestamptz[])
          AS v(token, close_val, ts_val)
        WHERE s.date = $4 AND s.token = v.token AND s.strategy_id = 'momentum'`,
-      [tokens, closes, tss, date]
+      [tokens1, closes1, tss1, date]
     );
+
+    // Push to min_5 only on 5-min boundary
+    if (tokens5.length) {
+      await db.query(
+        `UPDATE strategy_bs_snapshot AS s
+         SET min_5_close = COALESCE(s.min_5_close, ARRAY[]::numeric[]) || v.close_val,
+             min_5_ts    = COALESCE(s.min_5_ts,    ARRAY[]::timestamptz[]) || v.ts_val
+         FROM unnest($1::text[], $2::numeric[], $3::timestamptz[])
+           AS v(token, close_val, ts_val)
+         WHERE s.date = $4 AND s.token = v.token AND s.strategy_id = 'momentum'`,
+        [tokens5, closes5, tss5, date]
+      );
+    }
+
+    // Mirror to in-memory todayCloses
     for (const c of changes) {
       const key = String(c.token);
       const arr = todayCloses.get(key) || [];

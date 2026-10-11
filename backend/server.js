@@ -1551,6 +1551,7 @@ function scheduleMorningPreload() {
   const ms = msUntil(9, 0);
   console.log(`⏰ Next morning preload in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
+    await loadPrevCloseFromDB();       // ← YE ADD
     await loadPrevClosesFromDB();
     await loadTodayClosesFromDB();
     const today = getIST().toISOString().split('T')[0];

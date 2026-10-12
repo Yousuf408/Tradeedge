@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v4.6
+   server.js — TradeAlgo Pro backend  |  v4.7
    - Self-collect minute closes from BS ticks
    - Sliding window RSI (prev day + today)
    - Auto pre-market fetch @ 9:13:30
@@ -18,6 +18,9 @@
    - Din ka pehla candle bhi RSI paata hai (prev days ke seed se)
    - Live: har minute-end RSI update; startup + admin trigger se backfill
    - Rollback: env RSI_SOURCE=bs
+   v4.7 changes:
+   - RSI formula = WILDER RMA(14) (TradingView/AngelOne-style), poori stored series pe
+   - Purana simple-average formula sirf RSI_SOURCE=bs rollback me bacha hai
    ============================================================ */
 
 import express from 'express';
@@ -336,6 +339,34 @@ function computeRSIFromArray(closes14) {
   return computeRSI(closes14.slice(0, 13), closes14[13]);
 }
 
+/* ============================================================
+   v4.7 — WILDER RMA RSI (TradingView / AngelOne-style)
+   - Poori stored series pe recursive smoothing:
+       avg = (pichla_avg × 13 + naya_change) / 14
+   - Seed = pehle 14 changes ka simple average
+   - 400+ candles pe seed error ~0 (weight (13/14)^n se girta hai)
+   - <15 closes = null (RSI possible nahi)
+   ============================================================ */
+function computeRSIWilder(closes) {
+  if (!Array.isArray(closes) || closes.length < 15) return null;
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 1; i <= 14; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) avgGain += d; else avgLoss -= d;
+  }
+  avgGain /= 14;
+  avgLoss /= 14;
+  for (let i = 15; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    const gain = d > 0 ? d : 0;
+    const loss = d < 0 ? -d : 0;
+    avgGain = (avgGain * 13 + gain) / 14;
+    avgLoss = (avgLoss * 13 + loss) / 14;
+  }
+  if (avgLoss === 0) return 100;
+  return 100 - (100 / (1 + avgGain / avgLoss));
+}
+
 /* Build 14 closes using sliding window: prev day + today */
 function buildCloses14(token) {
   const todayArr = todayCloses.get(String(token)) || [];
@@ -594,8 +625,7 @@ async function updateRSIFromWS(date) {
     const todayArr = wsTodayCloses.get(token) || [];
     const prevArr = wsPrevCloses.get(token) || [];
     const series = todayArr.length ? prevArr.concat(todayArr) : prevArr;
-    if (series.length < 14) continue;
-    const rsi = computeRSIFromArray(series.slice(-14));
+    const rsi = computeRSIWilder(series);   // v4.7: Wilder RMA, poori series pe
     if (rsi == null) continue;
     const v = +rsi.toFixed(2);
     toks.push(token); rsis.push(v);
@@ -642,8 +672,7 @@ async function recomputeRSIFromWS(date) {
     for (const r of rows) {
       const dayArr = r.ws_1min_close.map(Number);
       const series = (prevMap.get(String(r.token)) || []).concat(dayArr);
-      if (series.length < 14) continue;
-      const rsi = computeRSIFromArray(series.slice(-14));
+      const rsi = computeRSIWilder(series);   // v4.7: Wilder RMA
       if (rsi == null) continue;
       toks.push(String(r.token)); rsis.push(+rsi.toFixed(2));
     }
@@ -1916,7 +1945,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v4.6`);
+  console.log(`✅ Server on port ${PORT} — v4.7`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 

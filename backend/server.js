@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v4.8
+   server.js — TradeAlgo Pro backend  |  v4.9
    - Self-collect minute closes from BS ticks
    - Sliding window RSI (prev day + today)
    - Auto pre-market fetch @ 9:13:30
@@ -25,6 +25,10 @@
    - REAL-TIME live RSI: har WS tick pe banti candle ka RSI (O(1) incremental calc)
    - DB me wahi minute-end closed-candle RSI (series clean), live value sirf display/cache
    - Working logic untouched: DB writes, sampler, BS, ORB sab jaise the waise
+   v4.9 changes:
+   - CHIP LIST: 9:15 pe lock (rank 1-10 pool, gap up <=3%, first-tick RSI >=70)
+   - Poore din FIXED; existing table ka chip_rank column (koi nayi table nahi)
+   - Restart-safe (startup pe DB se load), SSE 'chip' event + /api/screener/chips
    ============================================================ */
 
 import express from 'express';
@@ -319,6 +323,10 @@ const RSI_SOURCE = process.env.RSI_SOURCE || 'ws';
 const wsPrevCloses = new Map();    // pichle stored days ke ws_1min_close (date order, concatenated)
 const wsTodayCloses = new Map();   // aaj ke ws_1min_close (in-memory mirror)
 const rsiState = new Map();        // v4.8: token -> {avgGain, avgLoss, prevClose} = closed series ka running Wilder state
+
+// v4.9: CHIP LIST — 9:15 pe lock, poore din fixed (rank 1-10 pool, <=3% change, RSI>=70)
+const chipList = new Map();        // token -> { token, sym, rank, changePct, rsiAtLock }
+let chipDate = null;               // jis trading day ki chip list lock hai
 
 /* RSI formula — accepts 13 previous closes + 1 current (TradingView-style signature) */
 function computeRSI(prevCloses, currentClose) {
@@ -1009,6 +1017,11 @@ function broadcastBS(fetchedAt) {
   })}\n\n`);
 }
 
+function broadcastChip() {   // v4.9: chip list lock hote hi ek baar
+  if (!sseClients.size) return;
+  sseSend(`data: ${JSON.stringify({ type: 'chip', chips: [...chipList.values()] })}\n\n`);
+}
+
 function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
   if (extra && Number.isFinite(extra.volume)) lastWsVolume.set(String(token), extra.volume);   // v4.5: WS cumulative volume
@@ -1232,6 +1245,20 @@ app.get('/api/screener/data', auth, (req, res) => {
     cachedTokens, quotes,
     results: allCached, stocks: passingStocks
   });
+});
+
+/* v4.9: CHIP LIST endpoint — din bhar wahi locked list */
+app.get('/api/screener/chips', auth, (req, res) => {
+  const chips = [...chipList.values()].map(c => ({
+    token: c.token,
+    sym: c.sym,
+    rank: c.rank,
+    gapPct: c.gapPct,
+    rsiAtLock: c.rsiAtLock,
+    rsiLive: bsCache.get(c.token)?.rsi ?? null,
+    ltp: getCachedLTP(c.token) ?? null
+  }));
+  res.json({ ok: true, date: chipDate, locked: chipDate != null, chips });
 });
 
 app.get('/api/screener/stream', (req, res) => {
@@ -1802,6 +1829,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
     if (!silent) console.log(`✅ Auto-BS: ${results.length}/${allTokens.length} in ${Math.round((Date.now() - t0) / 1000)}s`);
 
     if (!volumeOnly) await assignDailyRank(p.date);
+    if (!volumeOnly) await buildChipList(p.date);   // v4.9: rank ke turant baad chip lock
   } catch (e) { console.error('Auto-BS failed:', e.message); }
   finally { bsRunning = false; }   // v4.4: overlap guard release
 }
@@ -1836,6 +1864,101 @@ async function assignDailyRank(date) {
     }
     console.log(`#️⃣ Assigned rank 1..${rows.length} for ${date}`);
   } catch (e) { console.error('Rank assign failed:', e.message); }
+}
+
+/* ============================================================
+   SECTION 11.1 — CHIP LIST (v4.9): 9:15 pe lock, poore din FIXED
+   - Pool: rank_no 1-10 (change% order, existing ranked list)
+   - Filters: GAP UP <= 3% (day_open vs prevClose)  AND  live RSI >= 70 (first ticks)
+   - Store: existing table ka chip_rank column (koi nayi table nahi)
+   - Restart-safe: startup pe DB se wapas load hoti hai
+   - Candle ka wait nahi — pehle BS fetch + ticks ke turant baad lock
+   ============================================================ */
+async function buildChipList(date) {
+  try {
+    if (chipDate === date) return;   // aaj ke liye already locked (khali list bhi = locked)
+
+    const { rows: chk } = await db.query(
+      `SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND chip_rank IS NOT NULL`,
+      [date]
+    );
+    if (+chk[0].cnt > 0) { await loadChipListFromDB(date); return; }   // restart ke baad wahi list
+
+    const pool = STOCKS.map(s => String(s.token))
+      .map(t => ({ token: t, rank: bsCache.get(t)?.rank ?? null }))
+      .filter(x => x.rank != null && x.rank >= 1 && x.rank <= 10)
+      .sort((a, b) => a.rank - b.rank);
+    if (!pool.length) return;   // rank abhi assign nahi hua
+
+    // Pehle ticks/RSI ready hone do (9:20 ke baad force lock)
+    const readyCount = pool.filter(x =>
+      (bsCache.get(x.token)?.rsi ?? null) != null && getCachedLTP(x.token)
+    ).length;
+    const ist = getIST();
+    const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+    const forceLock = mins >= 9 * 60 + 20;
+    if (!forceLock && readyCount < Math.min(5, pool.length)) {
+      console.log(`🔒 Chip list: first ticks ka wait (ready ${readyCount}/${pool.length})`);
+      return;
+    }
+
+    const chips = [];
+    for (const x of pool) {
+      const dayOpen = bsCache.get(x.token)?.dayOpen ?? null;
+      const prevClose = prevCloseCache.get(x.token) || null;
+      if (!dayOpen || !prevClose || prevClose <= 0) continue;
+      const gapPct = ((dayOpen - prevClose) / prevClose) * 100;   // GAP UP % (day_open vs prevClose)
+      const rsi = bsCache.get(x.token)?.rsi ?? null;
+      if (gapPct > 3) continue;                  // filter: gap up <= 3%
+      if (rsi == null || rsi < 70) continue;     // filter: first-tick RSI >= 70
+      chips.push({
+        token: x.token,
+        sym: SYM_BY_TOKEN[x.token] || '?',
+        rank: x.rank,
+        gapPct: +gapPct.toFixed(2),
+        rsiAtLock: rsi
+      });
+    }
+
+    for (const c of chips) {
+      db.query(
+        `UPDATE strategy_bs_snapshot SET chip_rank=$1, chip_rsi=$2
+         WHERE date=$3 AND token=$4 AND strategy_id='momentum'`,
+        [c.rank, c.rsiAtLock, date, c.token]
+      ).catch(() => {});
+      chipList.set(c.token, c);
+    }
+    chipDate = date;
+    console.log(`🔒 Chip list LOCKED for ${date}: ${chips.length} stocks → ${chips.map(c => `${c.sym}(#${c.rank},gap+${c.gapPct}%,RSI${c.rsiAtLock})`).join(', ') || 'none'}`);
+    broadcastChip();
+  } catch (e) { console.error('Chip list build failed:', e.message); }
+}
+
+async function loadChipListFromDB(date) {
+  try {
+    if (!date) return;
+    const { rows } = await db.query(
+      `SELECT token, sym, chip_rank, chip_rsi, day_open FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND chip_rank IS NOT NULL
+       ORDER BY chip_rank`,
+      [date]
+    );
+    chipList.clear();
+    for (const r of rows) {
+      const prevClose = prevCloseCache.get(String(r.token)) || null;
+      const gapPct = (r.day_open && prevClose > 0) ? +(((+r.day_open - prevClose) / prevClose) * 100).toFixed(2) : null;
+      chipList.set(String(r.token), {
+        token: String(r.token),
+        sym: r.sym,
+        rank: +r.chip_rank,
+        gapPct,
+        rsiAtLock: r.chip_rsi != null ? +r.chip_rsi : null   // v4.9: first-tick RSI, poore din fixed
+      });
+    }
+    chipDate = date;
+    if (rows.length) console.log(`🔒 Chip list DB se loaded: ${rows.length} stocks for ${date}`);
+  } catch (e) { console.error('Chip list load failed:', e.message); }
 }
 
 async function flushFinalMinuteBuffer() {
@@ -1988,7 +2111,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v4.8`);
+  console.log(`✅ Server on port ${PORT} — v4.9`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 
@@ -2006,6 +2129,7 @@ app.listen(PORT, async () => {
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();
+  await loadChipListFromDB(getIST().toISOString().split('T')[0]);   // v4.9: restart-safe chip list
   await loadPrevWSClosesFromDB();    // v4.6: multi-day WS seed
   await loadTodayWSClosesFromDB();   // v4.6: aaj ke WS closes
   seedRSIStateFromMemory();          // v4.8: live tick RSI state ready

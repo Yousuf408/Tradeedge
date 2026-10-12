@@ -2259,6 +2259,8 @@ app.listen(PORT, async () => {
   scheduleFinalFlush();
   scheduleMorningPreload();
   startMarginRefreshLoop();   // v5.0
+    /* v5.0: force margin refresh on every startup (works any time of day) */
+  maybeRefreshMargins('angelone', { force: true }).catch(() => {});
 
   console.log('ℹ️  Schedule: WS@9:14:55 | Preopen@9:13:30 | BS@9:15 (30s) | Quote@9:30 | HLC@15:16 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');
 });

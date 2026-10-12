@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v3.8
+   SCREENER.JS  — v3.9
    + Default strategy = Momentum
    + Fixed # column (rank from server)
    + Gap % filter for Top Gainers/Losers
@@ -13,6 +13,8 @@
    + v3.8: RSI CHIP BAR — 9:15 pe server-locked list
            (rank 1-10 pool · gap up <=3% · first-tick RSI >=70)
            poore din STATIC, SSE 'chip' event + /api/screener/chips se
+   + v3.9: 🔒 RSI Chips filter chip added next to Top 15 Losers
+           (click → table shows ONLY locked chips, empty-state message)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -243,7 +245,8 @@ function renderChips() {
     el.innerHTML =
       chip('all', 'All') +
       chip('top_gainers', '🚀 Top 15 Gainers') +
-      chip('top_losers', '📉 Top 15 Losers');
+      chip('top_losers', '📉 Top 15 Losers') +
+      chip('rsi_chips', '🔒 RSI Chips');
     el.style.display = '';
     renderChipBar();      // v3.8
     return;
@@ -1072,6 +1075,7 @@ function startSSE() {
       else if (msg.type === 'chip' && msg.chips) {   // v3.8: chip list lock event
         SCREENER_CHIPS = msg.chips;
         renderChipBar();
+        renderScreenerTable();
       }
     } catch {}
   };
@@ -1159,14 +1163,26 @@ function renderScreenerTable() {
         })
         .sort((a, b) => computeChangePct(a.token) - computeChangePct(b.token))
         .slice(0, 15);
+    } else if (SCREENER_MOMENTUM_FILTER === 'rsi_chips') {   // v3.9
+      const chipTokens = new Set(SCREENER_CHIPS.map(c => String(c.token)));
+      filtered = filtered.filter(s => chipTokens.has(String(s.token)));
+      const rankBy = {};
+      SCREENER_CHIPS.forEach(c => { rankBy[String(c.token)] = c.rank; });
+      filtered.sort((a, b) => (rankBy[String(a.token)] ?? 999) - (rankBy[String(b.token)] ?? 999));
     }
 
     const sorted = sortStocks(filtered);
 
     if (!sorted.length) {
-      body.innerHTML = `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
-        Loading stocks...<br>Please wait a few seconds.
-      </td></tr>`;
+      const isEmptyChipFilter = SCREENER_MOMENTUM_FILTER === 'rsi_chips';
+      body.innerHTML = isEmptyChipFilter
+        ? `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
+            🔒 No RSI chips locked today.<br>
+            <span style="font-size:11px">Chips lock at 9:15 (top-10 rank · gap ≤3% · RSI ≥70)</span>
+          </td></tr>`
+        : `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
+            Loading stocks...<br>Please wait a few seconds.
+          </td></tr>`;
       if (count) count.textContent = `0 / ${SCREENER_ALL_STOCKS.length}`;
       renderChips();
       return;

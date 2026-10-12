@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v4.9
+   server.js — TradeAlgo Pro backend  |  v5.0
    - Self-collect minute closes from BS ticks
    - Sliding window RSI (prev day + today)
    - Auto pre-market fetch @ 9:13:30
@@ -29,6 +29,12 @@
    - CHIP LIST: 9:15 pe lock (rank 1-10 pool, gap up <=3%, first-tick RSI >=70)
    - Poore din FIXED; existing table ka chip_rank column (koi nayi table nahi)
    - Restart-safe (startup pe DB se load), SSE 'chip' event + /api/screener/chips
+   v5.0 changes:
+   - BROKER MARGIN/LEVERAGE: real per-stock leverage from Angel margin API
+   - MAXQTY = floor(CAPITAL × leverage / LTP) — replaces risk-based formula
+   - Broker-level cache (shared across users), 30-min refresh
+   - New admin trigger: POST /api/admin/refresh-margins
+   - /api/screener/ltp + SSE bs ab leverage + marginPerShare bhi bhejte hain
    ============================================================ */
 
 import express from 'express';
@@ -68,6 +74,18 @@ import {
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 
 import { registerAdminRoutes } from './admin.js';
+
+/* v5.0: broker margin service */
+import {
+  initMarginService,
+  refreshMargins,
+  getLeverage,
+  getMarginInfo,
+  computeMaxQty,
+  shouldRefresh,
+  loadCachedMargins,
+  getMarginStatus
+} from './brokers/margin.js';
 
 dotenv.config();
 
@@ -240,8 +258,6 @@ const prevCloseCache = new Map();
 async function loadPrevCloseFromDB() {
   try {
     const activeTokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
-    // v4.4 fix: IST "today" use karo. Phase date 9:15 se pehle = previous trading day
-    // hota tha, jisse change% last-to-last working day se ban jata tha.
     const latestDate = getIST().toISOString().split('T')[0];
     const { rows } = await db.query(
       `SELECT DISTINCT ON (token) token, day_close
@@ -318,17 +334,14 @@ const prevClosesCache = new Map();
 const todayCloses = new Map();
 const minuteBuffer = new Map();
 
-// v4.6: RSI source switch — 'ws' (default) = WS 1-min continuous series, 'bs' = purana min_1
 const RSI_SOURCE = process.env.RSI_SOURCE || 'ws';
-const wsPrevCloses = new Map();    // pichle stored days ke ws_1min_close (date order, concatenated)
-const wsTodayCloses = new Map();   // aaj ke ws_1min_close (in-memory mirror)
-const rsiState = new Map();        // v4.8: token -> {avgGain, avgLoss, prevClose} = closed series ka running Wilder state
+const wsPrevCloses = new Map();
+const wsTodayCloses = new Map();
+const rsiState = new Map();
 
-// v4.9: CHIP LIST — 9:15 pe lock, poore din fixed (rank 1-10 pool, <=3% change, RSI>=70)
-const chipList = new Map();        // token -> { token, sym, rank, changePct, rsiAtLock }
-let chipDate = null;               // jis trading day ki chip list lock hai
+const chipList = new Map();
+let chipDate = null;
 
-/* RSI formula — accepts 13 previous closes + 1 current (TradingView-style signature) */
 function computeRSI(prevCloses, currentClose) {
   if (!Array.isArray(prevCloses) || prevCloses.length < 13) return null;
   if (!Number.isFinite(currentClose) || currentClose <= 0) return null;
@@ -346,20 +359,11 @@ function computeRSI(prevCloses, currentClose) {
   return 100 - (100 / (1 + avgGain / avgLoss));
 }
 
-/* Convenience wrapper for 14-array input */
 function computeRSIFromArray(closes14) {
   if (!Array.isArray(closes14) || closes14.length !== 14) return null;
   return computeRSI(closes14.slice(0, 13), closes14[13]);
 }
 
-/* ============================================================
-   v4.7 — WILDER RMA RSI (TradingView / AngelOne-style)
-   - Poori stored series pe recursive smoothing:
-       avg = (pichla_avg × 13 + naya_change) / 14
-   - Seed = pehle 14 changes ka simple average
-   - 400+ candles pe seed error ~0 (weight (13/14)^n se girta hai)
-   - <15 closes = null (RSI possible nahi)
-   ============================================================ */
 function computeRSIWilderState(closes) {
   if (!Array.isArray(closes) || closes.length < 15) return null;
   let avgGain = 0, avgLoss = 0;
@@ -385,7 +389,6 @@ function computeRSIWilder(closes) {
   return st ? st.rsi : null;
 }
 
-/* Build 14 closes using sliding window: prev day + today */
 function buildCloses14(token) {
   const todayArr = todayCloses.get(String(token)) || [];
   if (todayArr.length >= 14) return todayArr.slice(-14);
@@ -426,7 +429,6 @@ function updateMinuteBuffer(token, ltp) {
 async function bulkFlushMinuteChanges(changes, date) {
   if (!changes.length) return;
 
-  // Split: har change 1-min me jaayega, aur agar minute 5-min boundary pe hai to 5-min me bhi
   const tokens1 = [], closes1 = [], tss1 = [];
   const tokens5 = [], closes5 = [], tss5 = [];
 
@@ -436,7 +438,6 @@ async function bulkFlushMinuteChanges(changes, date) {
     closes1.push(close);
     tss1.push(c.ts);
 
-    // 5-min boundary check — minute 4, 9, 14, 19, 24, 29, ... (matlab 5th minute of window)
     const minute = new Date(c.ts).getUTCMinutes();
     if (minute % 5 === 4) {
       tokens5.push(String(c.token));
@@ -446,7 +447,6 @@ async function bulkFlushMinuteChanges(changes, date) {
   }
 
   try {
-    // Always push to min_1
     await db.query(
       `UPDATE strategy_bs_snapshot AS s
        SET min_1_close = COALESCE(s.min_1_close, ARRAY[]::numeric[]) || v.close_val,
@@ -457,7 +457,6 @@ async function bulkFlushMinuteChanges(changes, date) {
       [tokens1, closes1, tss1, date]
     );
 
-    // Push to min_5 only on 5-min boundary
     if (tokens5.length) {
       await db.query(
         `UPDATE strategy_bs_snapshot AS s
@@ -470,7 +469,6 @@ async function bulkFlushMinuteChanges(changes, date) {
       );
     }
 
-    // Mirror to in-memory todayCloses
     for (const c of changes) {
       const key = String(c.token);
       const arr = todayCloses.get(key) || [];
@@ -551,7 +549,7 @@ async function loadTodayClosesFromDB() {
 }
 
 async function recomputeAllRSI(date) {
-  if (RSI_SOURCE === 'ws') return recomputeRSIFromWS(date);   // v4.6: WS series path
+  if (RSI_SOURCE === 'ws') return recomputeRSIFromWS(date);
   try {
     const { rows } = await db.query(
       `SELECT token, min_1_close FROM strategy_bs_snapshot
@@ -581,14 +579,6 @@ async function recomputeAllRSI(date) {
   } catch (e) { console.error('recomputeAllRSI failed:', e.message); }
 }
 
-/* ============================================================
-   SECTION 4.4.1 — WS-BASED RSI (v4.6, multi-day continuous series)
-   - Series = pichle saare stored days ke ws_1min_close (date order)
-     + aaj ke ws_1min_close current candle tak
-   - RSI = is series ke last 14 closes
-   - Din ka pehla candle bhi RSI paata hai (prev days ke seed se)
-   - Rollback: env RSI_SOURCE=bs
-   ============================================================ */
 async function loadPrevWSClosesFromDB() {
   try {
     const activeTokens = STOCKS.map(s => String(s.token));
@@ -635,7 +625,6 @@ async function loadTodayWSClosesFromDB() {
   } catch (e) { console.error('WS today closes load failed:', e.message); }
 }
 
-/* v4.8: live tick RSI ke liye running Wilder state seed karo (stored series se) */
 function seedRSIStateFromMemory() {
   let n = 0;
   for (const s of STOCKS) {
@@ -650,7 +639,6 @@ function seedRSIStateFromMemory() {
   console.log(`🧮 RSI live state seeded: ${n} tokens`);
 }
 
-/* Live: har minute-end pe WS series se RSI → rsi column + bsCache */
 async function updateRSIFromWS(date) {
   const toks = [], rsis = [];
   for (const s of STOCKS) {
@@ -658,9 +646,9 @@ async function updateRSIFromWS(date) {
     const todayArr = wsTodayCloses.get(token) || [];
     const prevArr = wsPrevCloses.get(token) || [];
     const series = todayArr.length ? prevArr.concat(todayArr) : prevArr;
-    const st = computeRSIWilderState(series);   // v4.7/4.8: Wilder RMA + running state
+    const st = computeRSIWilderState(series);
     if (!st) continue;
-    rsiState.set(token, st);   // v4.8: minute-end pe state refresh (drift-free, DB value wahi jo pehle tha)
+    rsiState.set(token, st);
     const v = +st.rsi.toFixed(2);
     toks.push(token); rsis.push(v);
     const cached = bsCache.get(token) || {};
@@ -678,7 +666,6 @@ async function updateRSIFromWS(date) {
   } catch (e) { console.error('WS RSI update failed:', e.message); }
 }
 
-/* Backfill / admin: kisi bhi date ka RSI multi-day WS series se */
 async function recomputeRSIFromWS(date) {
   try {
     const activeTokens = STOCKS.map(s => String(s.token));
@@ -706,7 +693,7 @@ async function recomputeRSIFromWS(date) {
     for (const r of rows) {
       const dayArr = r.ws_1min_close.map(Number);
       const series = (prevMap.get(String(r.token)) || []).concat(dayArr);
-      const rsi = computeRSIWilder(series);   // v4.7: Wilder RMA
+      const rsi = computeRSIWilder(series);
       if (rsi == null) continue;
       toks.push(String(r.token)); rsis.push(+rsi.toFixed(2));
     }
@@ -810,17 +797,12 @@ function parsePreopen(json) {
 
 
 /* ============================================================
-   SECTION 4.6 — WS MINUTE-CLOSE SHADOW SAMPLER (close only)  [v4.4]
-   - Har naye minute ke turant baad (0-1 sec me) previous minute ka
-     aakhri LTP = us minute ka close, shadow columns me likhte hain
-   - Source: WS tick (getCachedLTP). Tick 75s+ purana ho to BS 30s ltp fallback
-   - Likhta SIRF naye columns me: ws_1min_close/ts, ws_5min_close/ts
-   - Purana min_1/min_5 pipeline bilkul untouched (compare ke liye)
+   SECTION 4.6 — WS MINUTE-CLOSE SHADOW SAMPLER
    ============================================================ */
 const lastLtpAt = new Map();
-const lastWsVolume = new Map();   // v4.5: WS tick ka cumulative volume (exchange se)
-const prevCumVol = new Map();     // v4.5: pichle minute-end ka cumulative volume
-const minVolRing = new Map();     // v4.5: pichle 5 one-min volumes (5-min volume ke liye)
+const lastWsVolume = new Map();
+const prevCumVol = new Map();
+const minVolRing = new Map();
 let wsMinuteKey = null;
 
 async function flushWSMinuteClose(prevKey, prevTs, date) {
@@ -828,12 +810,10 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
   for (const s of STOCKS) {
     const token = String(s.token);
     const age = Date.now() - (lastLtpAt.get(token) || 0);
-    let close = age < 75000 ? getCachedLTP(token) : null;   // WS fresh hai to WS
-    if (close == null) close = bsCache.get(token)?.ltp ?? null;  // warna BS fallback
+    let close = age < 75000 ? getCachedLTP(token) : null;
+    if (close == null) close = bsCache.get(token)?.ltp ?? null;
     if (!Number.isFinite(close) || close <= 0) continue;
 
-    // v4.5: 1-min volume = abhi ka cumulative − pichle minute-end ka cumulative
-    // (WS na ho to BS ka cumulative volume fallback)
     const cum = lastWsVolume.get(token) ?? bsCache.get(token)?.volume ?? null;
     const prev = prevCumVol.get(token) ?? null;
     let mv = 0;
@@ -844,7 +824,6 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     closes.push(close);
     minVols.push(mv);
 
-    // v4.5: 1-min volume ko ring buffer me rakho (max 5) — 5-min volume isi se banega
     const ring = minVolRing.get(token) || [];
     ring.push(mv);
     if (ring.length > 5) ring.shift();
@@ -852,7 +831,7 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
   }
   if (!tokens.length) return;
 
-  const isFive = Number(prevKey.slice(3)) % 5 === 4;   // minute 4,9,14... = 5-min window ka close
+  const isFive = Number(prevKey.slice(3)) % 5 === 4;
   const tss = tokens.map(() => prevTs);
   const vols5 = isFive ? tokens.map(t => (minVolRing.get(t) || []).reduce((a, b) => a + b, 0)) : [];
   try {
@@ -876,7 +855,6 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
         [tokens, closes, tss, vols5, date]
       );
     }
-    // v4.6: in-memory mirror (RSI continuous series ke liye) + live WS RSI
     for (let i = 0; i < tokens.length; i++) {
       const arr = wsTodayCloses.get(tokens[i]) || [];
       arr.push(closes[i]);
@@ -912,6 +890,49 @@ setInterval(() => {
 
   flushWSMinuteClose(prevKey, prevTs, date).catch(() => {});
 }, 1000);
+
+
+/* ============================================================
+   SECTION 4.7 — MARGIN SERVICE INTEGRATION (v5.0)
+   Broker-level leverage cache. Shared across all users of that broker.
+   ============================================================ */
+
+/* getSession for margin service — returns creds for a given broker.
+   Angel session credentials are read from the REST module + env. */
+function getBrokerSession(broker) {
+  if (broker === 'angelone') {
+    const st = getSessionStatusREST();
+    if (!st || !st.loggedIn) return null;
+    return {
+      jwt: st.jwt || process.env.ANGEL_JWT || null,
+      apiKey: process.env.ANGEL_API_KEY,
+      clientCode: process.env.ANGEL_CLIENT_ID
+    };
+  }
+  return null;
+}
+
+/* Build a fresh LTP map from bsCache (used by margin refresh). */
+function buildLtpMap() {
+  const map = {};
+  for (const s of STOCKS) {
+    const t = String(s.token);
+    const ltp = getCachedLTP(t) ?? bsCache.get(t)?.ltp ?? null;
+    if (ltp && ltp > 0) map[t] = ltp;
+  }
+  return map;
+}
+
+/* Trigger a margin refresh for a broker if due (>30 min). */
+async function maybeRefreshMargins(broker = 'angelone', { force = false } = {}) {
+  if (!force && !shouldRefresh(broker)) return;
+  const ltpMap = buildLtpMap();
+  if (!Object.keys(ltpMap).length) {
+    console.log(`📊 Margin refresh [${broker}]: skipped (no LTPs yet)`);
+    return;
+  }
+  await refreshMargins(broker, STOCKS, ltpMap);
+}
 
 
 /* ============================================================
@@ -1007,24 +1028,29 @@ function broadcastBS(fetchedAt) {
   if (!sseClients.size) return;
   sseSend(`data: ${JSON.stringify({
     type: 'bs', fetchedAt,
-    bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => [t, {
-      buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
-      volume: v.volume, rank: v.rank,
-      preopenPrice: v.preopenPrice ?? null,
-      dayOpen: v.dayOpen ?? null,
-      rsi: v.rsi ?? null
-    }]))
+    bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => {
+      const m = getMarginInfo('angelone', t);
+      return [t, {
+        buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
+        volume: v.volume, rank: v.rank,
+        preopenPrice: v.preopenPrice ?? null,
+        dayOpen: v.dayOpen ?? null,
+        rsi: v.rsi ?? null,
+        leverage: m?.leverage ?? null,
+        marginPerShare: m?.marginPerShare ?? null
+      }];
+    }))
   })}\n\n`);
 }
 
-function broadcastChip() {   // v4.9: chip list lock hote hi ek baar
+function broadcastChip() {
   if (!sseClients.size) return;
   sseSend(`data: ${JSON.stringify({ type: 'chip', chips: [...chipList.values()] })}\n\n`);
 }
 
 function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
-  if (extra && Number.isFinite(extra.volume)) lastWsVolume.set(String(token), extra.volume);   // v4.5: WS cumulative volume
+  if (extra && Number.isFinite(extra.volume)) lastWsVolume.set(String(token), extra.volume);
 
   if (token === NIFTY50_TOKEN) {
     setCachedLTP(token, ltp);
@@ -1034,9 +1060,8 @@ function handleTick(token, ltp, tickMs, extra) {
 
   setCachedLTP(token, ltp);
   broadcastLTP(token, ltp);
-  lastLtpAt.set(String(token), Date.now());   // v4.4: WS tick freshness track (sampler ke liye)
+  lastLtpAt.set(String(token), Date.now());
 
-  // v4.8: REAL-TIME live RSI — banti candle ka close = ye tick (O(1) calc, DB touch nahi hota)
   if (RSI_SOURCE === 'ws') {
     const st = rsiState.get(String(token));
     if (st && st.prevClose > 0) {
@@ -1196,7 +1221,8 @@ app.get('/api/broker/status', auth, (req, res) => {
   res.json({
     rest: getSessionStatusREST(),
     quote: getSessionStatusQuote(),
-    bs: getSessionStatusBS()
+    bs: getSessionStatusBS(),
+    margins: getMarginStatus()
   });
 });
 
@@ -1247,7 +1273,6 @@ app.get('/api/screener/data', auth, (req, res) => {
   });
 });
 
-/* v4.9: CHIP LIST endpoint — din bhar wahi locked list */
 app.get('/api/screener/chips', auth, (req, res) => {
   const chips = [...chipList.values()].map(c => ({
     token: c.token,
@@ -1259,6 +1284,11 @@ app.get('/api/screener/chips', auth, (req, res) => {
     ltp: getCachedLTP(c.token) ?? null
   }));
   res.json({ ok: true, date: chipDate, locked: chipDate != null, chips });
+});
+
+/* v5.0: margin cache inspection */
+app.get('/api/screener/margins', auth, (req, res) => {
+  res.json({ ok: true, status: getMarginStatus() });
 });
 
 app.get('/api/screener/stream', (req, res) => {
@@ -1392,6 +1422,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const quote = quoteCache.get(token) || null;
     const pivot = pivotCache.get(token) || null;
     const bs = bsCache.get(token) || null;
+    const m = getMarginInfo('angelone', token);   // v5.0
     return {
       token, ltp, prevClose, pivot,
       buyQty: bs?.buyQty ?? null,
@@ -1401,6 +1432,8 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       preopenPrice: bs?.preopenPrice ?? null,
       dayOpen: bs?.dayOpen ?? null,
       rsi: bs?.rsi ?? null,
+      leverage: m?.leverage ?? null,                 // v5.0
+      marginPerShare: m?.marginPerShare ?? null,     // v5.0
       highQuote: quote?.high ?? null,
       lowQuote: quote?.low ?? null,
       quoteFetchedAt: quote?.fetchedAt ?? null,
@@ -1424,9 +1457,27 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
   res.json({ ok: true, count: enriched.length, results: enriched });
 });
 
+/* v5.0: compute MAXQTY for a token given a capital (uses broker leverage cache). */
+app.post('/api/screener/maxqty', auth, (req, res) => {
+  const { token, capital, broker = 'angelone' } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'token required' });
+  const capitalNum = +capital;
+  if (!capitalNum || capitalNum <= 0) return res.status(400).json({ error: 'invalid capital' });
+
+  const ltp = getCachedLTP(String(token));
+  const lev = getLeverage(broker, String(token));
+  const qty = computeMaxQty(capitalNum, ltp, lev);
+
+  res.json({
+    ok: true, token: String(token), broker, capital: capitalNum,
+    ltp, leverage: lev, maxQty: qty,
+    marginPerShare: lev && ltp ? +(ltp / lev).toFixed(4) : null
+  });
+});
+
 
 /* ============================================================
-   SECTION 7.1 — ADMIN TRIGGERS (moved from admin.js)
+   SECTION 7.1 — ADMIN TRIGGERS
    ============================================================ */
 
 app.post('/api/admin/force-day-hlc', auth, adminOnly, async (req, res) => {
@@ -1515,7 +1566,6 @@ app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
       targetDate = rows[0].d;
     }
 
-    // v4.6: RSI ab multi-day WS series se (RSI_SOURCE=bs ho to purana min_1 path)
     await recomputeAllRSI(targetDate);
 
     const { rows: out } = await db.query(
@@ -1526,6 +1576,15 @@ app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
     );
     console.log(`🧪 Compute-RSI: ${out.length} saved for ${targetDate}`);
     res.json({ ok: true, date: targetDate, count: out.length, top10: out.slice(0, 10), bottom10: out.slice(-10) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* v5.0: manual margin refresh (admin) */
+app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
+  try {
+    const broker = req.body?.broker || 'angelone';
+    const result = await maybeRefreshMargins(broker, { force: true });
+    res.json({ ok: true, broker, status: getMarginStatus(), detail: result || null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1681,12 +1740,6 @@ async function autoFetchPreopen() {
       const existing = bsCache.get(m.token) || {};
       bsCache.set(m.token, { ...existing, preopenPrice: m.price, preopenAt: fetchedAt });
 
-      const key = String(m.token);
-      // v4.4 fix: preopen price ko min_1_close / todayCloses me MAT daalo.
-      // Wo ek fake "minute close" ban jata tha (market 9:15 pe khulta hai,
-      // ye 9:13:30 ka price hai) -> series off-by-one + RSI shift.
-      // preopen_price column alag se save hota rahega, wo zaroori hai.
-
       try {
         await db.query(
           `INSERT INTO strategy_bs_snapshot
@@ -1709,11 +1762,9 @@ async function autoFetchPreopen() {
    SECTION 11 — BS FETCH (9:15:00 + 30s interval) + MINUTE SELF-COLLECT
    ============================================================ */
 let bsIntervalTimer = null;
-let bsRunning = false;   // v4.4: overlap guard
+let bsRunning = false;
 
 async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
-  // v4.4: agar purana run abhi chalu hai to ye tick skip karo
-  // (500 tokens + DB writes 30s se zyada le sakte hain -> double flush / out-of-order minute closes)
   if (bsRunning) { if (!silent) console.log('💹 Auto-BS: previous run in progress — skipping'); return; }
   bsRunning = true;
   try {
@@ -1735,7 +1786,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
     const dbErrors = [];
     const minuteChanges = [];
 
-    // v4.4: bulk write buffers (500 alag-alag DB queries ki jagah ek batch query)
     const bTokens = [], bSyms = [], bBuy = [], bSell = [], bLtp = [], bVol = [], bOpen = [], bRsi = [];
     const vTokens = [], vVols = [];
 
@@ -1751,7 +1801,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
         const existing = bsCache.get(String(r.token)) || {};
 
         let rsi = existing.rsi ?? null;
-        // v4.6: RSI ab WS series se banta hai; BS path sirf rollback (RSI_SOURCE=bs) me
         if (RSI_SOURCE === 'bs' && rsi == null) {
           const closes14 = buildCloses14(r.token);
           if (closes14) rsi = computeRSIFromArray(closes14);
@@ -1772,7 +1821,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
         const flushed = updateMinuteBuffer(r.token, r.ltp);
         if (flushed) minuteChanges.push({ token: String(r.token), ts: flushed.ts, close: flushed.close });
 
-        // v4.4: per-row query nahi — buffer me rakho, loop ke baad ek bulk upsert
         bTokens.push(String(r.token));
         bSyms.push(SYM_BY_TOKEN[r.token] || '?');
         bBuy.push(r.buyQty ?? null);
@@ -1784,7 +1832,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
       }
     }
 
-    // v4.4: bulk volume update
     if (volumeOnly && vTokens.length) {
       try {
         await db.query(
@@ -1796,7 +1843,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
       } catch (e) { dbErrors.push(`bulk-vol: ${e.message}`); }
     }
 
-    // v4.4: bulk BS upsert (ek hi query me saare tokens)
     if (!volumeOnly && bTokens.length) {
       try {
         await db.query(
@@ -1829,9 +1875,14 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
     if (!silent) console.log(`✅ Auto-BS: ${results.length}/${allTokens.length} in ${Math.round((Date.now() - t0) / 1000)}s`);
 
     if (!volumeOnly) await assignDailyRank(p.date);
-    if (!volumeOnly) await buildChipList(p.date);   // v4.9: rank ke turant baad chip lock
+    if (!volumeOnly) await buildChipList(p.date);
+
+    /* v5.0: margin refresh piggyback on BS cycle (only fires if >30 min since last) */
+    if (!volumeOnly) {
+      maybeRefreshMargins('angelone').catch(e => console.error('margin refresh:', e.message));
+    }
   } catch (e) { console.error('Auto-BS failed:', e.message); }
-  finally { bsRunning = false; }   // v4.4: overlap guard release
+  finally { bsRunning = false; }
 }
 
 async function assignDailyRank(date) {
@@ -1866,32 +1917,23 @@ async function assignDailyRank(date) {
   } catch (e) { console.error('Rank assign failed:', e.message); }
 }
 
-/* ============================================================
-   SECTION 11.1 — CHIP LIST (v4.9): 9:15 pe lock, poore din FIXED
-   - Pool: rank_no 1-10 (change% order, existing ranked list)
-   - Filters: GAP UP <= 3% (day_open vs prevClose)  AND  live RSI >= 70 (first ticks)
-   - Store: existing table ka chip_rank column (koi nayi table nahi)
-   - Restart-safe: startup pe DB se wapas load hoti hai
-   - Candle ka wait nahi — pehle BS fetch + ticks ke turant baad lock
-   ============================================================ */
 async function buildChipList(date) {
   try {
-    if (chipDate === date) return;   // aaj ke liye already locked (khali list bhi = locked)
+    if (chipDate === date) return;
 
     const { rows: chk } = await db.query(
       `SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot
        WHERE date=$1 AND strategy_id='momentum' AND chip_rank IS NOT NULL`,
       [date]
     );
-    if (+chk[0].cnt > 0) { await loadChipListFromDB(date); return; }   // restart ke baad wahi list
+    if (+chk[0].cnt > 0) { await loadChipListFromDB(date); return; }
 
     const pool = STOCKS.map(s => String(s.token))
       .map(t => ({ token: t, rank: bsCache.get(t)?.rank ?? null }))
       .filter(x => x.rank != null && x.rank >= 1 && x.rank <= 10)
       .sort((a, b) => a.rank - b.rank);
-    if (!pool.length) return;   // rank abhi assign nahi hua
+    if (!pool.length) return;
 
-    // Pehle ticks/RSI ready hone do (9:20 ke baad force lock)
     const readyCount = pool.filter(x =>
       (bsCache.get(x.token)?.rsi ?? null) != null && getCachedLTP(x.token)
     ).length;
@@ -1908,10 +1950,10 @@ async function buildChipList(date) {
       const dayOpen = bsCache.get(x.token)?.dayOpen ?? null;
       const prevClose = prevCloseCache.get(x.token) || null;
       if (!dayOpen || !prevClose || prevClose <= 0) continue;
-      const gapPct = ((dayOpen - prevClose) / prevClose) * 100;   // GAP UP % (day_open vs prevClose)
+      const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
       const rsi = bsCache.get(x.token)?.rsi ?? null;
-      if (gapPct > 3) continue;                  // filter: gap up <= 3%
-      if (rsi == null || rsi < 70) continue;     // filter: first-tick RSI >= 70
+      if (gapPct > 3) continue;
+      if (rsi == null || rsi < 70) continue;
       chips.push({
         token: x.token,
         sym: SYM_BY_TOKEN[x.token] || '?',
@@ -1953,7 +1995,7 @@ async function loadChipListFromDB(date) {
         sym: r.sym,
         rank: +r.chip_rank,
         gapPct,
-        rsiAtLock: r.chip_rsi != null ? +r.chip_rsi : null   // v4.9: first-tick RSI, poore din fixed
+        rsiAtLock: r.chip_rsi != null ? +r.chip_rsi : null
       });
     }
     chipDate = date;
@@ -2055,16 +2097,28 @@ function scheduleMorningPreload() {
   const ms = msUntil(9, 0);
   console.log(`⏰ Next morning preload in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
-    await loadPrevCloseFromDB();       // ← YE ADD
+    await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
     await loadTodayClosesFromDB();
-    await loadPrevWSClosesFromDB();    // v4.6: naya din = naya WS seed
-    await loadTodayWSClosesFromDB();   // v4.6
-    seedRSIStateFromMemory();          // v4.8: live state refresh
+    await loadPrevWSClosesFromDB();
+    await loadTodayWSClosesFromDB();
+    seedRSIStateFromMemory();
     const today = getIST().toISOString().split('T')[0];
     await recomputeAllRSI(today);
     scheduleMorningPreload();
   }, ms);
+}
+
+/* v5.0: margin refresh check every 5 min (fires when >30 min since last, only after 9:15) */
+function startMarginRefreshLoop() {
+  setInterval(() => {
+    const ist = getIST();
+    if (!isTradingDay(ist)) return;
+    const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
+    if (secs < 9 * 3600 + 15 * 60 || secs > 15 * 3600 + 30 * 60) return;
+    maybeRefreshMargins('angelone').catch(() => {});
+  }, 5 * 60 * 1000);
+  console.log('📊 Margin refresh loop started (30-min cadence, from 9:15)');
 }
 
 
@@ -2111,9 +2165,12 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v4.9`);
+  console.log(`✅ Server on port ${PORT} — v5.0`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
+
+  /* v5.0: init margin service BEFORE logins (safe — no calls yet) */
+  initMarginService(db, getBrokerSession);
 
   try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }
   await new Promise(r => setTimeout(r, 4000));
@@ -2129,13 +2186,16 @@ app.listen(PORT, async () => {
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();
-  await loadChipListFromDB(getIST().toISOString().split('T')[0]);   // v4.9: restart-safe chip list
-  await loadPrevWSClosesFromDB();    // v4.6: multi-day WS seed
-  await loadTodayWSClosesFromDB();   // v4.6: aaj ke WS closes
-  seedRSIStateFromMemory();          // v4.8: live tick RSI state ready
+  await loadChipListFromDB(getIST().toISOString().split('T')[0]);
+  await loadPrevWSClosesFromDB();
+  await loadTodayWSClosesFromDB();
+  seedRSIStateFromMemory();
+
+  /* v5.0: load cached margins for angelone from DB */
+  await loadCachedMargins('angelone');
 
   const todayDate = getIST().toISOString().split('T')[0];
-  await recomputeAllRSI(todayDate);  // v4.6: WS series se backfill
+  await recomputeAllRSI(todayDate);
 
   const nowIST = getIST();
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
@@ -2183,12 +2243,22 @@ app.listen(PORT, async () => {
     startBSInterval();
   }
 
+  /* v5.0: if mid-session & margin cache empty, force refresh */
+  if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && secs >= bsStart && secs < bsEnd) {
+    const status = getMarginStatus();
+    if (!status.angelone || status.angelone.tokens === 0) {
+      console.log('🔔 Late startup — forcing margin refresh');
+      maybeRefreshMargins('angelone', { force: true }).catch(() => {});
+    }
+  }
+
   scheduleDailyHLC();
   scheduleQuoteAutoFetch();
   schedulePreopenFetch();
   scheduleBSAutoFetch();
   scheduleFinalFlush();
   scheduleMorningPreload();
+  startMarginRefreshLoop();   // v5.0
 
-  console.log('ℹ️  Schedule: WS@9:14:55 | Preopen@9:13:30 | BS@9:15 (30s) | Quote@9:30 | HLC@15:16 | FinalFlush@15:31 | Preload@9:00');
+  console.log('ℹ️  Schedule: WS@9:14:55 | Preopen@9:13:30 | BS@9:15 (30s) | Quote@9:30 | HLC@15:16 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');
 });

@@ -1,9 +1,14 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v4.3
+   server.js — TradeAlgo Pro backend  |  v4.4
    - Self-collect minute closes from BS ticks
    - Sliding window RSI (prev day + today)
    - Auto pre-market fetch @ 9:13:30
    - All admin triggers + RSI logic in server.js
+   v4.4 changes:
+   - prevClose cutoff = IST today (change% last-to-last day fix)
+   - preopen price ab min_1_close me nahi jata (fake minute fix)
+   - BS fetch: overlap guard + bulk DB writes (load fix)
+   - NAYA: WS minute-close shadow sampler (ws_1min_*, ws_5min_*)
    ============================================================ */
 
 import express from 'express';
@@ -215,7 +220,9 @@ const prevCloseCache = new Map();
 async function loadPrevCloseFromDB() {
   try {
     const activeTokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
-    const latestDate = getIST().toISOString().split('T')[0];   // Friday on weekend, today on weekday
+    // v4.4 fix: IST "today" use karo. Phase date 9:15 se pehle = previous trading day
+    // hota tha, jisse change% last-to-last working day se ban jata tha.
+    const latestDate = getIST().toISOString().split('T')[0];
     const { rows } = await db.query(
       `SELECT DISTINCT ON (token) token, day_close
        FROM angel_15m_candle
@@ -591,6 +598,81 @@ function parsePreopen(json) {
 
 
 /* ============================================================
+   SECTION 4.6 — WS MINUTE-CLOSE SHADOW SAMPLER (close only)  [v4.4]
+   - Har naye minute ke turant baad (0-1 sec me) previous minute ka
+     aakhri LTP = us minute ka close, shadow columns me likhte hain
+   - Source: WS tick (getCachedLTP). Tick 75s+ purana ho to BS 30s ltp fallback
+   - Likhta SIRF naye columns me: ws_1min_close/ts, ws_5min_close/ts
+   - Purana min_1/min_5 pipeline bilkul untouched (compare ke liye)
+   ============================================================ */
+const lastLtpAt = new Map();
+let wsMinuteKey = null;
+
+async function flushWSMinuteClose(prevKey, prevTs, date) {
+  const tokens = [], closes = [];
+  for (const s of STOCKS) {
+    const token = String(s.token);
+    const age = Date.now() - (lastLtpAt.get(token) || 0);
+    let close = age < 75000 ? getCachedLTP(token) : null;   // WS fresh hai to WS
+    if (close == null) close = bsCache.get(token)?.ltp ?? null;  // warna BS fallback
+    if (!Number.isFinite(close) || close <= 0) continue;
+    tokens.push(token);
+    closes.push(close);
+  }
+  if (!tokens.length) return;
+
+  const isFive = Number(prevKey.slice(3)) % 5 === 4;   // minute 4,9,14... = 5-min window ka close
+  const tss = tokens.map(() => prevTs);
+  try {
+    await db.query(
+      `UPDATE strategy_bs_snapshot AS s
+       SET ws_1min_close = COALESCE(s.ws_1min_close, ARRAY[]::numeric[]) || v.c,
+           ws_1min_ts    = COALESCE(s.ws_1min_ts,    ARRAY[]::timestamptz[]) || v.t
+       FROM unnest($1::text[], $2::numeric[], $3::timestamptz[]) AS v(token, c, t)
+       WHERE s.date = $4 AND s.token = v.token AND s.strategy_id = 'momentum'`,
+      [tokens, closes, tss, date]
+    );
+    if (isFive) {
+      await db.query(
+        `UPDATE strategy_bs_snapshot AS s
+         SET ws_5min_close = COALESCE(s.ws_5min_close, ARRAY[]::numeric[]) || v.c,
+             ws_5min_ts    = COALESCE(s.ws_5min_ts,    ARRAY[]::timestamptz[]) || v.t
+         FROM unnest($1::text[], $2::numeric[], $3::timestamptz[]) AS v(token, c, t)
+         WHERE s.date = $4 AND s.token = v.token AND s.strategy_id = 'momentum'`,
+        [tokens, closes, tss, date]
+      );
+    }
+    console.log(`🕐 WS minute-close: ${tokens.length} tokens @ ${prevKey}${isFive ? ' (5m)' : ''}`);
+  } catch (e) { console.error('WS minute-close flush failed:', e.message); }
+}
+
+setInterval(() => {
+  const ist = getIST();
+  const hh = String(ist.getUTCHours()).padStart(2, '0');
+  const mm = String(ist.getUTCMinutes()).padStart(2, '0');
+  const key = `${hh}:${mm}`;
+
+  if (wsMinuteKey === null) { wsMinuteKey = key; return; }
+  if (key === wsMinuteKey) return;
+
+  const prevKey = wsMinuteKey;
+  wsMinuteKey = key;
+
+  if (!isTradingDay(ist)) return;
+  const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
+  if (secs < 9 * 3600 + 15 * 60 || secs > 15 * 3600 + 31 * 60) return;
+
+  const d = new Date(ist);
+  d.setUTCMinutes(d.getUTCMinutes() - 1);
+  d.setUTCSeconds(0, 0);
+  const prevTs = d.toISOString().replace('Z', '+05:30');
+  const date = ist.toISOString().split('T')[0];
+
+  flushWSMinuteClose(prevKey, prevTs, date).catch(() => {});
+}, 1000);
+
+
+/* ============================================================
    SECTION 5 — WEBSOCKET + SSE + BATCHED LTP
    ============================================================ */
 let wsStarted = false;
@@ -704,6 +786,7 @@ function handleTick(token, ltp) {
 
   setCachedLTP(token, ltp);
   broadcastLTP(token, ltp);
+  lastLtpAt.set(String(token), Date.now());   // v4.4: WS tick freshness track (sampler ke liye)
 
   const p = getScreenerPhase();
   if (p.phase !== 'ready' || !p.date) return;
@@ -1341,15 +1424,16 @@ async function autoFetchPreopen() {
       bsCache.set(m.token, { ...existing, preopenPrice: m.price, preopenAt: fetchedAt });
 
       const key = String(m.token);
-      if (!todayCloses.has(key) || todayCloses.get(key).length === 0) {
-        todayCloses.set(key, [m.price]);
-      }
+      // v4.4 fix: preopen price ko min_1_close / todayCloses me MAT daalo.
+      // Wo ek fake "minute close" ban jata tha (market 9:15 pe khulta hai,
+      // ye 9:13:30 ka price hai) -> series off-by-one + RSI shift.
+      // preopen_price column alag se save hota rahega, wo zaroori hai.
 
       try {
         await db.query(
           `INSERT INTO strategy_bs_snapshot
-             (date, sym, token, strategy_id, preopen_price, preopen_at, min_1_close, min_1_ts, fetched_at)
-           VALUES ($1, $2, $3, 'momentum', $4, $5, ARRAY[$4]::numeric[], ARRAY[$5]::timestamptz[], NOW())
+             (date, sym, token, strategy_id, preopen_price, preopen_at, fetched_at)
+           VALUES ($1, $2, $3, 'momentum', $4, $5, NOW())
            ON CONFLICT (date, token, strategy_id) DO UPDATE SET
              preopen_price = EXCLUDED.preopen_price,
              preopen_at = EXCLUDED.preopen_at`,
@@ -1367,8 +1451,13 @@ async function autoFetchPreopen() {
    SECTION 11 — BS FETCH (9:15:00 + 30s interval) + MINUTE SELF-COLLECT
    ============================================================ */
 let bsIntervalTimer = null;
+let bsRunning = false;   // v4.4: overlap guard
 
 async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
+  // v4.4: agar purana run abhi chalu hai to ye tick skip karo
+  // (500 tokens + DB writes 30s se zyada le sakte hain -> double flush / out-of-order minute closes)
+  if (bsRunning) { if (!silent) console.log('💹 Auto-BS: previous run in progress — skipping'); return; }
+  bsRunning = true;
   try {
     if (!isTradingDay(getIST())) { if (!silent) console.log('💹 Auto-BS: non-trading day'); return; }
     const p = getScreenerPhase();
@@ -1388,16 +1477,15 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
     const dbErrors = [];
     const minuteChanges = [];
 
+    // v4.4: bulk write buffers (500 alag-alag DB queries ki jagah ek batch query)
+    const bTokens = [], bSyms = [], bBuy = [], bSell = [], bLtp = [], bVol = [], bOpen = [], bRsi = [];
+    const vTokens = [], vVols = [];
+
     for (const r of results) {
       if (volumeOnly) {
         if (!Number.isFinite(r.volume) || r.volume <= 0) continue;
-        try {
-          await db.query(
-            `UPDATE strategy_bs_snapshot SET volume=$1, fetched_at=NOW()
-             WHERE date=$2 AND token=$3 AND strategy_id=$4`,
-            [r.volume, p.date, r.token, 'momentum']
-          );
-        } catch (e) { dbErrors.push(`${r.token}: ${e.message}`); }
+        vTokens.push(String(r.token));
+        vVols.push(r.volume);
         const existing = bsCache.get(String(r.token)) || {};
         existing.volume = r.volume;
         bsCache.set(String(r.token), existing);
@@ -1425,23 +1513,50 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
         const flushed = updateMinuteBuffer(r.token, r.ltp);
         if (flushed) minuteChanges.push({ token: String(r.token), ts: flushed.ts, close: flushed.close });
 
-        try {
-          await db.query(
-            `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, day_open, rsi, fetched_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-             ON CONFLICT (date, token, strategy_id) DO UPDATE SET
-               sym=EXCLUDED.sym,
-               buy_qty=EXCLUDED.buy_qty,
-               sell_qty=EXCLUDED.sell_qty,
-               ltp=EXCLUDED.ltp,
-               volume=EXCLUDED.volume,
-               day_open=COALESCE(EXCLUDED.day_open, strategy_bs_snapshot.day_open),
-               rsi=COALESCE(EXCLUDED.rsi, strategy_bs_snapshot.rsi),
-               fetched_at=EXCLUDED.fetched_at`,
-            [p.date, SYM_BY_TOKEN[r.token] || '?', r.token, 'momentum', r.buyQty, r.sellQty, r.ltp, r.volume, r.dayOpen ?? null, rsi, fetchedAt]
-          );
-        } catch (e) { dbErrors.push(`${r.token}: ${e.message}`); }
+        // v4.4: per-row query nahi — buffer me rakho, loop ke baad ek bulk upsert
+        bTokens.push(String(r.token));
+        bSyms.push(SYM_BY_TOKEN[r.token] || '?');
+        bBuy.push(r.buyQty ?? null);
+        bSell.push(r.sellQty ?? null);
+        bLtp.push(r.ltp ?? null);
+        bVol.push(r.volume ?? null);
+        bOpen.push(r.dayOpen ?? null);
+        bRsi.push(rsi);
       }
+    }
+
+    // v4.4: bulk volume update
+    if (volumeOnly && vTokens.length) {
+      try {
+        await db.query(
+          `UPDATE strategy_bs_snapshot AS s SET volume=v.volume, fetched_at=NOW()
+           FROM unnest($1::text[], $2::numeric[]) AS v(token, volume)
+           WHERE s.date=$3 AND s.token=v.token AND s.strategy_id='momentum'`,
+          [vTokens, vVols, p.date]
+        );
+      } catch (e) { dbErrors.push(`bulk-vol: ${e.message}`); }
+    }
+
+    // v4.4: bulk BS upsert (ek hi query me saare tokens)
+    if (!volumeOnly && bTokens.length) {
+      try {
+        await db.query(
+          `INSERT INTO strategy_bs_snapshot AS s (date, sym, token, strategy_id, buy_qty, sell_qty, ltp, volume, day_open, rsi, fetched_at)
+           SELECT $1, v.sym, v.token, 'momentum', v.buy_qty, v.sell_qty, v.ltp, v.volume, v.day_open, v.rsi, $10
+           FROM unnest($2::text[], $3::text[], $4::numeric[], $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], $9::numeric[])
+             AS v(token, sym, buy_qty, sell_qty, ltp, volume, day_open, rsi)
+           ON CONFLICT (date, token, strategy_id) DO UPDATE SET
+             sym=EXCLUDED.sym,
+             buy_qty=EXCLUDED.buy_qty,
+             sell_qty=EXCLUDED.sell_qty,
+             ltp=EXCLUDED.ltp,
+             volume=EXCLUDED.volume,
+             day_open=COALESCE(EXCLUDED.day_open, s.day_open),
+             rsi=COALESCE(EXCLUDED.rsi, s.rsi),
+             fetched_at=EXCLUDED.fetched_at`,
+          [p.date, bTokens, bSyms, bBuy, bSell, bLtp, bVol, bOpen, bRsi, fetchedAt]
+        );
+      } catch (e) { dbErrors.push(`bulk-bs: ${e.message}`); }
     }
 
     if (minuteChanges.length) {
@@ -1456,6 +1571,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
 
     if (!volumeOnly) await assignDailyRank(p.date);
   } catch (e) { console.error('Auto-BS failed:', e.message); }
+  finally { bsRunning = false; }   // v4.4: overlap guard release
 }
 
 async function assignDailyRank(date) {
@@ -1637,7 +1753,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v4.3`);
+  console.log(`✅ Server on port ${PORT} — v4.4`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 

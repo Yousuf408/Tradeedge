@@ -53,16 +53,17 @@ const BROKER_CONFIG = {
       'X-PrivateKey': session.apiKey
     }),
 
-    buildBody: (positions) => ({
-      positions: positions.map(p => ({
-        exchange: 'NSE',
-        qty: 1,
-        price: +p.price,
-        productType: 'INTRADAY',
-        token: String(p.token),
-        tradeType: 'BUY'
-      }))
-    }),
+   buildBody: (positions) => ({
+  positions: positions.map(p => ({
+    exchange: 'NSE',
+    qty: 1,
+    price: +p.price,
+    productType: 'INTRADAY',
+    token: String(p.token),
+    tradeType: 'BUY',
+    orderType: 'MARKET'
+  }))
+}),
 
     /* Angel batch response: { status, data: [{ totalMarginRequired, ... }] } */
     parse: (json, batch) => {

@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v3.9
+   SCREENER.JS  — v4.0
    + Default strategy = Momentum
    + Fixed # column (rank from server)
    + Gap % filter for Top Gainers/Losers
@@ -11,10 +11,11 @@
    + RSI column (Momentum) — first tick 9:15, freeze after
    + EOD closes fetch button (manual for first-time setup)
    + v3.8: RSI CHIP BAR — 9:15 pe server-locked list
-           (rank 1-10 pool · gap up <=3% · first-tick RSI >=70)
-           poore din STATIC, SSE 'chip' event + /api/screener/chips se
    + v3.9: 🔒 RSI Chips filter chip added next to Top 15 Losers
-           (click → table shows ONLY locked chips, empty-state message)
+   + v4.0: MAXQTY now uses real broker leverage from Angel margin API
+           MAXQTY = floor(CAPITAL × leverage / LTP)
+           Label "Per-Trade ₹" renamed to "Capital ₹"
+           leverage + marginPerShare pulled from /api/screener/ltp + SSE bs
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -30,6 +31,8 @@ let SCREENER_ORB = {};
 let SCREENER_PREOPEN = {};         // token -> { price }
 let SCREENER_DAY_OPEN = {};        // token -> number
 let SCREENER_RSI = {};             // token -> number
+let SCREENER_LEVERAGE = {};        // v4.0: token -> leverage (from broker margin)
+let SCREENER_MARGIN_PS = {};       // v4.0: token -> margin per share
 let SCREENER_CHIPS = [];           // v3.8: day-fixed chip list (server 9:15 pe lock karta hai)
 let SCREENER_INIT_DONE = false;
 let SCREENER_SSE = null;
@@ -49,7 +52,7 @@ const NIFTY50_TOKEN = '99926000';
 const CURRENT_STRATEGY = 'momentum';
 const STRATEGY_FILTER = { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 };
 
-let PER_TRADE = 10000;
+let PER_TRADE = 25000;   // v4.0: default capital ₹25,000 (was 10000)
 const BATCH_SIZE = 20;
 const BATCH_DELAY = 150;
 
@@ -113,8 +116,8 @@ function renderStrategyControls() {
       <option value="advance_orb">🔍 Advance ORB</option>
     </select>
     ${strategyButtons}
-    <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">Per-Trade ₹</label>
-    <input id="perTradeInput" type="number" value="10000" min="100"
+    <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">Capital ₹</label>
+    <input id="perTradeInput" type="number" value="${PER_TRADE}" min="100"
            style="width:110px;padding:7px 12px;border:1.5px solid var(--border-soft);border-radius:8px;
                   font-size:13px;font-family:inherit;background:var(--bg-secondary);color:var(--text-primary)"
            onchange="onPerTradeChange()" />
@@ -148,7 +151,7 @@ function renderStrategyControls() {
 }
 
 function onPerTradeChange() {
-  PER_TRADE = +document.getElementById('perTradeInput').value || 10000;
+  PER_TRADE = +document.getElementById('perTradeInput').value || 25000;
   renderScreenerTable();
 }
 
@@ -367,6 +370,16 @@ function computeGapPct(token) {
   return ((c.open - prev) / prev) * 100;
 }
 
+/* v4.0: MAXQTY from real broker leverage */
+function computeMaxQty(token, ltp) {
+  const lev = SCREENER_LEVERAGE[token];
+  if (!ltp || ltp <= 0) return '—';
+  if (!lev || lev <= 0) return '—';
+  if (!PER_TRADE || PER_TRADE <= 0) return '—';
+  const qty = Math.floor((PER_TRADE * lev) / ltp);
+  return qty > 0 ? qty : '—';
+}
+
 function formatPriceINR(v) {
   if (v === null || v === undefined) return '—';
   return v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -472,6 +485,12 @@ function updateLTPCells(ticks) {
       const color = above ? 'var(--success)' : 'var(--danger)';
       const arrow = above ? '▲' : '▼';
       pivotEl.innerHTML = `<span style="color:${color};font-weight:700">${arrow} ₹${pivot.toFixed(2)}</span>`;
+    }
+
+    /* v4.0: MAXQTY recompute on every LTP change */
+    const mqEl = row.querySelector('.maxqty-cell');
+    if (mqEl) {
+      mqEl.textContent = computeMaxQty(token, +price);
     }
   }
 }
@@ -989,6 +1008,8 @@ async function loadLTP() {
         if (item.preopenPrice != null) SCREENER_PREOPEN[item.token] = { price: item.preopenPrice };
         if (item.dayOpen != null) SCREENER_DAY_OPEN[item.token] = item.dayOpen;
         if (item.rsi != null) SCREENER_RSI[item.token] = item.rsi;
+        if (item.leverage != null) SCREENER_LEVERAGE[item.token] = item.leverage;         // v4.0
+        if (item.marginPerShare != null) SCREENER_MARGIN_PS[item.token] = item.marginPerShare; // v4.0
 
         if (item.buyQty != null || item.sellQty != null || item.rank != null) {
           const existing = SCREENER_BS[item.token] || {};
@@ -1069,6 +1090,8 @@ function startSSE() {
           if (v.preopenPrice != null) SCREENER_PREOPEN[token] = { price: v.preopenPrice };
           if (v.dayOpen != null) SCREENER_DAY_OPEN[token] = v.dayOpen;
           if (v.rsi != null) SCREENER_RSI[token] = v.rsi;
+          if (v.leverage != null) SCREENER_LEVERAGE[token] = v.leverage;                 // v4.0
+          if (v.marginPerShare != null) SCREENER_MARGIN_PS[token] = v.marginPerShare;   // v4.0
         }
         renderScreenerTable();
       }
@@ -1197,11 +1220,7 @@ function renderScreenerTable() {
       const preopen = SCREENER_PREOPEN[s.token];
       const dayOpen = SCREENER_DAY_OPEN[s.token];
 
-      const sl = c ? c.low : null;
-      const high = c ? c.high : null;
-      const target = high ? high * 1.01 : null;
-      const risk = (ltp && sl) ? (ltp - sl) : 0;
-      const maxQty = risk > 0 ? Math.floor(PER_TRADE / risk) : '—';
+      const maxQty = computeMaxQty(s.token, ltp);   // v4.0
 
       const changePct = computeChangePct(s.token);
       let changeLine;
@@ -1255,7 +1274,7 @@ function renderScreenerTable() {
         <td class="pivot-cell" style="white-space:nowrap">${pivotCell}</td>
         <td style="white-space:nowrap"><span style="color:var(--text-muted)">—</span></td>
         <td style="white-space:nowrap" class="cell-targetsl">${c ? renderTargetSL(c, orb) : '<span style="color:var(--text-muted)">—</span>'}</td>
-        <td style="font-weight:700;color:#6C5CE7">${maxQty}</td>
+        <td class="maxqty-cell" style="font-weight:700;color:#6C5CE7">${maxQty}</td>
         <td style="color:var(--text-muted);font-size:11px;font-family:ui-monospace,monospace">${lastUpdate}</td>
         <td class="cell-action">${orb.entrySignal
           ? `<button class="btn btn-success btn-sm" onclick="placeOrder('${s.sym}')">Buy</button>`
@@ -1323,11 +1342,7 @@ function renderScreenerTable() {
     const quote = SCREENER_QUOTE[s.token];
     const pivot = SCREENER_PIVOT[s.token];
 
-    const sl = c ? c.low : null;
-    const high = c ? c.high : null;
-    const target = high ? high * 1.01 : null;
-    const risk = (ltp && sl) ? (ltp - sl) : 0;
-    const maxQty = risk > 0 ? Math.floor(PER_TRADE / risk) : '—';
+    const maxQty = computeMaxQty(s.token, ltp);   // v4.0
     const stage = c
       ? resolveOrbStage(s.token, c, ltp)
       : { label: '⏸️ No 9:15 data', color: 'var(--text-muted)', weight: 500 };
@@ -1388,7 +1403,7 @@ function renderScreenerTable() {
       </td>
       <td style="white-space:nowrap">${quoteCell}</td>
       <td style="white-space:nowrap" class="cell-targetsl">${c ? renderTargetSL(c, orb) : '<span style="color:var(--text-muted)">—</span>'}</td>
-      <td style="font-weight:700;color:#6C5CE7">${maxQty}</td>
+      <td class="maxqty-cell" style="font-weight:700;color:#6C5CE7">${maxQty}</td>
       <td class="cell-newlow">${newLowCell}</td>
       <td class="cell-pullback">${pullbackCell}</td>
       <td class="cell-breakout">${breakoutCell}</td>

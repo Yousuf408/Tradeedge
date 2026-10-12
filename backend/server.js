@@ -56,6 +56,8 @@ import {
   getCachedLTP,
   getSessionStatus as getSessionStatusREST,
   getFeedToken as getFeedTokenREST
+  getJwt as getJwtREST                  // ← ADD
+
 } from './brokers/angelone/Angel_REST.js';
 
 import {
@@ -904,7 +906,7 @@ function getBrokerSession(broker) {
     const st = getSessionStatusREST();
     if (!st || !st.loggedIn) return null;
     return {
-      jwt: st.jwt || process.env.ANGEL_JWT || null,
+      jwt: getJwtREST() || process.env.ANGEL_JWT || null,   // ← use new getter
       apiKey: process.env.ANGEL_API_KEY,
       clientCode: process.env.ANGEL_CLIENT_ID
     };

@@ -1,40 +1,8 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.0
-   - Self-collect minute closes from BS ticks
-   - Sliding window RSI (prev day + today)
-   - Auto pre-market fetch @ 9:13:30
-   - All admin triggers + RSI logic in server.js
-   v4.4 changes:
-   - prevClose cutoff = IST today (change% last-to-last day fix)
-   - preopen price ab min_1_close me nahi jata (fake minute fix)
-   - BS fetch: overlap guard + bulk DB writes (load fix)
-   - NAYA: WS minute-close shadow sampler (ws_1min_*, ws_5min_*)
-   v4.5 changes:
-   - WS Quote mode (Angel_WS v1.4) se per-tick cumulative volume
-   - Sampler ab ws_1min_volume bhi bharta hai (1-min exact volume)
-   - VWAP ready: Σ(close×vol)/Σ(vol) ban sakta hai
-   v4.6 changes:
-   - RSI source = WS 1-min series (multi-day continuous: stored prev days + today)
-   - Din ka pehla candle bhi RSI paata hai (prev days ke seed se)
-   - Live: har minute-end RSI update; startup + admin trigger se backfill
-   - Rollback: env RSI_SOURCE=bs
-   v4.7 changes:
-   - RSI formula = WILDER RMA(14) (TradingView/AngelOne-style), poori stored series pe
-   - Purana simple-average formula sirf RSI_SOURCE=bs rollback me bacha hai
-   v4.8 changes:
-   - REAL-TIME live RSI: har WS tick pe banti candle ka RSI (O(1) incremental calc)
-   - DB me wahi minute-end closed-candle RSI (series clean), live value sirf display/cache
-   - Working logic untouched: DB writes, sampler, BS, ORB sab jaise the waise
-   v4.9 changes:
-   - CHIP LIST: 9:15 pe lock (rank 1-10 pool, gap up <=3%, first-tick RSI >=70)
-   - Poore din FIXED; existing table ka chip_rank column (koi nayi table nahi)
-   - Restart-safe (startup pe DB se load), SSE 'chip' event + /api/screener/chips
-   v5.0 changes:
-   - BROKER MARGIN/LEVERAGE: real per-stock leverage from Angel margin API
-   - MAXQTY = floor(CAPITAL × leverage / LTP) — replaces risk-based formula
-   - Broker-level cache (shared across users), 30-min refresh
-   - New admin trigger: POST /api/admin/refresh-margins
-   - /api/screener/ltp + SSE bs ab leverage + marginPerShare bhi bhejte hain
+   server.js — TradeAlgo Pro backend  |  v5.1
+   v5.1 changes:
+   - Margin service ab REST → Quote → BS JWT fallback use karta hai
+   - getBrokerSession multi-source (REST fail ho to Quote/BS se JWT)
    ============================================================ */
 
 import express from 'express';
@@ -56,28 +24,28 @@ import {
   getCachedLTP,
   getSessionStatus as getSessionStatusREST,
   getFeedToken as getFeedTokenREST,
-  getJwt as getJwtREST                  // ← ADD
-
+  getJwt as getJwtREST
 } from './brokers/angelone/Angel_REST.js';
 
 import {
   loginPlatform as loginQuote,
   fetchQuotesForTokens,
   getSessionStatus as getSessionStatusQuote,
-  getFeedToken as getFeedTokenQuote
+  getFeedToken as getFeedTokenQuote,
+  getJwt as getJwtQuote
 } from './brokers/angelone/Angel_Quote.js';
 
 import {
   loginPlatform as loginBS,
   getSessionStatus as getSessionStatusBS,
-  fetchBuySellForTokens
+  fetchBuySellForTokens,
+  getJwt as getJwtBS
 } from './brokers/angelone/Angel_BS.js';
 
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 
 import { registerAdminRoutes } from './admin.js';
 
-/* v5.0: broker margin service */
 import {
   initMarginService,
   refreshMargins,
@@ -895,26 +863,30 @@ setInterval(() => {
 
 
 /* ============================================================
-   SECTION 4.7 — MARGIN SERVICE INTEGRATION (v5.0)
+   SECTION 4.7 — MARGIN SERVICE INTEGRATION (v5.1)
    Broker-level leverage cache. Shared across all users of that broker.
    ============================================================ */
 
-/* getSession for margin service — returns creds for a given broker.
-   Angel session credentials are read from the REST module + env. */
+/* v5.1: multi-source session for margin service.
+   REST fail ho to Quote / BS JWT use karta hai — same Angel account. */
 function getBrokerSession(broker) {
-  if (broker === 'angelone') {
-    const st = getSessionStatusREST();
-    if (!st || !st.loggedIn) return null;
-    return {
-      jwt: getJwtREST() || process.env.ANGEL_JWT || null,   // ← use new getter
-      apiKey: process.env.ANGEL_API_KEY,
-      clientCode: process.env.ANGEL_CLIENT_ID
-    };
-  }
-  return null;
+  if (broker !== 'angelone') return null;
+
+  let jwt = null;
+  if (getSessionStatusREST()?.loggedIn)          jwt = getJwtREST?.();
+  if (!jwt && getSessionStatusQuote()?.loggedIn) jwt = getJwtQuote?.();
+  if (!jwt && getSessionStatusBS()?.loggedIn)    jwt = getJwtBS?.();
+  if (!jwt) jwt = process.env.ANGEL_JWT || null;
+
+  if (!jwt) return null;
+
+  return {
+    jwt,
+    apiKey: process.env.ANGEL_API_KEY,
+    clientCode: process.env.ANGEL_CLIENT_ID
+  };
 }
 
-/* Build a fresh LTP map from bsCache (used by margin refresh). */
 function buildLtpMap() {
   const map = {};
   for (const s of STOCKS) {
@@ -925,7 +897,6 @@ function buildLtpMap() {
   return map;
 }
 
-/* Trigger a margin refresh for a broker if due (>30 min). */
 async function maybeRefreshMargins(broker = 'angelone', { force = false } = {}) {
   if (!force && !shouldRefresh(broker)) return;
   const ltpMap = buildLtpMap();
@@ -1288,7 +1259,6 @@ app.get('/api/screener/chips', auth, (req, res) => {
   res.json({ ok: true, date: chipDate, locked: chipDate != null, chips });
 });
 
-/* v5.0: margin cache inspection */
 app.get('/api/screener/margins', auth, (req, res) => {
   res.json({ ok: true, status: getMarginStatus() });
 });
@@ -1424,7 +1394,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const quote = quoteCache.get(token) || null;
     const pivot = pivotCache.get(token) || null;
     const bs = bsCache.get(token) || null;
-    const m = getMarginInfo('angelone', token);   // v5.0
+    const m = getMarginInfo('angelone', token);
     return {
       token, ltp, prevClose, pivot,
       buyQty: bs?.buyQty ?? null,
@@ -1434,8 +1404,8 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       preopenPrice: bs?.preopenPrice ?? null,
       dayOpen: bs?.dayOpen ?? null,
       rsi: bs?.rsi ?? null,
-      leverage: m?.leverage ?? null,                 // v5.0
-      marginPerShare: m?.marginPerShare ?? null,     // v5.0
+      leverage: m?.leverage ?? null,
+      marginPerShare: m?.marginPerShare ?? null,
       highQuote: quote?.high ?? null,
       lowQuote: quote?.low ?? null,
       quoteFetchedAt: quote?.fetchedAt ?? null,
@@ -1459,7 +1429,6 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
   res.json({ ok: true, count: enriched.length, results: enriched });
 });
 
-/* v5.0: compute MAXQTY for a token given a capital (uses broker leverage cache). */
 app.post('/api/screener/maxqty', auth, (req, res) => {
   const { token, capital, broker = 'angelone' } = req.body || {};
   if (!token) return res.status(400).json({ error: 'token required' });
@@ -1581,7 +1550,6 @@ app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* v5.0: manual margin refresh (admin) */
 app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
   try {
     const broker = req.body?.broker || 'angelone';
@@ -1879,7 +1847,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
     if (!volumeOnly) await assignDailyRank(p.date);
     if (!volumeOnly) await buildChipList(p.date);
 
-    /* v5.0: margin refresh piggyback on BS cycle (only fires if >30 min since last) */
     if (!volumeOnly) {
       maybeRefreshMargins('angelone').catch(e => console.error('margin refresh:', e.message));
     }
@@ -2111,7 +2078,6 @@ function scheduleMorningPreload() {
   }, ms);
 }
 
-/* v5.0: margin refresh check every 5 min (fires when >30 min since last, only after 9:15) */
 function startMarginRefreshLoop() {
   setInterval(() => {
     const ist = getIST();
@@ -2167,11 +2133,10 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.0`);
+  console.log(`✅ Server on port ${PORT} — v5.1`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 
-  /* v5.0: init margin service BEFORE logins (safe — no calls yet) */
   initMarginService(db, getBrokerSession);
 
   try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }
@@ -2193,7 +2158,6 @@ app.listen(PORT, async () => {
   await loadTodayWSClosesFromDB();
   seedRSIStateFromMemory();
 
-  /* v5.0: load cached margins for angelone from DB */
   await loadCachedMargins('angelone');
 
   const todayDate = getIST().toISOString().split('T')[0];
@@ -2245,23 +2209,15 @@ app.listen(PORT, async () => {
     startBSInterval();
   }
 
-  /* v5.0: if mid-session & margin cache empty, force refresh */
-  if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && secs >= bsStart && secs < bsEnd) {
-    const status = getMarginStatus();
-    if (!status.angelone || status.angelone.tokens === 0) {
-      console.log('🔔 Late startup — forcing margin refresh');
-      maybeRefreshMargins('angelone', { force: true }).catch(() => {});
-    }
-  }
-
   scheduleDailyHLC();
   scheduleQuoteAutoFetch();
   schedulePreopenFetch();
   scheduleBSAutoFetch();
   scheduleFinalFlush();
   scheduleMorningPreload();
-  startMarginRefreshLoop();   // v5.0
-    /* v5.0: force margin refresh on every startup (works any time of day) */
+  startMarginRefreshLoop();
+
+  /* v5.1: force margin refresh on every startup (works any time of day) */
   maybeRefreshMargins('angelone', { force: true }).catch(() => {});
 
   console.log('ℹ️  Schedule: WS@9:14:55 | Preopen@9:13:30 | BS@9:15 (30s) | Quote@9:30 | HLC@15:16 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');

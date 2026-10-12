@@ -1,5 +1,5 @@
 /* ============================================================
-   Angel_BS.js  —  v1.1  (standalone)
+   Angel_BS.js  —  v1.2  (standalone)
    Buy/Sell snapshot service via REST FULL quote
 
    - Fully independent (own login, own TOTP, own session)
@@ -11,7 +11,11 @@
    Exports:
      - loginPlatform()
      - getSessionStatus()
+     - getJwt()              ← v1.2 (for broker margin service)
      - fetchBuySellForTokens(tokens) → [{ token, buyQty, sellQty, ... }]
+
+   CHANGELOG v1.2 (2026-10-12):
+   - Added getJwt() export — exposes session JWT for broker margin service
    ============================================================ */
 
 import crypto from 'crypto';
@@ -183,6 +187,9 @@ export function getSessionStatus() {
     loginTime: session.loginTime
   };
 }
+
+/* v1.2: expose JWT for broker margin service */
+export function getJwt() { return session.jwtToken || null; }
 
 /* ============================================================
    FETCH BUY/SELL SNAPSHOT

@@ -38,8 +38,8 @@ const BROKER_CONFIG = {
   angelone: {
     name: 'Angel One',
     url: 'https://apiconnect.angelbroking.com/rest/secure/angelbroking/margin/v1/batch',
-    batchSize: 50,
-    rateLimitMs: 120,               // ~8 req/s (safe under 10/s limit)
+    batchSize: 1,
+    rateLimitMs: 130,            
 
     buildHeaders: (session) => ({
       'Authorization': `Bearer ${session.jwt}`,
@@ -65,15 +65,18 @@ const BROKER_CONFIG = {
   }))
 }),
 
-    /* Angel batch response: { status, data: [{ totalMarginRequired, ... }] } */
-    parse: (json, batch) => {
-      if (!json.status || !Array.isArray(json.data)) {
+       parse: (json, batch) => {
+      if (!json.status || !json.data) {
         throw new Error(`Angel margin API: ${json.message || 'bad response'}`);
       }
+
+      // data can be array (per-position) or object (single/basket)
+      const items = Array.isArray(json.data) ? json.data : [json.data];
+
       const out = [];
       for (let i = 0; i < batch.length; i++) {
         const p = batch[i];
-        const d = json.data[i] || {};
+        const d = items[i] || items[0] || {};
         const totalMargin = +(d.totalMarginRequired ?? d.totalMargin ?? 0);
         const notional = (+p.price) * 1;
         const leverage = totalMargin > 0 ? notional / totalMargin : null;

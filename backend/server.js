@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v4.7
+   server.js — TradeAlgo Pro backend  |  v4.8
    - Self-collect minute closes from BS ticks
    - Sliding window RSI (prev day + today)
    - Auto pre-market fetch @ 9:13:30
@@ -21,6 +21,10 @@
    v4.7 changes:
    - RSI formula = WILDER RMA(14) (TradingView/AngelOne-style), poori stored series pe
    - Purana simple-average formula sirf RSI_SOURCE=bs rollback me bacha hai
+   v4.8 changes:
+   - REAL-TIME live RSI: har WS tick pe banti candle ka RSI (O(1) incremental calc)
+   - DB me wahi minute-end closed-candle RSI (series clean), live value sirf display/cache
+   - Working logic untouched: DB writes, sampler, BS, ORB sab jaise the waise
    ============================================================ */
 
 import express from 'express';
@@ -314,6 +318,7 @@ const minuteBuffer = new Map();
 const RSI_SOURCE = process.env.RSI_SOURCE || 'ws';
 const wsPrevCloses = new Map();    // pichle stored days ke ws_1min_close (date order, concatenated)
 const wsTodayCloses = new Map();   // aaj ke ws_1min_close (in-memory mirror)
+const rsiState = new Map();        // v4.8: token -> {avgGain, avgLoss, prevClose} = closed series ka running Wilder state
 
 /* RSI formula — accepts 13 previous closes + 1 current (TradingView-style signature) */
 function computeRSI(prevCloses, currentClose) {
@@ -347,7 +352,7 @@ function computeRSIFromArray(closes14) {
    - 400+ candles pe seed error ~0 (weight (13/14)^n se girta hai)
    - <15 closes = null (RSI possible nahi)
    ============================================================ */
-function computeRSIWilder(closes) {
+function computeRSIWilderState(closes) {
   if (!Array.isArray(closes) || closes.length < 15) return null;
   let avgGain = 0, avgLoss = 0;
   for (let i = 1; i <= 14; i++) {
@@ -363,8 +368,13 @@ function computeRSIWilder(closes) {
     avgGain = (avgGain * 13 + gain) / 14;
     avgLoss = (avgLoss * 13 + loss) / 14;
   }
-  if (avgLoss === 0) return 100;
-  return 100 - (100 / (1 + avgGain / avgLoss));
+  const rsi = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+  return { rsi, avgGain, avgLoss, prevClose: closes[closes.length - 1] };
+}
+
+function computeRSIWilder(closes) {
+  const st = computeRSIWilderState(closes);
+  return st ? st.rsi : null;
 }
 
 /* Build 14 closes using sliding window: prev day + today */
@@ -617,6 +627,21 @@ async function loadTodayWSClosesFromDB() {
   } catch (e) { console.error('WS today closes load failed:', e.message); }
 }
 
+/* v4.8: live tick RSI ke liye running Wilder state seed karo (stored series se) */
+function seedRSIStateFromMemory() {
+  let n = 0;
+  for (const s of STOCKS) {
+    const token = String(s.token);
+    const todayArr = wsTodayCloses.get(token) || [];
+    const prevArr = wsPrevCloses.get(token) || [];
+    const series = todayArr.length ? prevArr.concat(todayArr) : prevArr;
+    const st = computeRSIWilderState(series);
+    if (st) { rsiState.set(token, st); n++; }
+    else rsiState.delete(token);
+  }
+  console.log(`🧮 RSI live state seeded: ${n} tokens`);
+}
+
 /* Live: har minute-end pe WS series se RSI → rsi column + bsCache */
 async function updateRSIFromWS(date) {
   const toks = [], rsis = [];
@@ -625,9 +650,10 @@ async function updateRSIFromWS(date) {
     const todayArr = wsTodayCloses.get(token) || [];
     const prevArr = wsPrevCloses.get(token) || [];
     const series = todayArr.length ? prevArr.concat(todayArr) : prevArr;
-    const rsi = computeRSIWilder(series);   // v4.7: Wilder RMA, poori series pe
-    if (rsi == null) continue;
-    const v = +rsi.toFixed(2);
+    const st = computeRSIWilderState(series);   // v4.7/4.8: Wilder RMA + running state
+    if (!st) continue;
+    rsiState.set(token, st);   // v4.8: minute-end pe state refresh (drift-free, DB value wahi jo pehle tha)
+    const v = +st.rsi.toFixed(2);
     toks.push(token); rsis.push(v);
     const cached = bsCache.get(token) || {};
     cached.rsi = v;
@@ -996,6 +1022,22 @@ function handleTick(token, ltp, tickMs, extra) {
   setCachedLTP(token, ltp);
   broadcastLTP(token, ltp);
   lastLtpAt.set(String(token), Date.now());   // v4.4: WS tick freshness track (sampler ke liye)
+
+  // v4.8: REAL-TIME live RSI — banti candle ka close = ye tick (O(1) calc, DB touch nahi hota)
+  if (RSI_SOURCE === 'ws') {
+    const st = rsiState.get(String(token));
+    if (st && st.prevClose > 0) {
+      const d = ltp - st.prevClose;
+      const gain = d > 0 ? d : 0;
+      const loss = d < 0 ? -d : 0;
+      const lg = (st.avgGain * 13 + gain) / 14;
+      const ll = (st.avgLoss * 13 + loss) / 14;
+      const live = ll === 0 ? 100 : 100 - (100 / (1 + lg / ll));
+      const cached = bsCache.get(String(token)) || {};
+      cached.rsi = +live.toFixed(2);
+      bsCache.set(String(token), cached);
+    }
+  }
 
   const p = getScreenerPhase();
   if (p.phase !== 'ready' || !p.date) return;
@@ -1895,6 +1937,7 @@ function scheduleMorningPreload() {
     await loadTodayClosesFromDB();
     await loadPrevWSClosesFromDB();    // v4.6: naya din = naya WS seed
     await loadTodayWSClosesFromDB();   // v4.6
+    seedRSIStateFromMemory();          // v4.8: live state refresh
     const today = getIST().toISOString().split('T')[0];
     await recomputeAllRSI(today);
     scheduleMorningPreload();
@@ -1945,7 +1988,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v4.7`);
+  console.log(`✅ Server on port ${PORT} — v4.8`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 
@@ -1965,6 +2008,7 @@ app.listen(PORT, async () => {
   await loadTodayClosesFromDB();
   await loadPrevWSClosesFromDB();    // v4.6: multi-day WS seed
   await loadTodayWSClosesFromDB();   // v4.6: aaj ke WS closes
+  seedRSIStateFromMemory();          // v4.8: live tick RSI state ready
 
   const todayDate = getIST().toISOString().split('T')[0];
   await recomputeAllRSI(todayDate);  // v4.6: WS series se backfill

@@ -1,5 +1,5 @@
 /* ============================================================
-   ANGEL_REST.js  —  v2.3
+   ANGEL_REST.js  —  v2.4
    ALL Angel One REST logic lives here:
    - Login (auto, platform creds)
    - 1-min candle aggregation (9:15-9:30 window)
@@ -12,11 +12,14 @@
    CHANGELOG v2.3 (2026-10-09):
    - Added getPrevDayLastCloses(token, prevDate, count)
    - Added getPrevDayLastClosesBatch(tokens, prevDate, count)
+
+   CHANGELOG v2.4 (2026-10-12):
+   - Added getJwt() export — exposes session JWT for broker margin service
    ============================================================ */
 
 import crypto from 'crypto';
 
-const BASE_URL = 'https://apiconnect.angelone.in';
+const BASE_URL = 'https://apiconnect.angelbroking.in';
 const API_KEY = process.env.ANGEL_API_KEY;
 const CLIENT_ID = process.env.ANGEL_CLIENT_ID;
 const PIN = process.env.ANGEL_PIN;
@@ -204,6 +207,11 @@ export function getSessionStatus() {
     expiresAt: session.expiresAt,
     loginTime: session.loginTime
   };
+}
+
+/* v2.4: expose JWT for broker margin service */
+export function getJwt() {
+  return session.jwtToken || null;
 }
 
 /* ============================================================
@@ -401,8 +409,6 @@ export async function getClosingPriceForToken(token, date) {
    BULK HELPERS — loops + batching live HERE
    ============================================================ */
 
-/* Fetch closing price for many tokens in batches.
-   Returns { ok: [{token, price}], failed: [token] } */
 export async function fetchAllClosingPrices(tokens, date, batchSize = 50, delayMs = 20000) {
   const ok = [];
   const failed = [];
@@ -423,7 +429,6 @@ export async function fetchAllClosingPrices(tokens, date, batchSize = 50, delayM
   return { ok, failed };
 }
 
-/* Fetch LTP for many tokens in batches of 50 */
 export async function fetchAllLTP(tokens) {
   const out = [];
   for (let i = 0; i < tokens.length; i += 50) {
@@ -449,9 +454,6 @@ export function getFeedToken() { return session.feedToken; }
 
 /* ============================================================
    FULL QUOTE — batch (50/call)
-   Returns LTP, OHLC and previous close for each token.
-   Previous close = last completed trading session's close
-   (Angel handles weekends/holidays automatically).
    ============================================================ */
 export async function getFullQuotesForTokens(tokens) {
   const ok = await ensureLoggedIn();
@@ -474,7 +476,7 @@ export async function getFullQuotesForTokens(tokens) {
             open: q.open,
             high: q.high,
             low: q.low,
-            close: q.close           // ← previous trading session close
+            close: q.close
           });
         }
       }
@@ -489,8 +491,6 @@ export async function getFullQuotesForTokens(tokens) {
 
 /* ============================================================
    PREV-DAY LAST N ONE-MIN CLOSES (for RSI bootstrap)
-   Fetch from 15:10–15:30, slice last N candles
-   Returns [{ ts, close }, ...] or null
    ============================================================ */
 export async function getPrevDayLastCloses(token, prevDate, count = 20) {
   const key = `PREV_${count}_${token}_${prevDate}`;
@@ -514,7 +514,7 @@ export async function getPrevDayLastCloses(token, prevDate, count = 20) {
       .map(bar => ({ ts: bar[0], close: +bar[4] }))
       .filter(x => Number.isFinite(x.close) && x.close > 0);
 
-        if (candles.length < 14) return null;
+    if (candles.length < 14) return null;
     const result = candles.slice(-Math.min(count, candles.length));
     candleCache.set(key, result);
     return result;

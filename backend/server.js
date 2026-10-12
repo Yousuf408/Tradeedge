@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v4.4
+   server.js — TradeAlgo Pro backend  |  v4.6
    - Self-collect minute closes from BS ticks
    - Sliding window RSI (prev day + today)
    - Auto pre-market fetch @ 9:13:30
@@ -9,6 +9,15 @@
    - preopen price ab min_1_close me nahi jata (fake minute fix)
    - BS fetch: overlap guard + bulk DB writes (load fix)
    - NAYA: WS minute-close shadow sampler (ws_1min_*, ws_5min_*)
+   v4.5 changes:
+   - WS Quote mode (Angel_WS v1.4) se per-tick cumulative volume
+   - Sampler ab ws_1min_volume bhi bharta hai (1-min exact volume)
+   - VWAP ready: Σ(close×vol)/Σ(vol) ban sakta hai
+   v4.6 changes:
+   - RSI source = WS 1-min series (multi-day continuous: stored prev days + today)
+   - Din ka pehla candle bhi RSI paata hai (prev days ke seed se)
+   - Live: har minute-end RSI update; startup + admin trigger se backfill
+   - Rollback: env RSI_SOURCE=bs
    ============================================================ */
 
 import express from 'express';
@@ -298,6 +307,11 @@ const prevClosesCache = new Map();
 const todayCloses = new Map();
 const minuteBuffer = new Map();
 
+// v4.6: RSI source switch — 'ws' (default) = WS 1-min continuous series, 'bs' = purana min_1
+const RSI_SOURCE = process.env.RSI_SOURCE || 'ws';
+const wsPrevCloses = new Map();    // pichle stored days ke ws_1min_close (date order, concatenated)
+const wsTodayCloses = new Map();   // aaj ke ws_1min_close (in-memory mirror)
+
 /* RSI formula — accepts 13 previous closes + 1 current (TradingView-style signature) */
 function computeRSI(prevCloses, currentClose) {
   if (!Array.isArray(prevCloses) || prevCloses.length < 13) return null;
@@ -488,6 +502,7 @@ async function loadTodayClosesFromDB() {
 }
 
 async function recomputeAllRSI(date) {
+  if (RSI_SOURCE === 'ws') return recomputeRSIFromWS(date);   // v4.6: WS series path
   try {
     const { rows } = await db.query(
       `SELECT token, min_1_close FROM strategy_bs_snapshot
@@ -515,6 +530,140 @@ async function recomputeAllRSI(date) {
     }
     console.log(`🧪 recomputeAllRSI: ${count} stocks updated for ${date}`);
   } catch (e) { console.error('recomputeAllRSI failed:', e.message); }
+}
+
+/* ============================================================
+   SECTION 4.4.1 — WS-BASED RSI (v4.6, multi-day continuous series)
+   - Series = pichle saare stored days ke ws_1min_close (date order)
+     + aaj ke ws_1min_close current candle tak
+   - RSI = is series ke last 14 closes
+   - Din ka pehla candle bhi RSI paata hai (prev days ke seed se)
+   - Rollback: env RSI_SOURCE=bs
+   ============================================================ */
+async function loadPrevWSClosesFromDB() {
+  try {
+    const activeTokens = STOCKS.map(s => String(s.token));
+    const today = getIST().toISOString().split('T')[0];
+    const { rows } = await db.query(
+      `SELECT token, ws_1min_close
+       FROM strategy_bs_snapshot
+       WHERE strategy_id='momentum' AND ws_1min_close IS NOT NULL
+         AND array_length(ws_1min_close, 1) > 0
+         AND token = ANY($1) AND date < $2
+       ORDER BY date ASC`,
+      [activeTokens, today]
+    );
+    wsPrevCloses.clear();
+    for (const r of rows) {
+      const arr = wsPrevCloses.get(String(r.token)) || [];
+      for (const c of r.ws_1min_close) arr.push(+c);
+      wsPrevCloses.set(String(r.token), arr);
+    }
+    for (const [t, arr] of wsPrevCloses) {
+      if (arr.length > 1000) wsPrevCloses.set(t, arr.slice(-1000));
+    }
+    console.log(`📈 WS prev closes: ${wsPrevCloses.size} tokens (multi-day seed)`);
+  } catch (e) { console.error('WS prev closes load failed:', e.message); }
+}
+
+async function loadTodayWSClosesFromDB() {
+  try {
+    const today = getIST().toISOString().split('T')[0];
+    const activeTokens = STOCKS.map(s => String(s.token));
+    const { rows } = await db.query(
+      `SELECT token, ws_1min_close FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND ws_1min_close IS NOT NULL
+         AND token = ANY($2)`,
+      [today, activeTokens]
+    );
+    wsTodayCloses.clear();
+    for (const r of rows) {
+      if (Array.isArray(r.ws_1min_close) && r.ws_1min_close.length > 0) {
+        wsTodayCloses.set(String(r.token), r.ws_1min_close.map(c => +c));
+      }
+    }
+    console.log(`📊 WS today closes: ${wsTodayCloses.size} tokens`);
+  } catch (e) { console.error('WS today closes load failed:', e.message); }
+}
+
+/* Live: har minute-end pe WS series se RSI → rsi column + bsCache */
+async function updateRSIFromWS(date) {
+  const toks = [], rsis = [];
+  for (const s of STOCKS) {
+    const token = String(s.token);
+    const todayArr = wsTodayCloses.get(token) || [];
+    const prevArr = wsPrevCloses.get(token) || [];
+    const series = todayArr.length ? prevArr.concat(todayArr) : prevArr;
+    if (series.length < 14) continue;
+    const rsi = computeRSIFromArray(series.slice(-14));
+    if (rsi == null) continue;
+    const v = +rsi.toFixed(2);
+    toks.push(token); rsis.push(v);
+    const cached = bsCache.get(token) || {};
+    cached.rsi = v;
+    bsCache.set(token, cached);
+  }
+  if (!toks.length) return;
+  try {
+    await db.query(
+      `UPDATE strategy_bs_snapshot AS s SET rsi=v.rsi
+       FROM unnest($1::text[], $2::numeric[]) AS v(token, rsi)
+       WHERE s.date=$3 AND s.token=v.token AND s.strategy_id='momentum'`,
+      [toks, rsis, date]
+    );
+  } catch (e) { console.error('WS RSI update failed:', e.message); }
+}
+
+/* Backfill / admin: kisi bhi date ka RSI multi-day WS series se */
+async function recomputeRSIFromWS(date) {
+  try {
+    const activeTokens = STOCKS.map(s => String(s.token));
+    const { rows: prevRows } = await db.query(
+      `SELECT token, ws_1min_close FROM strategy_bs_snapshot
+       WHERE strategy_id='momentum' AND ws_1min_close IS NOT NULL
+         AND array_length(ws_1min_close, 1) > 0
+         AND token = ANY($1) AND date < $2
+       ORDER BY date ASC`,
+      [activeTokens, date]
+    );
+    const prevMap = new Map();
+    for (const r of prevRows) {
+      const arr = prevMap.get(String(r.token)) || [];
+      for (const c of r.ws_1min_close) arr.push(+c);
+      prevMap.set(String(r.token), arr);
+    }
+    const { rows } = await db.query(
+      `SELECT token, ws_1min_close FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND ws_1min_close IS NOT NULL
+         AND token = ANY($2)`,
+      [date, activeTokens]
+    );
+    const toks = [], rsis = [];
+    for (const r of rows) {
+      const dayArr = r.ws_1min_close.map(Number);
+      const series = (prevMap.get(String(r.token)) || []).concat(dayArr);
+      if (series.length < 14) continue;
+      const rsi = computeRSIFromArray(series.slice(-14));
+      if (rsi == null) continue;
+      toks.push(String(r.token)); rsis.push(+rsi.toFixed(2));
+    }
+    if (toks.length) {
+      await db.query(
+        `UPDATE strategy_bs_snapshot AS s SET rsi=v.rsi
+         FROM unnest($1::text[], $2::numeric[]) AS v(token, rsi)
+         WHERE s.date=$3 AND s.token=v.token AND s.strategy_id='momentum'`,
+        [toks, rsis, date]
+      );
+      if (date === getIST().toISOString().split('T')[0]) {
+        for (let i = 0; i < toks.length; i++) {
+          const cached = bsCache.get(toks[i]) || {};
+          cached.rsi = rsis[i];
+          bsCache.set(toks[i], cached);
+        }
+      }
+    }
+    console.log(`🧪 recomputeRSIFromWS: ${toks.length} stocks updated for ${date}`);
+  } catch (e) { console.error('recomputeRSIFromWS failed:', e.message); }
 }
 
 
@@ -606,42 +755,72 @@ function parsePreopen(json) {
    - Purana min_1/min_5 pipeline bilkul untouched (compare ke liye)
    ============================================================ */
 const lastLtpAt = new Map();
+const lastWsVolume = new Map();   // v4.5: WS tick ka cumulative volume (exchange se)
+const prevCumVol = new Map();     // v4.5: pichle minute-end ka cumulative volume
+const minVolRing = new Map();     // v4.5: pichle 5 one-min volumes (5-min volume ke liye)
 let wsMinuteKey = null;
 
 async function flushWSMinuteClose(prevKey, prevTs, date) {
-  const tokens = [], closes = [];
+  const tokens = [], closes = [], minVols = [];
   for (const s of STOCKS) {
     const token = String(s.token);
     const age = Date.now() - (lastLtpAt.get(token) || 0);
     let close = age < 75000 ? getCachedLTP(token) : null;   // WS fresh hai to WS
     if (close == null) close = bsCache.get(token)?.ltp ?? null;  // warna BS fallback
     if (!Number.isFinite(close) || close <= 0) continue;
+
+    // v4.5: 1-min volume = abhi ka cumulative − pichle minute-end ka cumulative
+    // (WS na ho to BS ka cumulative volume fallback)
+    const cum = lastWsVolume.get(token) ?? bsCache.get(token)?.volume ?? null;
+    const prev = prevCumVol.get(token) ?? null;
+    let mv = 0;
+    if (cum != null && prev != null && cum >= prev) mv = cum - prev;
+    if (cum != null) prevCumVol.set(token, cum);
+
     tokens.push(token);
     closes.push(close);
+    minVols.push(mv);
+
+    // v4.5: 1-min volume ko ring buffer me rakho (max 5) — 5-min volume isi se banega
+    const ring = minVolRing.get(token) || [];
+    ring.push(mv);
+    if (ring.length > 5) ring.shift();
+    minVolRing.set(token, ring);
   }
   if (!tokens.length) return;
 
   const isFive = Number(prevKey.slice(3)) % 5 === 4;   // minute 4,9,14... = 5-min window ka close
   const tss = tokens.map(() => prevTs);
+  const vols5 = isFive ? tokens.map(t => (minVolRing.get(t) || []).reduce((a, b) => a + b, 0)) : [];
   try {
     await db.query(
       `UPDATE strategy_bs_snapshot AS s
-       SET ws_1min_close = COALESCE(s.ws_1min_close, ARRAY[]::numeric[]) || v.c,
-           ws_1min_ts    = COALESCE(s.ws_1min_ts,    ARRAY[]::timestamptz[]) || v.t
-       FROM unnest($1::text[], $2::numeric[], $3::timestamptz[]) AS v(token, c, t)
-       WHERE s.date = $4 AND s.token = v.token AND s.strategy_id = 'momentum'`,
-      [tokens, closes, tss, date]
+       SET ws_1min_close  = COALESCE(s.ws_1min_close,  ARRAY[]::numeric[]) || v.c,
+           ws_1min_ts     = COALESCE(s.ws_1min_ts,     ARRAY[]::timestamptz[]) || v.t,
+           ws_1min_volume = COALESCE(s.ws_1min_volume, ARRAY[]::numeric[]) || v.vol
+       FROM unnest($1::text[], $2::numeric[], $3::timestamptz[], $4::numeric[]) AS v(token, c, t, vol)
+       WHERE s.date = $5 AND s.token = v.token AND s.strategy_id = 'momentum'`,
+      [tokens, closes, tss, minVols, date]
     );
     if (isFive) {
       await db.query(
         `UPDATE strategy_bs_snapshot AS s
-         SET ws_5min_close = COALESCE(s.ws_5min_close, ARRAY[]::numeric[]) || v.c,
-             ws_5min_ts    = COALESCE(s.ws_5min_ts,    ARRAY[]::timestamptz[]) || v.t
-         FROM unnest($1::text[], $2::numeric[], $3::timestamptz[]) AS v(token, c, t)
-         WHERE s.date = $4 AND s.token = v.token AND s.strategy_id = 'momentum'`,
-        [tokens, closes, tss, date]
+         SET ws_5min_close  = COALESCE(s.ws_5min_close,  ARRAY[]::numeric[]) || v.c,
+             ws_5min_ts     = COALESCE(s.ws_5min_ts,     ARRAY[]::timestamptz[]) || v.t,
+             ws_5min_volume = COALESCE(s.ws_5min_volume, ARRAY[]::numeric[]) || v.vol
+         FROM unnest($1::text[], $2::numeric[], $3::timestamptz[], $4::numeric[]) AS v(token, c, t, vol)
+         WHERE s.date = $5 AND s.token = v.token AND s.strategy_id = 'momentum'`,
+        [tokens, closes, tss, vols5, date]
       );
     }
+    // v4.6: in-memory mirror (RSI continuous series ke liye) + live WS RSI
+    for (let i = 0; i < tokens.length; i++) {
+      const arr = wsTodayCloses.get(tokens[i]) || [];
+      arr.push(closes[i]);
+      wsTodayCloses.set(tokens[i], arr);
+    }
+    if (RSI_SOURCE === 'ws') await updateRSIFromWS(date);
+
     console.log(`🕐 WS minute-close: ${tokens.length} tokens @ ${prevKey}${isFive ? ' (5m)' : ''}`);
   } catch (e) { console.error('WS minute-close flush failed:', e.message); }
 }
@@ -775,8 +954,9 @@ function broadcastBS(fetchedAt) {
   })}\n\n`);
 }
 
-function handleTick(token, ltp) {
+function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
+  if (extra && Number.isFinite(extra.volume)) lastWsVolume.set(String(token), extra.volume);   // v4.5: WS cumulative volume
 
   if (token === NIFTY50_TOKEN) {
     setCachedLTP(token, ltp);
@@ -1227,45 +1407,25 @@ app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
     let targetDate = dateParam;
 
     if (!targetDate) {
+      const src = RSI_SOURCE === 'ws' ? 'ws_1min_close' : 'min_1_close';
       const { rows } = await db.query(
         `SELECT date::text AS d FROM strategy_bs_snapshot
-         WHERE strategy_id='momentum' AND min_1_close IS NOT NULL
+         WHERE strategy_id='momentum' AND ${src} IS NOT NULL
          ORDER BY date DESC LIMIT 1`
       );
-      if (!rows.length) return res.json({ ok: false, error: 'No min_1_close data found' });
+      if (!rows.length) return res.json({ ok: false, error: 'No candle data found' });
       targetDate = rows[0].d;
     }
 
-    const { rows: dataRows } = await db.query(
-      `SELECT token, sym, min_1_close FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL`,
+    // v4.6: RSI ab multi-day WS series se (RSI_SOURCE=bs ho to purana min_1 path)
+    await recomputeAllRSI(targetDate);
+
+    const { rows: out } = await db.query(
+      `SELECT sym, rsi FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND rsi IS NOT NULL
+       ORDER BY rsi DESC`,
       [targetDate]
     );
-
-    const out = [];
-    for (const r of dataRows) {
-      const closes = r.min_1_close.map(Number);
-      if (closes.length < 14) continue;
-      const last14 = closes.slice(-14);
-      const rsi = computeRSIFromArray(last14);
-      if (rsi == null) continue;
-      const v = +rsi.toFixed(2);
-
-      try {
-        await db.query(
-          `UPDATE strategy_bs_snapshot SET rsi=$1
-           WHERE date=$2 AND token=$3 AND strategy_id='momentum'`,
-          [v, targetDate, r.token]
-        );
-        // Sync in-memory cache
-        const cached = bsCache.get(String(r.token)) || {};
-        cached.rsi = v;
-        bsCache.set(String(r.token), cached);
-      } catch {}
-      out.push({ sym: r.sym, rsi: v });
-    }
-
-    out.sort((a, b) => b.rsi - a.rsi);
     console.log(`🧪 Compute-RSI: ${out.length} saved for ${targetDate}`);
     res.json({ ok: true, date: targetDate, count: out.length, top10: out.slice(0, 10), bottom10: out.slice(-10) });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1493,7 +1653,8 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
         const existing = bsCache.get(String(r.token)) || {};
 
         let rsi = existing.rsi ?? null;
-        if (rsi == null) {
+        // v4.6: RSI ab WS series se banta hai; BS path sirf rollback (RSI_SOURCE=bs) me
+        if (RSI_SOURCE === 'bs' && rsi == null) {
           const closes14 = buildCloses14(r.token);
           if (closes14) rsi = computeRSIFromArray(closes14);
         }
@@ -1703,6 +1864,8 @@ function scheduleMorningPreload() {
     await loadPrevCloseFromDB();       // ← YE ADD
     await loadPrevClosesFromDB();
     await loadTodayClosesFromDB();
+    await loadPrevWSClosesFromDB();    // v4.6: naya din = naya WS seed
+    await loadTodayWSClosesFromDB();   // v4.6
     const today = getIST().toISOString().split('T')[0];
     await recomputeAllRSI(today);
     scheduleMorningPreload();
@@ -1753,7 +1916,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v4.4`);
+  console.log(`✅ Server on port ${PORT} — v4.6`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 
@@ -1771,9 +1934,11 @@ app.listen(PORT, async () => {
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();
+  await loadPrevWSClosesFromDB();    // v4.6: multi-day WS seed
+  await loadTodayWSClosesFromDB();   // v4.6: aaj ke WS closes
 
   const todayDate = getIST().toISOString().split('T')[0];
-  await recomputeAllRSI(todayDate);
+  await recomputeAllRSI(todayDate);  // v4.6: WS series se backfill
 
   const nowIST = getIST();
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();

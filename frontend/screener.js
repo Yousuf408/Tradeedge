@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v3.7
+   SCREENER.JS  — v3.8
    + Default strategy = Momentum
    + Fixed # column (rank from server)
    + Gap % filter for Top Gainers/Losers
@@ -10,6 +10,9 @@
    + DAY OPEN column (Momentum) — from Angel BS quote.open
    + RSI column (Momentum) — first tick 9:15, freeze after
    + EOD closes fetch button (manual for first-time setup)
+   + v3.8: RSI CHIP BAR — 9:15 pe server-locked list
+           (rank 1-10 pool · gap up <=3% · first-tick RSI >=70)
+           poore din STATIC, SSE 'chip' event + /api/screener/chips se
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -25,6 +28,7 @@ let SCREENER_ORB = {};
 let SCREENER_PREOPEN = {};         // token -> { price }
 let SCREENER_DAY_OPEN = {};        // token -> number
 let SCREENER_RSI = {};             // token -> number
+let SCREENER_CHIPS = [];           // v3.8: day-fixed chip list (server 9:15 pe lock karta hai)
 let SCREENER_INIT_DONE = false;
 let SCREENER_SSE = null;
 let FETCHING = false;
@@ -60,6 +64,7 @@ async function initScreener() {
   await loadStockList();
   await loadCachedData();
   await loadLTP();
+  await loadChips();               // v3.8: chip list (locked ya khali)
   SCREENER_INIT_DONE = true;
   startSSE();
 }
@@ -129,6 +134,15 @@ function renderStrategyControls() {
     const tableWrap = panelGlass.querySelector('.table-wrap');
     panelGlass.insertBefore(chips, tableWrap);
   }
+
+  // v3.8: chip bar container (stage chips ke baad, table ke upar)
+  if (panelGlass && !document.getElementById('chipBar')) {
+    const bar = document.createElement('div');
+    bar.id = 'chipBar';
+    bar.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px;align-items:center';
+    const tableWrap2 = panelGlass.querySelector('.table-wrap');
+    panelGlass.insertBefore(bar, tableWrap2);
+  }
 }
 
 function onPerTradeChange() {
@@ -146,6 +160,42 @@ async function onStrategyChange(value) {
   renderStrategyControls();
   await loadLTP();
   renderScreenerTable();
+}
+
+/* ============================================================
+   SECTION 2.0 — RSI CHIP BAR (v3.8)
+   9:15 pe server-locked list, poore din STATIC
+   ============================================================ */
+function renderChipBar() {
+  const el = document.getElementById('chipBar');
+  if (!el) return;
+  if (SCREENER_ACTIVE_STRATEGY !== 'momentum') { el.innerHTML = ''; return; }
+  if (!SCREENER_CHIPS.length) {
+    el.innerHTML = '<span style="font-size:11px;color:var(--text-muted)">🔒 RSI chips 9:15 pe lock hongi (top-10 rank · gap ≤3% · RSI ≥70)</span>';
+    return;
+  }
+  el.innerHTML = SCREENER_CHIPS.map(c => {
+    const rsiNow = SCREENER_RSI[c.token];
+    const rsiShow = rsiNow != null ? (+rsiNow).toFixed(0)
+                  : (c.rsiAtLock != null ? (+c.rsiAtLock).toFixed(0) : '—');
+    const gap = c.gapPct != null ? (+c.gapPct).toFixed(2) : '—';
+    return `<span style="padding:4px 10px;border-radius:999px;background:rgba(108,92,231,0.12);
+      border:1px solid rgba(108,92,231,0.35);font-size:11px;font-weight:700;color:#6C5CE7;white-space:nowrap">
+      🔒 ${c.sym} <span style="color:var(--text-muted)">#${c.rank}</span>
+      <span style="color:var(--success)">gap +${gap}%</span>
+      <span style="color:var(--danger)">RSI ${rsiShow}🔥</span>
+    </span>`;
+  }).join('');
+}
+
+async function loadChips() {
+  try {
+    const r = await fetch(API + '/api/screener/chips', {
+      headers: { Authorization: 'Bearer ' + getToken() }
+    });
+    const d = await r.json();
+    if (d && d.chips) { SCREENER_CHIPS = d.chips; renderChipBar(); }
+  } catch (e) { console.error('Chips load failed:', e); }
 }
 
 /* ============================================================
@@ -195,6 +245,7 @@ function renderChips() {
       chip('top_gainers', '🚀 Top 15 Gainers') +
       chip('top_losers', '📉 Top 15 Losers');
     el.style.display = '';
+    renderChipBar();      // v3.8
     return;
   }
 
@@ -221,6 +272,8 @@ function renderChips() {
     chip('entry', '🎯 Entry Signal', counts.entry) +
     chip('lowbrok', '⬇️ Low Broken', counts.lowbrok) +
     chip('waiting', '⏸️ Waiting', counts.waiting);
+
+  renderChipBar();      // v3.8
 }
 
 /* ============================================================
@@ -237,7 +290,7 @@ function setSort(field) {
 }
 
 function sortIndicator(field) {
-  if (SCREENER_SORT_BY !== field) return '<span style="opacity:0.3;margin-left:4px">↕</span>';
+  if (SCREENER_SORT_BY === field) return '<span style="opacity:0.3;margin-left:4px">↕</span>';
   return SCREENER_SORT_DIR === 'desc'
     ? '<span style="margin-left:4px">▼</span>'
     : '<span style="margin-left:4px">▲</span>';
@@ -512,7 +565,7 @@ function updateORBRow(token, state) {
   if (stageCell && SCREENER_ALL_CANDLES[token]) {
     const stage = resolveOrbStage(token, SCREENER_ALL_CANDLES[token], SCREENER_LTP[token]);
     stageCell.style.color = stage.color;
-    stageCell.style.fontWeight = stage.weight;
+    stageCell.fontWeight = stage.weight;
     stageCell.textContent = stage.label;
   }
 
@@ -1015,6 +1068,10 @@ function startSSE() {
           if (v.rsi != null) SCREENER_RSI[token] = v.rsi;
         }
         renderScreenerTable();
+      }
+      else if (msg.type === 'chip' && msg.chips) {   // v3.8: chip list lock event
+        SCREENER_CHIPS = msg.chips;
+        renderChipBar();
       }
     } catch {}
   };

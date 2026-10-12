@@ -187,6 +187,9 @@ export function getSessionStatus() {
 
 export function getFeedToken() { return session.feedToken; }
 
+/* v2.4: expose JWT for broker margin service */
+export function getJwt() { return session.jwtToken || null; }
+
 /* ============================================================
    CACHE — candles + LTP
    ============================================================ */

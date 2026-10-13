@@ -1580,9 +1580,10 @@ app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
    SECTION 7.2 — HISTORICAL BACKFILL (v5.4)
    Fetch 1-min + 5-min from Angel REST, overwrite WS columns
    ============================================================ */
-const HISTORICAL_DAYS_DEFAULT = 4;
+const HISTORICAL_DAYS_DEFAULT = 2;   // v4.9.1: yesterday + today only
 const ANGEL_HISTORICAL_URL = 'https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData';
 let historicalRunning = false;
+const historicalFailed = new Set();   // v4.9.1: pichle run ke failed tokens → agla click sirf inhe retry karega
 
 function getAnyAngelJwt() {
   if (getSessionStatusREST()?.loggedIn && getJwtREST?.())  return getJwtREST();
@@ -1655,17 +1656,47 @@ function groupCandlesByDate(raw) {
   return byDate;
 }
 
+function fillMissingMinutes(by1m) {
+  // Angel sirf traded minutes deta hai → khali minutes bhar do
+  // (carry-forward close, volume 0) taaki har din 375 continuous candles ho
+  // — live WS sampler ki convention se exact match
+  for (const date in by1m) {
+    const src = by1m[date];
+    if (!src.minutes || !src.minutes.length) continue;
+    const have = new Map();
+    for (let i = 0; i < src.minutes.length; i++) have.set(src.minutes[i], i);
+    const closes = [], ts = [], vols = [], minutes = [];
+    let prevClose = src.closes[0];   // leading minutes = pehli candle ka close
+    for (let m = 555; m <= 929; m++) {   // 9:15 → 15:29 IST
+      const idx = have.get(m);
+      let c, v;
+      if (idx !== undefined) { c = src.closes[idx]; v = src.vols[idx]; }
+      else { c = prevClose; v = 0; }
+      prevClose = c;
+      const hh = String(Math.floor(m / 60)).padStart(2, '0');
+      const mm = String(m % 60).padStart(2, '0');
+      closes.push(c); vols.push(v); minutes.push(m);
+      ts.push(idx !== undefined ? src.ts[idx] : `${date}T${hh}:${mm}:00.000+05:30`);
+    }
+    by1m[date] = { closes, ts, vols, minutes };
+  }
+  return by1m;
+}
+
 function derive5minFrom1min(by1m) {
   // 5-min candle ends at minutes % 5 === 4  (matches WS sampler convention)
+  // 5-min volume = pichle 5 one-min volumes ka sum (live ws_5min_volume jaisa)
   const by5m = {};
   for (const date in by1m) {
     const src = by1m[date];
     const dst = { closes: [], ts: [], vols: [] };
     for (let i = 0; i < src.minutes.length; i++) {
       if (src.minutes[i] % 5 === 4) {
+        let v = 0;
+        for (let k = Math.max(0, i - 4); k <= i; k++) v += src.vols[k] || 0;
         dst.closes.push(src.closes[i]);
         dst.ts.push(src.ts[i]);
-        dst.vols.push(src.vols[i]);
+        dst.vols.push(v);
       }
     }
     by5m[date] = dst;
@@ -1679,7 +1710,7 @@ async function backfillOneStock(stock, daysBack) {
 
   // 1-min from Angel
   const raw1m = await fetchAngelInterval(token, 'ONE_MINUTE', daysBack);
-  const by1m = groupCandlesByDate(raw1m);
+  const by1m = fillMissingMinutes(groupCandlesByDate(raw1m));   // v4.9.1: 375 continuous candles
 
   // Derive 5-min
   const by5m = derive5minFrom1min(by1m);
@@ -1737,8 +1768,13 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
   const summary = { ok: 0, failed: 0, skipped: 0, days_saved: 0, total: STOCKS.length };
   const errors = [];
 
-  const DELAY_MS = 320;   // Angel rate-limit: ~3/sec
-  const queue = [...STOCKS];
+  const DELAY_MS = 900;   // v4.9.1: ~1.1 req/sec — Angel rate-limit safe
+  const retryOnly = req.body?.all !== true && historicalFailed.size > 0;
+  const queue = retryOnly
+    ? STOCKS.filter(s => historicalFailed.has(String(s.token)))
+    : [...STOCKS];
+  if (!retryOnly) historicalFailed.clear();
+  console.log(`📥 Historical start: ${queue.length} stocks (${retryOnly ? 'retry-failed only' : 'full run'})`);
   let processed = 0;
 
   try {
@@ -1752,9 +1788,21 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
         } else {
           summary.skipped++;
         }
+        historicalFailed.delete(String(stock.token));   // ✅ success = retry list se hatao
       } catch (e) {
-        summary.failed++;
-        if (errors.length < 20) errors.push(`${stock.sym}: ${e.message}`);
+        // v4.9.1: ek retry, 2s ruk ke (rate-limit safe)
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const r2 = await backfillOneStock(stock, days);
+          if (r2.days_saved > 0) { summary.ok++; summary.days_saved += r2.days_saved; }
+          else summary.skipped++;
+          historicalFailed.delete(String(stock.token));
+        } catch (e2) {
+          summary.failed++;
+          historicalFailed.add(String(stock.token));    // ❌ fail = agla click sirf inhe chalega
+          if (summary.failed === 1) console.error('❌ First error:', stock.sym, e2.message);
+          if (errors.length < 20) errors.push(`${stock.sym}: ${e2.message}`);
+        }
       }
       processed++;
       if (processed % 25 === 0) {
@@ -1764,7 +1812,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
     }
 
     const elapsed = Math.round((Date.now() - t0) / 1000);
-    console.log(`✅ Historical DONE ${elapsed}s | ok=${summary.ok} skip=${summary.skipped} fail=${summary.failed} days=${summary.days_saved}`);
+    console.log(`✅ Historical DONE ${elapsed}s | ok=${summary.ok} skip=${summary.skipped} fail=${summary.failed} days=${summary.days_saved} | retry_pending=${historicalFailed.size}`);
 
     // Rebuild memory after backfill
     try {

@@ -1586,6 +1586,82 @@ app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* ============================================================
+   TEMPORARY — RSI test route (remove after validation)
+   ============================================================ */
+app.get('/api/test-rsi-3stocks', async (req, res) => {
+  try {
+    const JWT = getJwtREST();
+    if (!JWT) return res.status(500).json({ error: 'No Angel JWT' });
+
+    const stocks = [
+      { sym: 'BANDHANBNK', token: '2263' },
+      { sym: 'HCLTECH',    token: '7229' },
+      { sym: 'BSOFT',      token: '6994' }
+    ];
+
+    const today = getIST().toISOString().split('T')[0];
+    const fromDate = new Date(getIST().getTime() - 5 * 24 * 3600 * 1000).toISOString().split('T')[0];
+
+    const out = [];
+
+    for (const s of stocks) {
+      const r = await fetch('https://apiconnect.angelbroking.in/rest/secure/angelbroking/historical/v1/getCandleData', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'X-UserType': 'USER',
+          'X-SourceID': 'WEB',
+          'X-ClientLocalIP': '127.0.0.1',
+          'X-ClientPublicIP': '127.0.0.1',
+          'X-MACAddress': '00:00:00:00:00:00',
+          'X-PrivateKey': process.env.ANGEL_API_KEY,
+          'Authorization': 'Bearer ' + JWT
+        },
+        body: JSON.stringify({
+          exchange: 'NSE',
+          symboltoken: s.token,
+          interval: 'ONE_MINUTE',
+          fromdate: `${fromDate} 09:15`,
+          todate: `${today} 15:30`
+        })
+      });
+
+      const j = await r.json();
+      if (!j.status || !Array.isArray(j.data)) {
+        out.push({ sym: s.sym, error: j.message || 'no data', raw: j });
+        continue;
+      }
+
+      const candles = j.data.map(b => ({ ts: String(b[0]), close: +b[4] }));
+      const todayCandles = candles.filter(c => c.ts.startsWith(today));
+
+      if (!todayCandles.length) {
+        out.push({ sym: s.sym, error: 'no today candles', total: candles.length });
+        continue;
+      }
+
+      const before915 = candles.filter(c => c.ts < todayCandles[0].ts);
+      const prev50 = before915.slice(-50).map(c => c.close);
+      const series = [...prev50, todayCandles[0].close];
+      const st = computeRSIWilderState(series);
+
+      out.push({
+        sym: s.sym,
+        total_fetched: candles.length,
+        candles_915_ts: todayCandles[0].ts,
+        close_915: todayCandles[0].close,
+        prev_candles_used: prev50.length,
+        rsi_at_915: st ? +st.rsi.toFixed(2) : null
+      });
+    }
+
+    res.json({ ok: true, today, fromDate, out });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 /* ============================================================
    SECTION 8 — DAY H/L/C FETCH (15:31 IST)

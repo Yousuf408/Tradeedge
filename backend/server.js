@@ -1581,7 +1581,7 @@ app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
    Fetch 1-min + 5-min from Angel REST, overwrite WS columns
    ============================================================ */
 const HISTORICAL_DAYS_DEFAULT = 4;
-const ANGEL_HISTORICAL_URL = 'https://apiconnect.angelbroking.in/rest/secure/angelbroking/historical/v1/getCandleData';
+const ANGEL_HISTORICAL_URL = 'https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData';
 let historicalRunning = false;
 
 function getAnyAngelJwt() {
@@ -1731,7 +1731,6 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
     return res.status(409).json({ error: 'Historical fetch already running' });
   }
   historicalRunning = true;
-  console.log('🔑 JWT ready:', !!getAnyAngelJwt());   // ← ye line add karo
 
   const days = Math.min(Math.max(+req.body?.days || HISTORICAL_DAYS_DEFAULT, 1), 5);
   const t0 = Date.now();
@@ -1755,7 +1754,6 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
         }
       } catch (e) {
         summary.failed++;
-        if (summary.failed === 1) console.error('❌ First error:', stock.sym, e.message);   // ← ye line add karo
         if (errors.length < 20) errors.push(`${stock.sym}: ${e.message}`);
       }
       processed++;

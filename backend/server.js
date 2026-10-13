@@ -1731,6 +1731,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
     return res.status(409).json({ error: 'Historical fetch already running' });
   }
   historicalRunning = true;
+  console.log('🔑 JWT ready:', !!getAnyAngelJwt());   // ← ye line add karo
 
   const days = Math.min(Math.max(+req.body?.days || HISTORICAL_DAYS_DEFAULT, 1), 5);
   const t0 = Date.now();
@@ -1754,6 +1755,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
         }
       } catch (e) {
         summary.failed++;
+        if (summary.failed === 1) console.error('❌ First error:', stock.sym, e.message);   // ← ye line add karo
         if (errors.length < 20) errors.push(`${stock.sym}: ${e.message}`);
       }
       processed++;

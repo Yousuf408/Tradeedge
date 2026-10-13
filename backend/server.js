@@ -2,6 +2,11 @@
    server.js — TradeAlgo Pro backend  |  v5.4
    v5.1: Margin service JWT fallback
    v5.2: BS upsert writes day_high/low/close/prev_close;
+   v5.3: prev_close hardening —
+         - BS-first read sirf TODAY ki row se (purani `date <=` query 9:15 se pehle
+           yesterday-wala prev_close utha leti thi = galat change%)
+         - 9:15 ke pehle BS upsert ke baad prevCloseCache sync (din me ek baar)
+         - Momentum change% / rank / chips sab ka source = BS table prev_close
          prevCloseCache from Angel q.close;
          Momentum 15m-independent; pivot load removed
    v5.4: NEW admin route — Angel REST 1-min + 5-min candle backfill
@@ -243,7 +248,7 @@ async function loadPrevCloseFromDB() {
        FROM strategy_bs_snapshot
        WHERE prev_close IS NOT NULL
          AND token = ANY($1)
-         AND date <= $2
+         AND date = $2
        ORDER BY token, date DESC`,
       [activeTokens, latestDate]
     );
@@ -2066,6 +2071,7 @@ async function autoFetchPreopen() {
    ============================================================ */
 let bsIntervalTimer = null;
 let bsRunning = false;
+let prevSyncDate = null;   // v5.3: din me ek baar prev_close cache sync
 
 async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
   if (bsRunning) { if (!silent) console.log('💹 Auto-BS: previous run in progress — skipping'); return; }
@@ -2195,6 +2201,12 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
           [p.date, bTokens, bSyms, bBuy, bSell, bLtp, bVol, bOpen, bHigh, bLow, bClose, bPivot, bPrevClose, bRsi, fetchedAt]
         );
       } catch (e) { dbErrors.push(`bulk-bs: ${e.message}`); }
+    }
+
+    // v5.3: 9:15 ke pehle BS write ke baad prev_close cache sync (din me ek baar)
+    if (!volumeOnly && prevSyncDate !== p.date) {
+      await loadPrevCloseFromDB();
+      prevSyncDate = p.date;
     }
 
     if (minuteChanges.length) {

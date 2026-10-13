@@ -1444,7 +1444,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
   const enriched = tokens.map(t => {
     const token = String(t);
     const state = getOrbState(token, p.date);
-    const ltp = getCachedLTP(token);
+    const ltp = getCachedLTP(token) ?? bsCache.get(token)?.ltp ?? null;   // v4.9.4: market band/restart ke baad BS table ka LTP
     const prevClose = prevCloseCache.get(token) || null;
     const quote = quoteCache.get(token) || null;
     const pivot = pivotCache.get(token) || null;

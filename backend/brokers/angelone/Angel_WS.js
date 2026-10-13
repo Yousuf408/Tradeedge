@@ -1,21 +1,17 @@
 /* ============================================================
-   Angel_WS.js — v1.5
+   Angel_WS.js — v1.6
    WebSocket live feed — reconnects + gap backfill support
 
-   CHANGELOG v1.4:
-   - Subscribe mode configurable: WS_MODE env (default 2 = Quote)
-     mode 1 = LTP only (51-byte packet)
-     mode 2 = Quote  (115-byte packet: ltp + volume + O/H/L/C)
-     mode 3 = Snap Quote (depth)
-   - parseTick handles 51 and 115 byte packets
-   - onTick callback gets full tick object as 4th arg
-
-   CHANGELOG v1.5 (2026-10-13):
-   - Angel ne Quote packet 115 → 123 bytes kar diya (8-byte OI field append)
+   CHANGELOG v1.5:
+   - Angel ne Quote packet 115 → 123 bytes kar diya (8-byte field append)
    - parseTick ab 123-byte packets bhi accept karta hai
-   - Same offsets: LTP@107, vol@67, O/H/L/C@75/83/91/99
-   - Extra 8 bytes (115-122) = Open Interest (ignored for now)
-   - Hex log har naye size pe ek baar (debug ke liye)
+   - Offsets assumed same as 115
+
+   CHANGELOG v1.6 (2026-10-13):
+   - DIAGNOSTIC build: first 5 x 123-byte ticks pe saare candidate
+     offset values log karta hai (43/59/67/75/83/91/99/107/115)
+   - Isse confirm hoga ki LTP kis byte pe hai
+   - Baaki sab kuch v1.5 jaisa
    ============================================================ */
 
 import WebSocket from 'ws';
@@ -85,6 +81,7 @@ export function getWSStatus() {
    INTERNAL
    ============================================================ */
 let _hexLogged = 0;
+let _debugCount = 0;
 const _sizesLogged = new Set();
 
 function connect() {
@@ -212,13 +209,15 @@ function clearTimers() {
      [91-98]  low   (paise ÷100)
      [99-106] close (paise ÷100, prev day close)
      [107-114] LTP  (paise ÷100)
-     [115-122] (v1.5) Open Interest int64 — IGNORED for now
+     [115-122] (v1.5+) extra field (likely Open Interest) — IGNORED
+
+   v1.6 DIAGNOSTIC: dumps all candidate offsets for first 5 ticks
    ============================================================ */
 function parseTick(buffer) {
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
   const len = buf.length;
 
-  // Log hex of first 3 real ticks (any size ≥30) — debug help
+  // Log hex of first 3 real ticks (any size ≥30)
   if (_hexLogged < 3 && len >= 30) {
     _hexLogged++;
     console.log(`🔬 tick hex [${len}]: ${buf.toString('hex')}`);
@@ -229,14 +228,26 @@ function parseTick(buffer) {
   const token = buf.slice(2, 27).toString('ascii').replace(/\0+$/, '').trim();
   if (!token) return null;
 
+  /* LTP mode (51 bytes) */
   if (len === 51) {
-    /* LTP mode — price × 100, little-endian int64 at byte 43 */
     const ltp = Number(buf.readBigInt64LE(43)) / 100;
     if (!Number.isFinite(ltp) || ltp <= 0 || ltp > 10000000) return null;
     return { token, ltp: +ltp.toFixed(2), volume: null };
   }
 
-  /* Quote mode (115 or 123) — same offsets for both */
+  /* v1.6 DIAGNOSTIC: dump all candidate offsets for first 5 x 123-byte ticks */
+  if (len === 123 && _debugCount < 5) {
+    _debugCount++;
+    const read = off => Number(buf.readBigInt64LE(off)) / 100;
+    console.log(
+      `🔎 [123] tok=${token} ` +
+      `35=${read(35)} 43=${read(43)} 51=${read(51)} 59=${read(59)} ` +
+      `67=${read(67)} 75=${read(75)} 83=${read(83)} 91=${read(91)} ` +
+      `99=${read(99)} 107=${read(107)} 115=${read(115)}`
+    );
+  }
+
+  /* Quote mode (115 or 123) — current offsets */
   const ltp = Number(buf.readBigInt64LE(107)) / 100;
   if (!Number.isFinite(ltp) || ltp <= 0 || ltp > 10000000) return null;
 
@@ -256,7 +267,6 @@ function parseTick(buffer) {
     close: close > 0 ? +close.toFixed(2) : null
   };
 
-  /* v1.5: 123-byte packet has 8 extra bytes at end = Open Interest */
   if (len === 123) {
     const oi = Number(buf.readBigInt64LE(115));
     tick.openInterest = Number.isFinite(oi) && oi >= 0 ? oi : null;

@@ -1,0 +1,4 @@
+tvdatafeed==2.1.0
+pandas
+flask
+gunicorn

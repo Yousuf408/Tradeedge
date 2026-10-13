@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.2
+   SCREENER.JS  — v4.3
    + Default strategy = Momentum
    + Fixed # column (rank from server)
    + Gap % filter for Top Gainers/Losers
@@ -13,8 +13,9 @@
    + v3.8: RSI CHIP BAR
    + v4.0: MAXQTY from real broker leverage
    + v4.1: 📥 Fetch Historical button (Angel REST 1m+5m backfill)
-   + v4.2: cleanup —
-           - "RSI Chips" table filter REMOVED (chip bar kaafi hai, duplicate tha)
+   + v4.2: cleanup — Pivot/Target-SL columns removed, B/S Volume rename, compact controls
+   + v4.3: chip BAR removed (duplicate list thi) — "🔒 RSI Chips" filter button wapas
+           (click pe table me chip stocks dikhte hain — ek hi jagah)
            - Momentum table se Pivot + Target/SL columns REMOVED
            - "Buy / Sell" header → "B/S Volume"
            - Controls compact (Capital input same row)
@@ -152,14 +153,6 @@ function renderStrategyControls() {
     const tableWrap = panelGlass.querySelector('.table-wrap');
     panelGlass.insertBefore(chips, tableWrap);
   }
-
-  if (panelGlass && !document.getElementById('chipBar')) {
-    const bar = document.createElement('div');
-    bar.id = 'chipBar';
-    bar.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px;align-items:center';
-    const tableWrap2 = panelGlass.querySelector('.table-wrap');
-    panelGlass.insertBefore(bar, tableWrap2);
-  }
 }
 
 function onPerTradeChange() {
@@ -182,35 +175,13 @@ async function onStrategyChange(value) {
 /* ============================================================
    SECTION 2.0 — RSI CHIP BAR
    ============================================================ */
-function renderChipBar() {
-  const el = document.getElementById('chipBar');
-  if (!el) return;
-  if (SCREENER_ACTIVE_STRATEGY !== 'momentum') { el.innerHTML = ''; return; }
-  if (!SCREENER_CHIPS.length) {
-    el.innerHTML = '<span style="font-size:11px;color:var(--text-muted)">🔒 RSI chips 9:15 pe lock hongi (top-10 rank · gap ≤3% · RSI ≥70)</span>';
-    return;
-  }
-  el.innerHTML = SCREENER_CHIPS.map(c => {
-    const rsiNow = SCREENER_RSI[c.token];
-    const rsiShow = rsiNow != null ? (+rsiNow).toFixed(0)
-                  : (c.rsiAtLock != null ? (+c.rsiAtLock).toFixed(0) : '—');
-    const gap = c.gapPct != null ? (+c.gapPct).toFixed(2) : '—';
-    return `<span style="padding:4px 10px;border-radius:999px;background:rgba(108,92,231,0.12);
-      border:1px solid rgba(108,92,231,0.35);font-size:11px;font-weight:700;color:#6C5CE7;white-space:nowrap">
-      🔒 ${c.sym} <span style="color:var(--text-muted)">#${c.rank}</span>
-      <span style="color:var(--success)">gap +${gap}%</span>
-      <span style="color:var(--danger)">RSI ${rsiShow}🔥</span>
-    </span>`;
-  }).join('');
-}
-
 async function loadChips() {
   try {
     const r = await fetch(API + '/api/screener/chips', {
       headers: { Authorization: 'Bearer ' + getToken() }
     });
     const d = await r.json();
-    if (d && d.chips) { SCREENER_CHIPS = d.chips; renderChipBar(); }
+    if (d && d.chips) { SCREENER_CHIPS = d.chips; renderScreenerTable(); }
   } catch (e) { console.error('Chips load failed:', e); }
 }
 
@@ -256,13 +227,12 @@ function renderChips() {
       const active = SCREENER_MOMENTUM_FILTER === key ? 'active' : '';
       return `<button class="filter-chip ${active}" onclick="setMomentumFilter('${key}')">${label}</button>`;
     };
-    // v4.2: "RSI Chips" filter hataya — chip bar already wahi list dikhata hai
     el.innerHTML =
       chip('all', 'All') +
       chip('top_gainers', '🚀 Top 15 Gainers') +
-      chip('top_losers', '📉 Top 15 Losers');
+      chip('top_losers', '📉 Top 15 Losers') +
+      chip('rsi_chips', '🔒 RSI Chips');
     el.style.display = '';
-    renderChipBar();
     return;
   }
 
@@ -289,8 +259,6 @@ function renderChips() {
     chip('entry', '🎯 Entry Signal', counts.entry) +
     chip('lowbrok', '⬇️ Low Broken', counts.lowbrok) +
     chip('waiting', '⏸️ Waiting', counts.waiting);
-
-  renderChipBar();
 }
 
 /* ============================================================
@@ -1157,7 +1125,6 @@ function startSSE() {
       }
       else if (msg.type === 'chip' && msg.chips) {
         SCREENER_CHIPS = msg.chips;
-        renderChipBar();
         renderScreenerTable();
       }
     } catch {}
@@ -1245,14 +1212,26 @@ function renderScreenerTable() {
         })
         .sort((a, b) => computeChangePct(a.token) - computeChangePct(b.token))
         .slice(0, 15);
+    } else if (SCREENER_MOMENTUM_FILTER === 'rsi_chips') {
+      const chipTokens = new Set(SCREENER_CHIPS.map(c => String(c.token)));
+      filtered = filtered.filter(s => chipTokens.has(String(s.token)));
+      const rankBy = {};
+      SCREENER_CHIPS.forEach(c => { rankBy[String(c.token)] = c.rank; });
+      filtered.sort((a, b) => (rankBy[String(a.token)] ?? 999) - (rankBy[String(b.token)] ?? 999));
     }
 
     const sorted = sortStocks(filtered);
 
     if (!sorted.length) {
-      body.innerHTML = `<tr><td colspan="12" style="text-align:center;padding:60px;color:var(--text-muted)">
-        Loading stocks...<br>Please wait a few seconds.
-      </td></tr>`;
+      const isEmptyChipFilter = SCREENER_MOMENTUM_FILTER === 'rsi_chips';
+      body.innerHTML = isEmptyChipFilter
+        ? `<tr><td colspan="12" style="text-align:center;padding:60px;color:var(--text-muted)">
+            🔒 No RSI chips locked today.<br>
+            <span style="font-size:11px">Chips lock at 9:15 (top-10 rank · gap ≤3% · RSI ≥70)</span>
+          </td></tr>`
+        : `<tr><td colspan="12" style="text-align:center;padding:60px;color:var(--text-muted)">
+            Loading stocks...<br>Please wait a few seconds.
+          </td></tr>`;
       if (count) count.textContent = `0 / ${SCREENER_ALL_STOCKS.length}`;
       renderChips();
       return;

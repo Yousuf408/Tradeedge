@@ -1591,9 +1591,11 @@ app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
    ============================================================ */
 app.get('/api/test-rsi-3stocks', async (req, res) => {
   try {
-    const JWT = getJwtREST();
-    if (!JWT) return res.status(500).json({ error: 'No Angel JWT' });
-
+    let JWT = null;
+    if (getSessionStatusREST()?.loggedIn)          JWT = getJwtREST?.();
+    if (!JWT && getSessionStatusQuote()?.loggedIn) JWT = getJwtQuote?.();
+    if (!JWT && getSessionStatusBS()?.loggedIn)    JWT = getJwtBS?.();
+    if (!JWT) return res.status(500).json({ error: 'No Angel JWT from any session' });
     const stocks = [
       { sym: 'BANDHANBNK', token: '2263' },
       { sym: 'HCLTECH',    token: '7229' },

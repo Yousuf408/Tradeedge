@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -57,7 +58,7 @@
                    onkeydown="if(event.key==='Enter') doLogin()" />
             <button type="button" class="auth-toggle-eye" onclick="toggleAuthPwd('authPass', this)">SHOW</button>
             <svg class="auth-input-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+              <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11v7M17 11v7M7 11a5 5 0 0 1 10 0"/>
             </svg>
           </div>
         </div>
@@ -144,7 +145,7 @@
             <input id="forgotNew" type="password" placeholder="At least 6 characters" />
             <button type="button" class="auth-toggle-eye" onclick="toggleAuthPwd('forgotNew', this)">SHOW</button>
             <svg class="auth-input-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+              <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11v7M17 11v7M7 11a5 5 0 0 1 10 0"/>
             </svg>
           </div>
         </div>
@@ -211,6 +212,7 @@
 
   <ul class="nav-links">
     <li><a class="active" data-page="screener">🔍 Screener</a></li>
+    <li><a data-page="orders">📋 Orders</a></li>
     <li><a data-page="portfolio">💰 Portfolio</a></li>
     <li class="admin-only" style="display:none"><a data-page="users">👥 Users</a></li>
     <li><a data-page="settings">⚙️ Settings</a></li>
@@ -302,6 +304,16 @@
     </div>
   </div>
 
+  <!-- 5.1.1 — ORDERS (AutoTrader positions) -->
+  <div id="page-orders" class="page">
+    <h2 class="section-title">📋 Orders</h2>
+    <div id="ordersStats" style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 16px"></div>
+    <div class="panel-glass">
+      <div class="panel-head"><h3>🤖 AutoTrader Positions — Entry / SL / T1 / T2 / Net P&L</h3></div>
+      <div class="panel-body table-wrap" id="ordersTable"></div>
+    </div>
+  </div>
+
   <!-- 5.2 — PORTFOLIO -->
   <div id="page-portfolio" class="page">
     <h2 class="section-title">💰 Portfolio</h2>
@@ -387,7 +399,7 @@
           <p style="font-size:13px;color:var(--text-muted);margin-bottom:12px">
             Format: <code>Full Name,Mobile,Duration</code><br>
             Duration codes: <strong>5d, 7d, 1m, 2m, 3m, 6m, 1y</strong><br>
-            Username &amp; password are auto-generated. Plan defaults to <strong>Pro</strong>.
+            Username &amp; password auto-generated. Plan defaults to <strong>Pro</strong>.
           </p>
           <textarea id="csvInput" class="form-input" rows="8" style="font-family:monospace;font-size:12px"
             placeholder="Ravi Kumar,9876543210,1m
@@ -509,9 +521,9 @@ Rahul Verma,9876543212,5d"></textarea>
         </div>
         <div id="dhanFields" class="broker-fields">
           <div class="field-group field-full"><label>Client ID</label><input type="text" placeholder="Your Dhan Client ID" /></div>
-          <div class="field-group"><label>TOTP</label><input type="text" placeholder="TOTP secret" /></div>
-          <div class="field-group"><label>PIN</label><input type="password" placeholder="Trading PIN" /></div>
-          <div class="field-group field-full"><label>Secret Key</label><input type="password" placeholder="API Secret Key" /></div>
+          <div class="field-group"><label>TOTP</label><input type="text" placeholder="Your Dhan TOTP secret" /></div>
+          <div class="field-group"><label>PIN</label><input type="password" placeholder="Your Dhan PIN" /></div>
+          <div class="field-group field-full"><label>Secret Key</label><input type="password" placeholder="Your Dhan Secret Key" /></div>
         </div>
         <div id="otherBrokerFields"><p>🔑 Enter credentials for your selected broker.</p></div>
       </div>
@@ -662,6 +674,7 @@ Rahul Verma,9876543212,5d"></textarea>
      ============================================================ -->
 <script src="admin.js"></script>
 <script src="screener.js"></script>
+<script src="orders.js"></script>
 <script src="app.js"></script>
 
 </body>

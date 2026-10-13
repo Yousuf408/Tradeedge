@@ -14,7 +14,7 @@
    + v3.9: 🔒 RSI Chips filter
    + v4.0: MAXQTY from real broker leverage
    + v4.1: 📥 Fetch Historical button (Angel REST 1m+5m backfill)
-           Overwrites WS candle columns for last 4 days
+           Overwrites WS candle columns for last 2 days (yesterday + today)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -971,7 +971,7 @@ async function startEODClosesFetch() {
 
 /* ============================================================
    SECTION 5.6 — FETCH HISTORICAL (v4.1)
-   Angel REST 1-min + 5-min candles → overwrite WS columns (last 4 days)
+   Angel REST 1-min + 5-min candles → overwrite WS columns (last 2 days: yesterday + today)
    ============================================================ */
 async function startHistoricalFetch() {
   const btn = document.getElementById('fetchHistoricalBtn');
@@ -980,23 +980,23 @@ async function startHistoricalFetch() {
 
   const ok = confirm(
     '📥 Fetch Historical (Angel REST)\n\n' +
-    'Ye last 4 days ka 1-min + 5-min candle Angel REST se fetch karega ' +
+    'Ye last 2 days (yesterday + today) ka 1-min + 5-min candle Angel REST se fetch karega ' +
     'aur ws_1min_close / ws_5min_close columns overwrite karega.\n\n' +
-    'Saare 388 stocks — approx 2-3 minutes.\n\n' +
+    'Saare 388 stocks — approx 6-7 minutes (rate-limit safe, 900ms gap).\n\n' +
     'Continue?'
   );
   if (!ok) return;
 
   HISTORICAL_FETCHING = true;
   btn.disabled = true;
-  btn.textContent = '⏳ Historical fetch... (~2-3 min)';
+  btn.textContent = '⏳ Historical fetch... (~6-7 min)';
   showToast('📥 Historical Fetch', 'Starting Angel REST backfill...');
 
   try {
     const r = await fetch(API + '/api/admin/fetch-historical', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
-      body: JSON.stringify({ days: 4 })
+      body: JSON.stringify({ days: 2 })
     });
     const d = await r.json();
 

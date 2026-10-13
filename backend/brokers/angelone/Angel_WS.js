@@ -1,17 +1,29 @@
 /* ============================================================
-   Angel_WS.js — v1.6
+   Angel_WS.js — v1.7
    WebSocket live feed — reconnects + gap backfill support
 
-   CHANGELOG v1.5:
-   - Angel ne Quote packet 115 → 123 bytes kar diya (8-byte field append)
-   - parseTick ab 123-byte packets bhi accept karta hai
-   - Offsets assumed same as 115
+   CHANGELOG v1.4:
+   - Subscribe mode configurable: WS_MODE env (default 2 = Quote)
+     mode 1 = LTP only (51-byte packet)
+     mode 2 = Quote  (115-byte packet: ltp + volume + O/H/L/C)
+   - onTick callback gets full tick object as 4th arg
 
-   CHANGELOG v1.6 (2026-10-13):
-   - DIAGNOSTIC build: first 5 x 123-byte ticks pe saare candidate
-     offset values log karta hai (43/59/67/75/83/91/99/107/115)
-   - Isse confirm hoga ki LTP kis byte pe hai
-   - Baaki sab kuch v1.5 jaisa
+   CHANGELOG v1.5:
+   - Angel ne Quote packet 115 → 123 bytes kar diya
+   - parseTick ab 123-byte packets bhi accept karta hai
+
+   CHANGELOG v1.6:
+   - DIAGNOSTIC: dumped all candidate offsets for first 5 ticks
+
+   CHANGELOG v1.7 (2026-10-13):
+   - CONFIRMED: 123-byte packet me NEW layout hai
+       LTP moved 107 → 43
+       Volume @ 67
+       Low    @ 91
+       High   @ 99
+       Close  @ 107  (prev day close)
+       Open   @ 115
+   - Legacy 115-byte path untouched (rollback safe)
    ============================================================ */
 
 import WebSocket from 'ws';
@@ -81,7 +93,6 @@ export function getWSStatus() {
    INTERNAL
    ============================================================ */
 let _hexLogged = 0;
-let _debugCount = 0;
 const _sizesLogged = new Set();
 
 function connect() {
@@ -186,7 +197,7 @@ function clearTimers() {
 /* ============================================================
    PARSE BINARY TICK — Angel One WebSocket
 
-   LTP mode (51 bytes):
+   LTP mode (51 bytes) — UNCHANGED:
      [0]      mode
      [1]      exchange type
      [2-26]   token (25 bytes ASCII, null-padded)
@@ -194,30 +205,36 @@ function clearTimers() {
      [35-42]  exchange timestamp (int64 LE, epoch ms)
      [43-50]  LTP (int64 LE, price × 100 in paise)
 
-   Quote mode (115 OR 123 bytes):
+   Quote mode (123 bytes) — NEW v1.7 LAYOUT (confirmed via hex):
      [0]      mode
      [1]      exchange type
      [2-26]   token
      [27-34]  sequence
      [35-42]  exchange timestamp
-     [43-50]  last traded time
-     [51-58]  last traded quantity
-     [59-66]  average traded price
-     [67-74]  VOLUME traded today
-     [75-82]  open  (paise ÷100)
-     [83-90]  high  (paise ÷100)
-     [91-98]  low   (paise ÷100)
-     [99-106] close (paise ÷100, prev day close)
-     [107-114] LTP  (paise ÷100)
-     [115-122] (v1.5+) extra field (likely Open Interest) — IGNORED
+     [43-50]  LTP        (paise ÷100)
+     [51-58]  last traded qty
+     [59-66]  avg traded price (paise ÷100)
+     [67-74]  VOLUME traded today (raw shares)
+     [75-90]  unknown/reserved (16 bytes)
+     [91-98]  low       (paise ÷100)
+     [99-106] high      (paise ÷100)
+     [107-114] close    (paise ÷100, prev day close)
+     [115-122] open     (paise ÷100)
 
-   v1.6 DIAGNOSTIC: dumps all candidate offsets for first 5 ticks
+   Quote mode (115 bytes) — LEGACY (kept for rollback):
+     [43-50]  last traded time
+     [67-74]  volume
+     [75-82]  open
+     [83-90]  high
+     [91-98]  low
+     [99-106] close
+     [107-114] LTP
    ============================================================ */
 function parseTick(buffer) {
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
   const len = buf.length;
 
-  // Log hex of first 3 real ticks (any size ≥30)
+  // Log hex of first 3 real ticks (any size ≥30) — debug help
   if (_hexLogged < 3 && len >= 30) {
     _hexLogged++;
     console.log(`🔬 tick hex [${len}]: ${buf.toString('hex')}`);
@@ -228,26 +245,36 @@ function parseTick(buffer) {
   const token = buf.slice(2, 27).toString('ascii').replace(/\0+$/, '').trim();
   if (!token) return null;
 
-  /* LTP mode (51 bytes) */
+  /* ---- LTP mode (51 bytes) — unchanged ---- */
   if (len === 51) {
     const ltp = Number(buf.readBigInt64LE(43)) / 100;
     if (!Number.isFinite(ltp) || ltp <= 0 || ltp > 10000000) return null;
     return { token, ltp: +ltp.toFixed(2), volume: null };
   }
 
-  /* v1.6 DIAGNOSTIC: dump all candidate offsets for first 5 x 123-byte ticks */
-  if (len === 123 && _debugCount < 5) {
-    _debugCount++;
-    const read = off => Number(buf.readBigInt64LE(off)) / 100;
-    console.log(
-      `🔎 [123] tok=${token} ` +
-      `35=${read(35)} 43=${read(43)} 51=${read(51)} 59=${read(59)} ` +
-      `67=${read(67)} 75=${read(75)} 83=${read(83)} 91=${read(91)} ` +
-      `99=${read(99)} 107=${read(107)} 115=${read(115)}`
-    );
+  /* ---- Quote mode (123 bytes) — v1.7 NEW layout ---- */
+  if (len === 123) {
+    const ltp = Number(buf.readBigInt64LE(43)) / 100;
+    if (!Number.isFinite(ltp) || ltp <= 0 || ltp > 10000000) return null;
+
+    const volume = Number(buf.readBigInt64LE(67));
+    const low    = Number(buf.readBigInt64LE(91))  / 100;
+    const high   = Number(buf.readBigInt64LE(99))  / 100;
+    const close  = Number(buf.readBigInt64LE(107)) / 100;
+    const open   = Number(buf.readBigInt64LE(115)) / 100;
+
+    return {
+      token,
+      ltp: +ltp.toFixed(2),
+      volume: Number.isFinite(volume) && volume >= 0 ? volume : null,
+      open:  open  > 0 ? +open.toFixed(2)  : null,
+      high:  high  > 0 ? +high.toFixed(2)  : null,
+      low:   low   > 0 ? +low.toFixed(2)   : null,
+      close: close > 0 ? +close.toFixed(2) : null
+    };
   }
 
-  /* Quote mode (115 or 123) — current offsets */
+  /* ---- Quote mode (115 bytes) — LEGACY rollback path ---- */
   const ltp = Number(buf.readBigInt64LE(107)) / 100;
   if (!Number.isFinite(ltp) || ltp <= 0 || ltp > 10000000) return null;
 
@@ -257,20 +284,13 @@ function parseTick(buffer) {
   const low    = Number(buf.readBigInt64LE(91)) / 100;
   const close  = Number(buf.readBigInt64LE(99)) / 100;
 
-  const tick = {
+  return {
     token,
     ltp: +ltp.toFixed(2),
     volume: Number.isFinite(volume) && volume >= 0 ? volume : null,
-    open: open > 0 ? +open.toFixed(2) : null,
-    high: high > 0 ? +high.toFixed(2) : null,
-    low:  low  > 0 ? +low.toFixed(2)  : null,
+    open:  open  > 0 ? +open.toFixed(2)  : null,
+    high:  high  > 0 ? +high.toFixed(2)  : null,
+    low:   low   > 0 ? +low.toFixed(2)   : null,
     close: close > 0 ? +close.toFixed(2) : null
   };
-
-  if (len === 123) {
-    const oi = Number(buf.readBigInt64LE(115));
-    tick.openInterest = Number.isFinite(oi) && oi >= 0 ? oi : null;
-  }
-
-  return tick;
 }

@@ -49,7 +49,7 @@ import {
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 
 import {
-  initAutoTrader, onChipLock, onTickPos, loadOpenPositions
+  initAutoTrader, onChipLock, onTickPos, loadOpenPositions, getPositions
 } from './autoTrader.js';   // v4.9.3: auto buy/SL/target module
 
 import { registerAdminRoutes } from './admin.js';
@@ -1279,6 +1279,39 @@ app.get('/api/screener/chips', auth, (req, res) => {
     ltp: getCachedLTP(c.token) ?? null
   }));
   res.json({ ok: true, date: chipDate, locked: chipDate != null, chips });
+});
+
+/* v4.9.4: ORDERS page endpoint — positions + live LTP + Net P&L */
+app.get('/api/auto/positions', auth, async (req, res) => {
+  try {
+    const date = req.query.date || getIST().toISOString().split('T')[0];
+    const { rows } = await db.query(
+      `SELECT date::text AS date, token, sym, qty, entry, sl, t1, t2, stage, peak,
+              status, exit_price, exit_reason, entry_at, exit_at
+       FROM auto_positions WHERE date=$1 ORDER BY entry_at`,
+      [date]
+    );
+    const live = getPositions();
+    const out = rows.map(r => {
+      const lp = live.find(p => p.token === String(r.token));
+      const ltp = getCachedLTP(String(r.token)) ?? null;
+      const ref = r.status === 'open' ? (ltp ?? +r.entry) : (r.exit_price != null ? +r.exit_price : +r.entry);
+      const pnl = +((ref - +r.entry) * r.qty).toFixed(2);
+      const pnlPct = +(((ref - +r.entry) / +r.entry) * 100).toFixed(2);
+      return {
+        date: r.date, token: String(r.token), sym: r.sym, qty: +r.qty,
+        entry: +r.entry, sl: +r.sl, t1: +r.t1, t2: +r.t2,
+        stage: lp ? lp.stage : +r.stage,
+        slLive: lp ? lp.sl : +r.sl,
+        peak: lp ? lp.peak : (r.peak != null ? +r.peak : null),
+        status: r.status, exitPrice: r.exit_price != null ? +r.exit_price : null,
+        exitReason: r.exit_reason, entryAt: r.entry_at, exitAt: r.exit_at,
+        ltp, pnl, pnlPct
+      };
+    });
+    const total = +out.reduce((a, b) => a + b.pnl, 0).toFixed(2);
+    res.json({ ok: true, date, total, positions: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/screener/margins', auth, (req, res) => {

@@ -1,4 +1,4 @@
-tvdatafeed==2.1.0
+git+https://github.com/rongardF/tvdatafeed.git
 pandas
 flask
 gunicorn

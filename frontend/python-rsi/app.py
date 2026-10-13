@@ -1,6 +1,6 @@
 """
 python-rsi — TradingView RSI microservice
-Step 3: TradingView connection + Wilder's RSI(14)
+Step 4: Session cookie auth + Wilder's RSI(14)
 
 Endpoints:
   GET /health                 — health check
@@ -22,14 +22,19 @@ def get_tv():
     if _tv is not None:
         return _tv
 
-    username = os.environ.get('TV_USERNAME')
-    password = os.environ.get('TV_PASSWORD')
+    sessionid = os.environ.get('TV_SESSIONID')
 
-    if username and password:
-        print(f'🔌 Connecting to TradingView as {username}...')
-        _tv = TvDatafeed(username=username, password=password)
+    if sessionid:
+        print('🔌 Creating TvDatafeed with session cookie')
+        _tv = TvDatafeed()
+        # name-mangled private attrs in tvdatafeed library
+        try:
+            _tv._TvDatafeed__ws._TVWebsocket__auth_token = sessionid
+            print('🔑 Session token injected')
+        except Exception as e:
+            print(f'⚠️ Could not inject session: {e}')
     else:
-        print('🔌 Connecting to TradingView (anonymous)...')
+        print('🔌 Anonymous mode (no TV_SESSIONID)')
         _tv = TvDatafeed()
 
     return _tv
@@ -105,7 +110,7 @@ def health():
         'ok': True,
         'service': 'python-rsi',
         'version': '1.0',
-        'step': 3
+        'step': 4
     })
 
 @app.route('/', methods=['GET'])

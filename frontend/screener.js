@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.1
+   SCREENER.JS  — v4.2
    + Default strategy = Momentum
    + Fixed # column (rank from server)
    + Gap % filter for Top Gainers/Losers
@@ -11,10 +11,14 @@
    + RSI column (Momentum)
    + EOD closes fetch button (manual)
    + v3.8: RSI CHIP BAR
-   + v3.9: 🔒 RSI Chips filter
    + v4.0: MAXQTY from real broker leverage
    + v4.1: 📥 Fetch Historical button (Angel REST 1m+5m backfill)
-           Overwrites WS candle columns for last 2 days (yesterday + today)
+   + v4.2: cleanup —
+           - "RSI Chips" table filter REMOVED (chip bar kaafi hai, duplicate tha)
+           - Momentum table se Pivot + Target/SL columns REMOVED
+           - "Buy / Sell" header → "B/S Volume"
+           - Controls compact (Capital input same row)
+           (Advance ORB branch untouched — Pivot/Target/SL wahi chahiye)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -94,33 +98,41 @@ function renderStrategyControls() {
   const controls = document.querySelector('.screener-controls');
   if (!controls) return;
 
+  // v4.2: compact + wrap — Capital input same row me fit ho
+  controls.style.display = 'flex';
+  controls.style.flexWrap = 'wrap';
+  controls.style.gap = '6px';
+  controls.style.alignItems = 'center';
+
+  const btnStyle = 'style="padding:6px 10px;font-size:12px;white-space:nowrap"';
+
   let strategyButtons = '';
   if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
     strategyButtons = `
-      <button id="fetchBSBtn" class="btn btn-primary" onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
-      <button id="fetchPreopenBtn" class="btn btn-outline" onclick="startPreopenFetch()">📡 Fetch Pre-Open</button>
-      <button id="fetchHistoricalBtn" class="btn btn-outline" onclick="startHistoricalFetch()">📥 Fetch Historical</button>
-      <button id="fetchEODBtn" class="btn btn-outline" onclick="startEODClosesFetch()">⚙️ Fetch EOD Closes</button>`;
+      <button id="fetchBSBtn" class="btn btn-primary" ${btnStyle} onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
+      <button id="fetchPreopenBtn" class="btn btn-outline" ${btnStyle} onclick="startPreopenFetch()">📡 Fetch Pre-Open</button>
+      <button id="fetchHistoricalBtn" class="btn btn-outline" ${btnStyle} onclick="startHistoricalFetch()">📥 Fetch Historical</button>
+      <button id="fetchEODBtn" class="btn btn-outline" ${btnStyle} onclick="startEODClosesFetch()">⚙️ Fetch EOD Closes</button>`;
   } else {
     strategyButtons = `
-      <button id="fetch915Btn" class="btn btn-primary" onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
-      <button id="fetchQuoteBtn" class="btn btn-outline" onclick="startQuoteFetch()">📊 Fetch Quote H/L</button>
-      <button id="fetchDayHLCBtn" class="btn btn-outline" onclick="startDayHLCFetch()">📅 Fetch Day H/L/C</button>`;
+      <button id="fetch915Btn" class="btn btn-primary" ${btnStyle} onclick="startFetch()">⚡ Fetch 9:15 Candles</button>
+      <button id="fetchQuoteBtn" class="btn btn-outline" ${btnStyle} onclick="startQuoteFetch()">📊 Fetch Quote H/L</button>
+      <button id="fetchDayHLCBtn" class="btn btn-outline" ${btnStyle} onclick="startDayHLCFetch()">📅 Fetch Day H/L/C</button>`;
   }
 
   controls.innerHTML = `
     <select id="strategyDropdown" onchange="onStrategyChange(this.value)"
-            style="padding:7px 14px;border:1.5px solid var(--border-soft);border-radius:8px;
-                   font-size:13px;font-weight:600;font-family:inherit;
+            style="padding:6px 10px;border:1.5px solid var(--border-soft);border-radius:8px;
+                   font-size:12px;font-weight:600;font-family:inherit;
                    background:var(--bg-secondary);color:var(--text-primary);cursor:pointer">
       <option value="momentum">🚀 Momentum</option>
       <option value="advance_orb">🔍 Advance ORB</option>
     </select>
     ${strategyButtons}
-    <label style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-left:8px">Capital ₹</label>
+    <label style="font-size:11px;font-weight:600;color:var(--text-secondary);margin-left:2px">Capital ₹</label>
     <input id="perTradeInput" type="number" value="${PER_TRADE}" min="100"
-           style="width:110px;padding:7px 12px;border:1.5px solid var(--border-soft);border-radius:8px;
-                  font-size:13px;font-family:inherit;background:var(--bg-secondary);color:var(--text-primary)"
+           style="width:86px;padding:6px 8px;border:1.5px solid var(--border-soft);border-radius:8px;
+                  font-size:12px;font-family:inherit;background:var(--bg-secondary);color:var(--text-primary)"
            onchange="onPerTradeChange()" />
     <div id="progressBar" style="display:none;width:100%;margin-top:8px">
       <div style="background:rgba(0,0,0,0.06);border-radius:10px;height:6px;overflow:hidden">
@@ -244,11 +256,11 @@ function renderChips() {
       const active = SCREENER_MOMENTUM_FILTER === key ? 'active' : '';
       return `<button class="filter-chip ${active}" onclick="setMomentumFilter('${key}')">${label}</button>`;
     };
+    // v4.2: "RSI Chips" filter hataya — chip bar already wahi list dikhata hai
     el.innerHTML =
       chip('all', 'All') +
       chip('top_gainers', '🚀 Top 15 Gainers') +
-      chip('top_losers', '📉 Top 15 Losers') +
-      chip('rsi_chips', '🔒 RSI Chips');
+      chip('top_losers', '📉 Top 15 Losers');
     el.style.display = '';
     renderChipBar();
     return;
@@ -613,6 +625,7 @@ function renderTimePrice(isoStr, price) {
          (p ? `<span style="display:block;font-size:10px;color:var(--text-muted);font-family:ui-monospace,monospace">${p}</span>` : '');
 }
 
+/* Advance ORB branch me use hota hai — momentum se hataya gaya (v4.2) */
 function renderTargetSL(c, orb) {
   const target = c.high * 1.01;
   const sl = c.low;
@@ -1189,6 +1202,7 @@ function renderScreenerTable() {
 
   /* ============================================================
      MOMENTUM strategy branch (default)
+     v4.2: Pivot + Target/SL columns removed; Buy/Sell → B/S Volume
      ============================================================ */
   if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
     head.innerHTML = `<tr>
@@ -1199,11 +1213,9 @@ function renderScreenerTable() {
       <th>PRE-OPEN</th>
       <th>DAY OPEN</th>
       <th class="th-sortable" onclick="setSort('rsi')">RSI ${sortIndicator('rsi')}</th>
-      <th>Buy / Sell</th>
+      <th>B/S Volume</th>
       <th>Volume</th>
-      <th>Pivot</th>
       <th>20 EMA</th>
-      <th>Target / SL</th>
       <th>MAXQTY</th>
       <th>LAST UPDATE</th>
       <th>ACTION</th>
@@ -1233,36 +1245,22 @@ function renderScreenerTable() {
         })
         .sort((a, b) => computeChangePct(a.token) - computeChangePct(b.token))
         .slice(0, 15);
-    } else if (SCREENER_MOMENTUM_FILTER === 'rsi_chips') {
-      const chipTokens = new Set(SCREENER_CHIPS.map(c => String(c.token)));
-      filtered = filtered.filter(s => chipTokens.has(String(s.token)));
-      const rankBy = {};
-      SCREENER_CHIPS.forEach(c => { rankBy[String(c.token)] = c.rank; });
-      filtered.sort((a, b) => (rankBy[String(a.token)] ?? 999) - (rankBy[String(b.token)] ?? 999));
     }
 
     const sorted = sortStocks(filtered);
 
     if (!sorted.length) {
-      const isEmptyChipFilter = SCREENER_MOMENTUM_FILTER === 'rsi_chips';
-      body.innerHTML = isEmptyChipFilter
-        ? `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
-            🔒 No RSI chips locked today.<br>
-            <span style="font-size:11px">Chips lock at 9:15 (top-10 rank · gap ≤3% · RSI ≥70)</span>
-          </td></tr>`
-        : `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
-            Loading stocks...<br>Please wait a few seconds.
-          </td></tr>`;
+      body.innerHTML = `<tr><td colspan="12" style="text-align:center;padding:60px;color:var(--text-muted)">
+        Loading stocks...<br>Please wait a few seconds.
+      </td></tr>`;
       if (count) count.textContent = `0 / ${SCREENER_ALL_STOCKS.length}`;
       renderChips();
       return;
     }
 
     body.innerHTML = sorted.map(s => {
-      const c = SCREENER_ALL_CANDLES[s.token];
       const ltp = SCREENER_LTP[s.token];
       const orb = SCREENER_ORB[s.token] || {};
-      const pivot = SCREENER_PIVOT[s.token];
       const bs = SCREENER_BS[s.token];
       const preopen = SCREENER_PREOPEN[s.token];
       const dayOpen = SCREENER_DAY_OPEN[s.token];
@@ -1277,20 +1275,6 @@ function renderScreenerTable() {
         const isPos = changePct >= 0;
         const color = isPos ? 'var(--success)' : 'var(--danger)';
         changeLine = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
-      }
-
-      let pivotCell;
-      if (pivot) {
-        const above = ltp ? (+ltp >= pivot) : null;
-        if (above === null) {
-          pivotCell = `<span style="color:var(--text-muted)">₹${pivot.toFixed(2)}</span>`;
-        } else {
-          const color = above ? 'var(--success)' : 'var(--danger)';
-          const arrow = above ? '▲' : '▼';
-          pivotCell = `<span style="color:${color};font-weight:700">${arrow} ₹${pivot.toFixed(2)}</span>`;
-        }
-      } else {
-        pivotCell = '<span style="color:var(--text-muted)">—</span>';
       }
 
       const preopenCell = preopen
@@ -1318,9 +1302,7 @@ function renderScreenerTable() {
         <td style="white-space:nowrap">${renderRSICell(s.token)}</td>
         <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
         <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">${bs?.volume ? formatQty(bs.volume) : '—'}</td>
-        <td class="pivot-cell" style="white-space:nowrap">${pivotCell}</td>
         <td style="white-space:nowrap"><span style="color:var(--text-muted)">—</span></td>
-        <td style="white-space:nowrap" class="cell-targetsl">${c ? renderTargetSL(c, orb) : '<span style="color:var(--text-muted)">—</span>'}</td>
         <td class="maxqty-cell" style="font-weight:700;color:#6C5CE7">${maxQty}</td>
         <td style="color:var(--text-muted);font-size:11px;font-family:ui-monospace,monospace">${lastUpdate}</td>
         <td class="cell-action">${orb.entrySignal
@@ -1335,7 +1317,7 @@ function renderScreenerTable() {
   }
 
   /* ============================================================
-     ADVANCE ORB strategy branch
+     ADVANCE ORB strategy branch (untouched — Pivot/Target/SL yahi chahiye)
      ============================================================ */
   head.innerHTML = `<tr>
     <th>Stock / Company</th>

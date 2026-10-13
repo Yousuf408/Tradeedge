@@ -48,7 +48,6 @@ import {
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 
 import { registerAdminRoutes } from './admin.js';
-import { runNseTest } from './nse-fetch-test.js';
 
 import {
   initMarginService,
@@ -2192,7 +2191,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.3`);
+  console.log(`✅ Server on port ${PORT} — v5.2`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 
@@ -2278,7 +2277,6 @@ app.listen(PORT, async () => {
   maybeRefreshMargins('angelone', { force: true }).catch(() => {});
 
   // NSE test — ek baar startup pe
-  runNseTest().then(r => console.log('🎯 NSE test result:', JSON.stringify(r))).catch(e => console.error('NSE test failed:', e.message));
 
   console.log('ℹ️  Schedule: WS@9:14:55 | Preopen@9:13:30 | BS@9:15 (30s) | Quote@9:30 | HLC@15:31 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');
 });

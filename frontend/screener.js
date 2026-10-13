@@ -1,21 +1,20 @@
 /* ============================================================
-   SCREENER.JS  — v4.0
+   SCREENER.JS  — v4.1
    + Default strategy = Momentum
    + Fixed # column (rank from server)
    + Gap % filter for Top Gainers/Losers
    + Volume column (same BS fetch)
-   + 30s REST LTP poll REMOVED — SSE only (WS → LTP, 30s BS → Buy/Sell/Vol)
+   + 30s REST LTP poll REMOVED — SSE only
    + Strategy-specific control buttons
-   + PRE-OPEN column (Momentum) — NSE pre-open final price
-   + DAY OPEN column (Momentum) — from Angel BS quote.open
-   + RSI column (Momentum) — first tick 9:15, freeze after
-   + EOD closes fetch button (manual for first-time setup)
-   + v3.8: RSI CHIP BAR — 9:15 pe server-locked list
-   + v3.9: 🔒 RSI Chips filter chip added next to Top 15 Losers
-   + v4.0: MAXQTY now uses real broker leverage from Angel margin API
-           MAXQTY = floor(CAPITAL × leverage / LTP)
-           Label "Per-Trade ₹" renamed to "Capital ₹"
-           leverage + marginPerShare pulled from /api/screener/ltp + SSE bs
+   + PRE-OPEN column (Momentum)
+   + DAY OPEN column (Momentum)
+   + RSI column (Momentum)
+   + EOD closes fetch button (manual)
+   + v3.8: RSI CHIP BAR
+   + v3.9: 🔒 RSI Chips filter
+   + v4.0: MAXQTY from real broker leverage
+   + v4.1: 📥 Fetch Historical button (Angel REST 1m+5m backfill)
+           Overwrites WS candle columns for last 4 days
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -28,18 +27,19 @@ let SCREENER_QUOTE = {};
 let SCREENER_PIVOT = {};
 let SCREENER_BS = {};
 let SCREENER_ORB = {};
-let SCREENER_PREOPEN = {};         // token -> { price }
-let SCREENER_DAY_OPEN = {};        // token -> number
-let SCREENER_RSI = {};             // token -> number
-let SCREENER_LEVERAGE = {};        // v4.0: token -> leverage (from broker margin)
-let SCREENER_MARGIN_PS = {};       // v4.0: token -> margin per share
-let SCREENER_CHIPS = [];           // v3.8: day-fixed chip list (server 9:15 pe lock karta hai)
+let SCREENER_PREOPEN = {};
+let SCREENER_DAY_OPEN = {};
+let SCREENER_RSI = {};
+let SCREENER_LEVERAGE = {};
+let SCREENER_MARGIN_PS = {};
+let SCREENER_CHIPS = [];
 let SCREENER_INIT_DONE = false;
 let SCREENER_SSE = null;
 let FETCHING = false;
 let QUOTE_FETCHING = false;
 let DAYHLC_FETCHING = false;
 let EOD_FETCHING = false;
+let HISTORICAL_FETCHING = false;   // v4.1
 
 let SCREENER_STAGE_FILTER = 'all';
 let SCREENER_MOMENTUM_FILTER = 'all';
@@ -52,7 +52,7 @@ const NIFTY50_TOKEN = '99926000';
 const CURRENT_STRATEGY = 'momentum';
 const STRATEGY_FILTER = { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 };
 
-let PER_TRADE = 25000;   // v4.0: default capital ₹25,000 (was 10000)
+let PER_TRADE = 25000;
 const BATCH_SIZE = 20;
 const BATCH_DELAY = 150;
 
@@ -69,7 +69,7 @@ async function initScreener() {
   await loadStockList();
   await loadCachedData();
   await loadLTP();
-  await loadChips();               // v3.8: chip list (locked ya khali)
+  await loadChips();
   SCREENER_INIT_DONE = true;
   startSSE();
 }
@@ -99,6 +99,7 @@ function renderStrategyControls() {
     strategyButtons = `
       <button id="fetchBSBtn" class="btn btn-primary" onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
       <button id="fetchPreopenBtn" class="btn btn-outline" onclick="startPreopenFetch()">📡 Fetch Pre-Open</button>
+      <button id="fetchHistoricalBtn" class="btn btn-outline" onclick="startHistoricalFetch()">📥 Fetch Historical</button>
       <button id="fetchEODBtn" class="btn btn-outline" onclick="startEODClosesFetch()">⚙️ Fetch EOD Closes</button>`;
   } else {
     strategyButtons = `
@@ -140,7 +141,6 @@ function renderStrategyControls() {
     panelGlass.insertBefore(chips, tableWrap);
   }
 
-  // v3.8: chip bar container (stage chips ke baad, table ke upar)
   if (panelGlass && !document.getElementById('chipBar')) {
     const bar = document.createElement('div');
     bar.id = 'chipBar';
@@ -168,8 +168,7 @@ async function onStrategyChange(value) {
 }
 
 /* ============================================================
-   SECTION 2.0 — RSI CHIP BAR (v3.8)
-   9:15 pe server-locked list, poore din STATIC
+   SECTION 2.0 — RSI CHIP BAR
    ============================================================ */
 function renderChipBar() {
   const el = document.getElementById('chipBar');
@@ -251,7 +250,7 @@ function renderChips() {
       chip('top_losers', '📉 Top 15 Losers') +
       chip('rsi_chips', '🔒 RSI Chips');
     el.style.display = '';
-    renderChipBar();      // v3.8
+    renderChipBar();
     return;
   }
 
@@ -279,7 +278,7 @@ function renderChips() {
     chip('lowbrok', '⬇️ Low Broken', counts.lowbrok) +
     chip('waiting', '⏸️ Waiting', counts.waiting);
 
-  renderChipBar();      // v3.8
+  renderChipBar();
 }
 
 /* ============================================================
@@ -370,7 +369,6 @@ function computeGapPct(token) {
   return ((c.open - prev) / prev) * 100;
 }
 
-/* v4.0: MAXQTY from real broker leverage */
 function computeMaxQty(token, ltp) {
   const lev = SCREENER_LEVERAGE[token];
   if (!ltp || ltp <= 0) return '—';
@@ -487,7 +485,6 @@ function updateLTPCells(ticks) {
       pivotEl.innerHTML = `<span style="color:${color};font-weight:700">${arrow} ₹${pivot.toFixed(2)}</span>`;
     }
 
-    /* v4.0: MAXQTY recompute on every LTP change */
     const mqEl = row.querySelector('.maxqty-cell');
     if (mqEl) {
       mqEl.textContent = computeMaxQty(token, +price);
@@ -937,7 +934,6 @@ async function startPreopenFetch() {
 
 /* ============================================================
    SECTION 5.5 — MANUAL EOD CLOSES FETCH  [Momentum]
-   First-time setup: fetch prev-day last 20 one-min closes for RSI
    ============================================================ */
 async function startEODClosesFetch() {
   const btn = document.getElementById('fetchEODBtn');
@@ -971,6 +967,57 @@ async function startEODClosesFetch() {
   EOD_FETCHING = false;
   btn.disabled = false;
   btn.textContent = '⚙️ Fetch EOD Closes';
+}
+
+/* ============================================================
+   SECTION 5.6 — FETCH HISTORICAL (v4.1)
+   Angel REST 1-min + 5-min candles → overwrite WS columns (last 4 days)
+   ============================================================ */
+async function startHistoricalFetch() {
+  const btn = document.getElementById('fetchHistoricalBtn');
+  if (!btn) return;
+  if (HISTORICAL_FETCHING) return;
+
+  const ok = confirm(
+    '📥 Fetch Historical (Angel REST)\n\n' +
+    'Ye last 4 days ka 1-min + 5-min candle Angel REST se fetch karega ' +
+    'aur ws_1min_close / ws_5min_close columns overwrite karega.\n\n' +
+    'Saare 388 stocks — approx 2-3 minutes.\n\n' +
+    'Continue?'
+  );
+  if (!ok) return;
+
+  HISTORICAL_FETCHING = true;
+  btn.disabled = true;
+  btn.textContent = '⏳ Historical fetch... (~2-3 min)';
+  showToast('📥 Historical Fetch', 'Starting Angel REST backfill...');
+
+  try {
+    const r = await fetch(API + '/api/admin/fetch-historical', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
+      body: JSON.stringify({ days: 4 })
+    });
+    const d = await r.json();
+
+    if (!r.ok) {
+      showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
+    } else {
+      const s = d.summary || {};
+      showToast(
+        '✅ Historical Saved',
+        `${s.ok || 0} ok · ${s.skipped || 0} skipped · ${s.failed || 0} failed · ` +
+        `${s.days_saved || 0} days · ${d.elapsed_sec || 0}s`
+      );
+      await loadLTP();
+    }
+  } catch (e) {
+    showToast('⚠️ Error', e.message);
+  }
+
+  HISTORICAL_FETCHING = false;
+  btn.disabled = false;
+  btn.textContent = '📥 Fetch Historical';
 }
 
 function updateProgress(done, total) {
@@ -1008,8 +1055,8 @@ async function loadLTP() {
         if (item.preopenPrice != null) SCREENER_PREOPEN[item.token] = { price: item.preopenPrice };
         if (item.dayOpen != null) SCREENER_DAY_OPEN[item.token] = item.dayOpen;
         if (item.rsi != null) SCREENER_RSI[item.token] = item.rsi;
-        if (item.leverage != null) SCREENER_LEVERAGE[item.token] = item.leverage;         // v4.0
-        if (item.marginPerShare != null) SCREENER_MARGIN_PS[item.token] = item.marginPerShare; // v4.0
+        if (item.leverage != null) SCREENER_LEVERAGE[item.token] = item.leverage;
+        if (item.marginPerShare != null) SCREENER_MARGIN_PS[item.token] = item.marginPerShare;
 
         if (item.buyQty != null || item.sellQty != null || item.rank != null) {
           const existing = SCREENER_BS[item.token] || {};
@@ -1090,12 +1137,12 @@ function startSSE() {
           if (v.preopenPrice != null) SCREENER_PREOPEN[token] = { price: v.preopenPrice };
           if (v.dayOpen != null) SCREENER_DAY_OPEN[token] = v.dayOpen;
           if (v.rsi != null) SCREENER_RSI[token] = v.rsi;
-          if (v.leverage != null) SCREENER_LEVERAGE[token] = v.leverage;                 // v4.0
-          if (v.marginPerShare != null) SCREENER_MARGIN_PS[token] = v.marginPerShare;   // v4.0
+          if (v.leverage != null) SCREENER_LEVERAGE[token] = v.leverage;
+          if (v.marginPerShare != null) SCREENER_MARGIN_PS[token] = v.marginPerShare;
         }
         renderScreenerTable();
       }
-      else if (msg.type === 'chip' && msg.chips) {   // v3.8: chip list lock event
+      else if (msg.type === 'chip' && msg.chips) {
         SCREENER_CHIPS = msg.chips;
         renderChipBar();
         renderScreenerTable();
@@ -1186,7 +1233,7 @@ function renderScreenerTable() {
         })
         .sort((a, b) => computeChangePct(a.token) - computeChangePct(b.token))
         .slice(0, 15);
-    } else if (SCREENER_MOMENTUM_FILTER === 'rsi_chips') {   // v3.9
+    } else if (SCREENER_MOMENTUM_FILTER === 'rsi_chips') {
       const chipTokens = new Set(SCREENER_CHIPS.map(c => String(c.token)));
       filtered = filtered.filter(s => chipTokens.has(String(s.token)));
       const rankBy = {};
@@ -1220,7 +1267,7 @@ function renderScreenerTable() {
       const preopen = SCREENER_PREOPEN[s.token];
       const dayOpen = SCREENER_DAY_OPEN[s.token];
 
-      const maxQty = computeMaxQty(s.token, ltp);   // v4.0
+      const maxQty = computeMaxQty(s.token, ltp);
 
       const changePct = computeChangePct(s.token);
       let changeLine;
@@ -1342,7 +1389,7 @@ function renderScreenerTable() {
     const quote = SCREENER_QUOTE[s.token];
     const pivot = SCREENER_PIVOT[s.token];
 
-    const maxQty = computeMaxQty(s.token, ltp);   // v4.0
+    const maxQty = computeMaxQty(s.token, ltp);
     const stage = c
       ? resolveOrbStage(s.token, c, ltp)
       : { label: '⏸️ No 9:15 data', color: 'var(--text-muted)', weight: 500 };

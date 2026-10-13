@@ -48,6 +48,10 @@ import {
 
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 
+import {
+  initAutoTrader, onChipLock, onTickPos, loadOpenPositions
+} from './autoTrader.js';   // v4.9.3: auto buy/SL/target module
+
 import { registerAdminRoutes } from './admin.js';
 
 import {
@@ -1051,6 +1055,7 @@ function handleTick(token, ltp, tickMs, extra) {
   setCachedLTP(token, ltp);
   broadcastLTP(token, ltp);
   lastLtpAt.set(String(token), Date.now());
+  onTickPos(token, ltp);                      // v4.9.3: autoTrader SL/T1/T2/trail monitor
 
   if (RSI_SOURCE === 'ws') {
     const st = rsiState.get(String(token));
@@ -2268,6 +2273,8 @@ async function buildChipList(date) {
     chipDate = date;
     console.log(`🔒 Chip list LOCKED for ${date}: ${chips.length} stocks → ${chips.map(c => `${c.sym}(#${c.rank},gap+${c.gapPct}%,RSI${c.rsiAtLock})`).join(', ') || 'none'}`);
     broadcastChip();
+    // v4.9.3: autoTrader entry — chip lock hote hi RSI>=70 top-10 pe market buy
+    onChipLock(chips, date).catch(e => console.error('🤖 AutoTrader entry error:', e.message));
   } catch (e) { console.error('Chip list build failed:', e.message); }
 }
 
@@ -2478,6 +2485,18 @@ app.listen(PORT, async () => {
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();
   await loadChipListFromDB(getIST().toISOString().split('T')[0]);
+
+  // v4.9.3: AutoTrader init (PAPER mode jab tak env AUTO_TRADE=true na karo)
+  initAutoTrader({
+    db,
+    getJwt: getJwtREST,
+    apiKey: process.env.ANGEL_API_KEY,
+    clientCode: process.env.ANGEL_CLIENT_ID,
+    symByToken: SYM_BY_TOKEN,
+    getLtp: getCachedLTP,
+    perTrade: Number(process.env.AUTO_PER_TRADE || 10000)
+  });
+  await loadOpenPositions(getIST().toISOString().split('T')[0]);
   await loadPrevWSClosesFromDB();
   await loadTodayWSClosesFromDB();
   seedRSIStateFromMemory();

@@ -1651,7 +1651,7 @@ function groupCandlesByDate(raw) {
     byDate[date].closes.push(+b[4]);
     byDate[date].ts.push(tsStr);
     byDate[date].vols.push(+b[5] || 0);
-    byDate[date].minutes.push(mm);
+    byDate[date].minutes.push(mins);   // v4.9.2: minutes-of-day (555-929) — fillMissingMinutes isi ko match karta hai
   }
   return byDate;
 }
@@ -1763,6 +1763,27 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
   }
   historicalRunning = true;
 
+  // v4.9.2: cross-instance DB lock — Render pe 2+ instances ho to bhi sirf EK run chalega
+  // (advisory xact lock: instance mare ya connection toote to lock khud release)
+  let lockClient = null;
+  try {
+    lockClient = await db.connect();
+    await lockClient.query('BEGIN');
+    const lk = await lockClient.query('SELECT pg_try_advisory_xact_lock(7451) AS got');
+    if (!lk.rows[0]?.got) {
+      await lockClient.query('ROLLBACK');
+      lockClient.release();
+      lockClient = null;
+      historicalRunning = false;
+      return res.status(409).json({ error: 'Historical fetch already running on another instance' });
+    }
+  } catch (e) {
+    try { if (lockClient) { await lockClient.query('ROLLBACK'); lockClient.release(); } } catch {}
+    lockClient = null;
+    historicalRunning = false;
+    return res.status(500).json({ error: 'lock failed: ' + e.message });
+  }
+
   const days = Math.min(Math.max(+req.body?.days || HISTORICAL_DAYS_DEFAULT, 1), 5);
   const t0 = Date.now();
   const summary = { ok: 0, failed: 0, skipped: 0, days_saved: 0, total: STOCKS.length };
@@ -1828,6 +1849,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
     res.status(500).json({ error: e.message });
   } finally {
     historicalRunning = false;
+    try { if (lockClient) { await lockClient.query('ROLLBACK'); lockClient.release(); } } catch {}   // v4.9.2: lock release
   }
 });
 

@@ -1,13 +1,10 @@
 /* ============================================================
-   nse-fetch-test.js — standalone test (no DB, no server)
-   Purpose: check if openchart-js can fetch 3 days of 1-min
-   candles for 378 NSE stocks without getting blocked.
-
-   Usage:  node nse-fetch-test.js
-   Output: console logs + ./nse-test-output.json
+   nse-fetch-test.js — Standalone NSE 1-min candle test
+   Purpose: Verify openchart-js can fetch 3 days of 1-min data
+   for all active NSE stocks without getting blocked.
    ============================================================ */
 
-import NSEData from 'openchart';
+import NSEData from 'openchart-js';
 import moment from 'moment';
 import { readFileSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -15,7 +12,7 @@ import { dirname, join } from 'path';
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 
-// Load stock list
+// Load your stock list
 const ALL_STOCKS = JSON.parse(
   readFileSync(join(__dir, 'brokers/angelone/Angel_nifty500.json'), 'utf8')
 );
@@ -23,58 +20,55 @@ const STOCKS = ALL_STOCKS.filter(s => !s.disabled);
 
 console.log(`📋 Testing ${STOCKS.length} stocks`);
 
-// Config
 const DAYS_BACK = 3;
-const DELAY_BETWEEN_STOCKS_MS = 250;   // be nice to NSE
-const SAVE_EVERY = 25;                 // dump partial results
+const DELAY_MS = 300;        // Delay between stocks to be gentle on NSE
 const OUTPUT_FILE = join(__dir, 'nse-test-output.json');
 
 async function main() {
   const nse = new NSEData();
-
-  console.log('⏳ Downloading NSE master list...');
+  console.log('⏳ Downloading NSE master data...');
   await nse.download();
-  console.log('✅ Master downloaded');
+  console.log('✅ Master data downloaded');
 
-  const endDate = moment().subtract(1, 'days').toDate();   // yesterday (today incomplete)
-  const startDate = moment().subtract(DAYS_BACK + 3, 'days').toDate();  // extra buffer for weekends
+  // Use dates from 5 days ago to yesterday to account for weekends/holidays
+  const endDate = moment().subtract(1, 'days').toDate();
+  const startDate = moment().subtract(DAYS_BACK + 4, 'days').toDate();
 
   const results = {};
   let ok = 0, empty = 0, failed = 0;
   const t0 = Date.now();
 
   for (let i = 0; i < STOCKS.length; i++) {
-    const s = STOCKS[i];
-    const sym = s.sym.replace(/-EQ$/, '');
-
+    const stock = STOCKS[i];
+    const symbol = stock.sym.replace(/-EQ$/, '');   // e.g., 'BSOFT'
     try {
-      const data = await nse.historical(sym, 'NSE', startDate, endDate, '1m');
+      const data = await nse.historical(symbol, 'NSE', startDate, endDate, '1m');
 
-      if (!data || !data.length) {
+      if (!data || data.length === 0) {
         empty++;
-        results[sym] = { ok: false, reason: 'no_data' };
+        results[symbol] = { ok: false, reason: 'no_data' };
       } else {
         ok++;
-        results[sym] = {
+        results[symbol] = {
           ok: true,
           candles: data.length,
           first: data[0],
           last: data[data.length - 1]
         };
       }
-    } catch (e) {
+    } catch (err) {
       failed++;
-      results[sym] = { ok: false, reason: e.message };
+      results[symbol] = { ok: false, reason: err.message };
     }
 
+    // Log progress every 25 stocks
     if ((i + 1) % 25 === 0 || i === STOCKS.length - 1) {
       const elapsed = Math.round((Date.now() - t0) / 1000);
       console.log(`📊 ${i + 1}/${STOCKS.length} | ok=${ok} empty=${empty} failed=${failed} | ${elapsed}s`);
-      // save partial
-      writeFileSync(OUTPUT_FILE, JSON.stringify(results, null, 2));
+      writeFileSync(OUTPUT_FILE, JSON.stringify(results, null, 2));   // Save partial
     }
 
-    await new Promise(r => setTimeout(r, DELAY_BETWEEN_STOCKS_MS));
+    await new Promise(r => setTimeout(r, DELAY_MS));
   }
 
   console.log('═══════════════════════════════════════');
@@ -83,10 +77,10 @@ async function main() {
   console.log(`   Saved: ${OUTPUT_FILE}`);
   console.log('═══════════════════════════════════════');
 
-  // Show 5 samples
-  console.log('\nSample results:');
+  // Print a sample
+  console.log('\nSample results (first 5):');
   Object.entries(results).slice(0, 5).forEach(([sym, r]) => {
-    console.log(`  ${sym}: ${JSON.stringify(r).slice(0, 200)}`);
+    console.log(`  ${sym}: ${JSON.stringify(r).slice(0, 150)}...`);
   });
 
   // Error breakdown

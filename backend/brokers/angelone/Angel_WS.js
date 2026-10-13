@@ -1,16 +1,21 @@
 /* ============================================================
-   Angel_WS.js — v1.4
+   Angel_WS.js — v1.5
    WebSocket live feed — reconnects + gap backfill support
 
    CHANGELOG v1.4:
-   - Subscribe mode ab configurable: WS_MODE env (default 2 = Quote)
-     mode 1 = LTP only (51-byte packet, purana behaviour)
-     mode 2 = Quote  (115-byte packet: ltp + volume + O/H/L/C)  ← volume yahan milta hai
-     mode 3 = Snap Quote (depth wala, bahut heavy — zaroorat nahi)
-   - parseTick ab 51 aur 115 dono packet samajhta hai
-   - onTick callback ko 4th arg me poora tick object milta hai
-     (server.js isme se volume nikalta hai)
-   - Rollback: env me WS_MODE=1 set karo = bilkul purana behaviour
+   - Subscribe mode configurable: WS_MODE env (default 2 = Quote)
+     mode 1 = LTP only (51-byte packet)
+     mode 2 = Quote  (115-byte packet: ltp + volume + O/H/L/C)
+     mode 3 = Snap Quote (depth)
+   - parseTick handles 51 and 115 byte packets
+   - onTick callback gets full tick object as 4th arg
+
+   CHANGELOG v1.5 (2026-10-13):
+   - Angel ne Quote packet 115 → 123 bytes kar diya (8-byte OI field append)
+   - parseTick ab 123-byte packets bhi accept karta hai
+   - Same offsets: LTP@107, vol@67, O/H/L/C@75/83/91/99
+   - Extra 8 bytes (115-122) = Open Interest (ignored for now)
+   - Hex log har naye size pe ek baar (debug ke liye)
    ============================================================ */
 
 import WebSocket from 'ws';
@@ -156,7 +161,7 @@ function sendSubscribe() {
   ws.send(JSON.stringify({
     action: 1,
     params: {
-      mode: WS_MODE,   // v1.4: 2 = Quote (ltp + volume + OHLC)
+      mode: WS_MODE,
       tokenList: [
         { exchangeType: 1, tokens: subscribedTokens }   // 1 = NSE
       ]
@@ -184,7 +189,7 @@ function clearTimers() {
 /* ============================================================
    PARSE BINARY TICK — Angel One WebSocket
 
-   LTP mode (51 bytes) — confirmed from live hex:
+   LTP mode (51 bytes):
      [0]      mode
      [1]      exchange type
      [2-26]   token (25 bytes ASCII, null-padded)
@@ -192,39 +197,37 @@ function clearTimers() {
      [35-42]  exchange timestamp (int64 LE, epoch ms)
      [43-50]  LTP (int64 LE, price × 100 in paise)
 
-   Quote mode (115 bytes) — documented layout:
+   Quote mode (115 OR 123 bytes):
      [0]      mode
      [1]      exchange type
      [2-26]   token
      [27-34]  sequence
      [35-42]  exchange timestamp
-     [43-50]  last traded time (int64 LE)
-     [51-58]  last traded quantity (int64 LE)
-     [59-66]  average traded price (int64 LE, paise)
-     [67-74]  VOLUME traded today (int64 LE, raw shares — ÷100 NAHI)
-     [75-82]  open  (paise)
-     [83-90]  high  (paise)
-     [91-98]  low   (paise)
-     [99-106] close (paise, prev day close)
-     [107-114] LTP  (paise)
-
-   NOTE: deploy ke baad pehle packet ka hex log hoga (_hexLogged).
-   Ek baar RELIANCE jaise liquid stock pe cross-check kar lena:
-   parsed ltp ≈ REST quote ltp, parsed volume ≈ REST quote volume.
+     [43-50]  last traded time
+     [51-58]  last traded quantity
+     [59-66]  average traded price
+     [67-74]  VOLUME traded today
+     [75-82]  open  (paise ÷100)
+     [83-90]  high  (paise ÷100)
+     [91-98]  low   (paise ÷100)
+     [99-106] close (paise ÷100, prev day close)
+     [107-114] LTP  (paise ÷100)
+     [115-122] (v1.5) Open Interest int64 — IGNORED for now
    ============================================================ */
 function parseTick(buffer) {
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
   const len = buf.length;
 
-  if (len !== 51 && len !== 115) return null;
-
-  const token = buf.slice(2, 27).toString('ascii').replace(/\0+$/, '').trim();
-  if (!token) return null;
-
-  if (_hexLogged < 3) {
+  // Log hex of first 3 real ticks (any size ≥30) — debug help
+  if (_hexLogged < 3 && len >= 30) {
     _hexLogged++;
     console.log(`🔬 tick hex [${len}]: ${buf.toString('hex')}`);
   }
+
+  if (len !== 51 && len !== 115 && len !== 123) return null;
+
+  const token = buf.slice(2, 27).toString('ascii').replace(/\0+$/, '').trim();
+  if (!token) return null;
 
   if (len === 51) {
     /* LTP mode — price × 100, little-endian int64 at byte 43 */
@@ -233,7 +236,7 @@ function parseTick(buffer) {
     return { token, ltp: +ltp.toFixed(2), volume: null };
   }
 
-  /* Quote mode (115 bytes) */
+  /* Quote mode (115 or 123) — same offsets for both */
   const ltp = Number(buf.readBigInt64LE(107)) / 100;
   if (!Number.isFinite(ltp) || ltp <= 0 || ltp > 10000000) return null;
 
@@ -243,7 +246,7 @@ function parseTick(buffer) {
   const low    = Number(buf.readBigInt64LE(91)) / 100;
   const close  = Number(buf.readBigInt64LE(99)) / 100;
 
-  return {
+  const tick = {
     token,
     ltp: +ltp.toFixed(2),
     volume: Number.isFinite(volume) && volume >= 0 ? volume : null,
@@ -252,4 +255,12 @@ function parseTick(buffer) {
     low:  low  > 0 ? +low.toFixed(2)  : null,
     close: close > 0 ? +close.toFixed(2) : null
   };
+
+  /* v1.5: 123-byte packet has 8 extra bytes at end = Open Interest */
+  if (len === 123) {
+    const oi = Number(buf.readBigInt64LE(115));
+    tick.openInterest = Number.isFinite(oi) && oi >= 0 ? oi : null;
+  }
+
+  return tick;
 }

@@ -1,21 +1,23 @@
 /* ============================================================
-   Angel_BS.js  —  v1.2  (standalone)
+   Angel_BS.js  —  v1.3  (standalone)
    Buy/Sell snapshot service via REST FULL quote
 
    - Fully independent (own login, own TOTP, own session)
    - Fetches FULL quote in 50-token batches
-   - Extracts: buyQty (totBuyQuan), sellQty (totSellQuan),
-               ltp, volume, ltq, atp
+   - Extracts: buyQty, sellQty, ltp, volume, ltq, atp,
+               dayOpen, dayHigh, dayLow, prevClose
    - No DB writes here — server.js handles persistence
 
    Exports:
      - loginPlatform()
      - getSessionStatus()
-     - getJwt()              ← v1.2 (for broker margin service)
-     - fetchBuySellForTokens(tokens) → [{ token, buyQty, sellQty, ... }]
+     - getJwt()
+     - fetchBuySellForTokens(tokens) → [{ token, buyQty, ..., dayHigh, dayLow, prevClose }]
 
-   CHANGELOG v1.2 (2026-10-12):
-   - Added getJwt() export — exposes session JWT for broker margin service
+   CHANGELOG v1.3 (2026-10-13):
+   - Added dayHigh, dayLow, prevClose (from Angel q.high/q.low/q.close)
+   - Used by server.js to persist day H/L/C + pivot into BS table
+   - prevClose = Angel's official previous close (= NSE match)
    ============================================================ */
 
 import crypto from 'crypto';
@@ -188,7 +190,6 @@ export function getSessionStatus() {
   };
 }
 
-/* v1.2: expose JWT for broker margin service */
 export function getJwt() { return session.jwtToken || null; }
 
 /* ============================================================
@@ -214,18 +215,25 @@ export async function fetchBuySellForTokens(tokens) {
         for (const q of r.data.fetched) {
           const token = String(q.symbolToken);
 
-          const buyQty  = Number.isFinite(+q.totBuyQuan)  ? +q.totBuyQuan  : null;
-          const sellQty = Number.isFinite(+q.totSellQuan) ? +q.totSellQuan : null;
-          const ltp     = Number.isFinite(+q.ltp)         ? +q.ltp         : null;
-          const volume  = Number.isFinite(+q.tradeVolume) ? +q.tradeVolume : null;
+          const buyQty  = Number.isFinite(+q.totBuyQuan)   ? +q.totBuyQuan   : null;
+          const sellQty = Number.isFinite(+q.totSellQuan)  ? +q.totSellQuan  : null;
+          const ltp     = Number.isFinite(+q.ltp)          ? +q.ltp          : null;
+          const volume  = Number.isFinite(+q.tradeVolume)  ? +q.tradeVolume  : null;
           const ltq     = Number.isFinite(+q.lastTradeQty) ? +q.lastTradeQty : null;
-          const atp     = Number.isFinite(+q.avgPrice)    ? +q.avgPrice    : null;
-          const dayOpen = Number.isFinite(+q.open)        ? +q.open        : null;
+          const atp     = Number.isFinite(+q.avgPrice)     ? +q.avgPrice     : null;
+          const dayOpen = Number.isFinite(+q.open)         ? +q.open         : null;
 
-          /* Skip if BOTH buy and sell missing (Angel sometimes omits) */
+          /* v1.3 additions */
+          const dayHigh   = Number.isFinite(+q.high)  ? +q.high  : null;
+          const dayLow    = Number.isFinite(+q.low)   ? +q.low   : null;
+          const prevClose = Number.isFinite(+q.close) ? +q.close : null;
+
           if (buyQty === null && sellQty === null) continue;
 
-          out.push({ token, buyQty, sellQty, ltp, volume, ltq, atp, dayOpen });
+          out.push({
+            token, buyQty, sellQty, ltp, volume, ltq, atp, dayOpen,
+            dayHigh, dayLow, prevClose
+          });
         }
       }
     } catch (e) {

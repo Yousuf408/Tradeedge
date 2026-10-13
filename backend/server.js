@@ -2005,7 +2005,7 @@ function msUntil(targetHour, targetMin, dayOffsetIfPassed = 1) {
 }
 
 function scheduleDailyHLC() {
-  const ms = msUntil(15, 16);
+  const ms = msUntil(15, 31);
   console.log(`⏰ Next HLC fetch in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => { await fetchDayHLC(); scheduleDailyHLC(); }, ms);
 }

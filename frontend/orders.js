@@ -1,14 +1,20 @@
 /* ============================================================
-   ORDERS.JS — v1.0
-   AutoTrader positions page (Entry / SL / T1 / T2 / Net P&L)
-   - 3s poll on /api/auto/positions jab page active ho
-   - Self-hooked: nav click [data-page="orders"] pe load+poll
-   - Koi app.js dependency nahi (page switch generic ho ya na ho)
+   ORDERS.JS — v1.1 (FINAL)
+   AutoTrader positions page — Entry / SL / T1 / T2 / Net P&L
+   ------------------------------------------------------------
+   - Data: GET /api/auto/positions (3s poll jab page active ho)
+   - Nav click pe page khud activate karta hai (app.js pe depend nahi)
+   - Stats: NET P&L (total), OPEN, CLOSED, WINS
+   - Table: TIME · STOCK · STATUS · QTY · ENTRY · LTP · SL(live trail)
+            · T1 ✓ · T2 ✓ · NET P&L ₹/% · EXIT reason+time
    ============================================================ */
 
 let ORDERS_DATA = { date: null, total: 0, positions: [] };
 let ORDERS_TIMER = null;
 
+/* ============================================================
+   SECTION 1 — LOAD + POLL
+   ============================================================ */
 async function loadOrders() {
   try {
     const r = await fetch(API + '/api/auto/positions', {
@@ -34,13 +40,25 @@ function startOrdersPoll() {
   }, 3000);
 }
 
-/* Nav click hook — app.js pe depend nahi karta */
+/* ============================================================
+   SECTION 2 — NAV CLICK HOOK (page activate + load + poll)
+   app.js me page list hardcoded ho tab bhi Orders page khulega
+   ============================================================ */
 document.addEventListener('click', (e) => {
   const link = e.target.closest('[data-page="orders"]');
-  if (link) { loadOrders(); startOrdersPoll(); }
+  if (!link) return;
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  const pg = document.getElementById('page-orders');
+  if (pg) pg.classList.add('active');
+  document.querySelectorAll('.nav-links a').forEach(a =>
+    a.classList.toggle('active', a.getAttribute('data-page') === 'orders'));
+  loadOrders();
+  startOrdersPoll();
 });
 
-/* ---------- helpers ---------- */
+/* ============================================================
+   SECTION 3 — HELPERS
+   ============================================================ */
 function ordTime(d) {
   if (!d) return '—';
   try {
@@ -67,7 +85,9 @@ function ordStatus(p) {
   return `<span style="color:${col};font-weight:800">⏹ ${rsn}</span>`;
 }
 
-/* ---------- render ---------- */
+/* ============================================================
+   SECTION 4 — RENDER
+   ============================================================ */
 function renderOrders() {
   const stats = document.getElementById('ordersStats');
   const wrap = document.getElementById('ordersTable');
@@ -80,26 +100,22 @@ function renderOrders() {
   const total = ORDERS_DATA.total ?? 0;
   const tCol = total > 0 ? 'var(--success)' : total < 0 ? 'var(--danger)' : 'var(--text-primary)';
 
+  /* ---- stats row ---- */
   if (stats) {
-    stats.innerHTML = `
-      <div style="background:var(--bg-secondary);border:1px solid var(--border-soft);border-radius:12px;padding:14px 20px;min-width:150px">
-        <div style="font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1px">NET P&L</div>
-        <div style="font-size:20px;font-weight:800;color:${tCol}">${total >= 0 ? '+' : ''}${ordINR(total)}</div>
-      </div>
-      <div style="background:var(--bg-secondary);border:1px solid var(--border-soft);border-radius:12px;padding:14px 20px;min-width:90px">
-        <div style="font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1px">OPEN</div>
-        <div style="font-size:20px;font-weight:800;color:var(--success)">${open.length}</div>
-      </div>
-      <div style="background:var(--bg-secondary);border:1px solid var(--border-soft);border-radius:12px;padding:14px 20px;min-width:90px">
-        <div style="font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1px">CLOSED</div>
-        <div style="font-size:20px;font-weight:800">${closed.length}</div>
-      </div>
-      <div style="background:var(--bg-secondary);border:1px solid var(--border-soft);border-radius:12px;padding:14px 20px;min-width:90px">
-        <div style="font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1px">WINS</div>
-        <div style="font-size:20px;font-weight:800;color:var(--success)">${wins}</div>
+    const card = (label, value, color) => `
+      <div style="background:var(--bg-secondary);border:1px solid var(--border-soft);
+                  border-radius:12px;padding:14px 20px;min-width:110px">
+        <div style="font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1px">${label}</div>
+        <div style="font-size:20px;font-weight:800;color:${color || 'var(--text-primary)'}">${value}</div>
       </div>`;
+    stats.innerHTML =
+      card('NET P&L', `${total >= 0 ? '+' : ''}${ordINR(total)}`, tCol) +
+      card('OPEN', open.length, 'var(--success)') +
+      card('CLOSED', closed.length) +
+      card('WINS', wins, 'var(--success)');
   }
 
+  /* ---- positions table ---- */
   const rows = ps.map(p => {
     const pnlCol = p.pnl > 0 ? 'var(--success)' : p.pnl < 0 ? 'var(--danger)' : 'var(--text-secondary)';
     const t1hit = (p.stage >= 1 || (p.exitPrice != null && p.exitPrice >= p.t1));

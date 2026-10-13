@@ -1,10 +1,12 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.2
+   server.js — TradeAlgo Pro backend  |  v5.4
    v5.1: Margin service JWT fallback
    v5.2: BS upsert writes day_high/low/close/prev_close;
          prevCloseCache from Angel q.close;
-         loadPrevCloseFromDB reads BS-first;
          Momentum 15m-independent; pivot load removed
+   v5.4: NEW admin route — Angel REST 1-min + 5-min candle backfill
+         Overwrites ws_1min_close, ws_5min_close (and ts/volume)
+         + RSI recompute. Guarded against concurrent runs.
    ============================================================ */
 
 import express from 'express';
@@ -292,7 +294,7 @@ async function loadQuoteCacheFromDB() {
 
 
 /* ============================================================
-   SECTION 4.3 — PIVOT CACHE (kept for ORB; not loaded for Momentum)
+   SECTION 4.3 — PIVOT CACHE
    ============================================================ */
 const pivotCache = new Map();
 
@@ -1575,6 +1577,214 @@ app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
 
 
 /* ============================================================
+   SECTION 7.2 — HISTORICAL BACKFILL (v5.4)
+   Fetch 1-min + 5-min from Angel REST, overwrite WS columns
+   ============================================================ */
+const HISTORICAL_DAYS_DEFAULT = 4;
+const ANGEL_HISTORICAL_URL = 'https://apiconnect.angelbroking.in/rest/secure/angelbroking/historical/v1/getCandleData';
+let historicalRunning = false;
+
+function getAnyAngelJwt() {
+  if (getSessionStatusREST()?.loggedIn && getJwtREST?.())  return getJwtREST();
+  if (getSessionStatusQuote()?.loggedIn && getJwtQuote?.()) return getJwtQuote();
+  if (getSessionStatusBS()?.loggedIn && getJwtBS?.())       return getJwtBS();
+  return process.env.ANGEL_JWT || null;
+}
+
+async function fetchAngelInterval(token, interval, daysBack) {
+  const JWT = getAnyAngelJwt();
+  if (!JWT) throw new Error('No Angel JWT');
+
+  const nowIST = getIST();
+  const toDate = nowIST.toISOString().split('T')[0];
+  const fromMs = nowIST.getTime() - (daysBack + 4) * 24 * 3600 * 1000;
+  const fromDate = new Date(fromMs).toISOString().split('T')[0];
+
+  const r = await fetch(ANGEL_HISTORICAL_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'X-UserType': 'USER',
+      'X-SourceID': 'WEB',
+      'X-ClientLocalIP': '127.0.0.1',
+      'X-ClientPublicIP': '127.0.0.1',
+      'X-MACAddress': '00:00:00:00:00:00',
+      'X-PrivateKey': process.env.ANGEL_API_KEY,
+      'Authorization': 'Bearer ' + JWT
+    },
+    body: JSON.stringify({
+      exchange: 'NSE',
+      symboltoken: String(token),
+      interval,
+      fromdate: `${fromDate} 09:15`,
+      todate: `${toDate} 15:30`
+    })
+  });
+
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const j = await r.json();
+  if (!j.status || !Array.isArray(j.data)) throw new Error(j.message || 'no data');
+  return j.data;   // [ [ts, o, h, l, c, v], ... ]
+}
+
+function groupCandlesByDate(raw) {
+  const byDate = {};
+  for (const b of raw) {
+    let ms;
+    if (typeof b[0] === 'number') ms = b[0];
+    else ms = new Date(b[0]).getTime();
+    if (!Number.isFinite(ms)) continue;
+
+    const istD = new Date(ms + 5.5 * 3600 * 1000);
+    const date = istD.toISOString().slice(0, 10);
+    const hh = istD.getUTCHours();
+    const mm = istD.getUTCMinutes();
+    const mins = hh * 60 + mm;
+
+    // Filter 9:15–15:30 IST
+    if (mins < 9 * 60 + 15 || mins > 15 * 60 + 30) continue;
+
+    if (!byDate[date]) byDate[date] = { closes: [], ts: [], vols: [], minutes: [] };
+    const tsStr = `${date}T${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:00.000+05:30`;
+    byDate[date].closes.push(+b[4]);
+    byDate[date].ts.push(tsStr);
+    byDate[date].vols.push(+b[5] || 0);
+    byDate[date].minutes.push(mm);
+  }
+  return byDate;
+}
+
+function derive5minFrom1min(by1m) {
+  // 5-min candle ends at minutes % 5 === 4  (matches WS sampler convention)
+  const by5m = {};
+  for (const date in by1m) {
+    const src = by1m[date];
+    const dst = { closes: [], ts: [], vols: [] };
+    for (let i = 0; i < src.minutes.length; i++) {
+      if (src.minutes[i] % 5 === 4) {
+        dst.closes.push(src.closes[i]);
+        dst.ts.push(src.ts[i]);
+        dst.vols.push(src.vols[i]);
+      }
+    }
+    by5m[date] = dst;
+  }
+  return by5m;
+}
+
+async function backfillOneStock(stock, daysBack) {
+  const sym = stock.sym;
+  const token = String(stock.token);
+
+  // 1-min from Angel
+  const raw1m = await fetchAngelInterval(token, 'ONE_MINUTE', daysBack);
+  const by1m = groupCandlesByDate(raw1m);
+
+  // Derive 5-min
+  const by5m = derive5minFrom1min(by1m);
+
+  // Keep last N days
+  const dates = Object.keys(by1m).sort().slice(-daysBack);
+  let saved = 0;
+
+  for (const date of dates) {
+    const d1 = by1m[date];
+    const d5 = by5m[date] || { closes: [], ts: [], vols: [] };
+    if (d1.closes.length < 20) continue;
+
+    const rsi = computeRSIWilder(d1.closes);
+
+    await db.query(
+      `INSERT INTO strategy_bs_snapshot
+         (date, sym, token, strategy_id,
+          ws_1min_close, ws_1min_ts, ws_1min_volume,
+          ws_5min_close, ws_5min_ts, ws_5min_volume,
+          rsi, fetched_at)
+       VALUES ($1, $2, $3, 'momentum',
+               $4::numeric[], $5::timestamptz[], $6::numeric[],
+               $7::numeric[], $8::timestamptz[], $9::numeric[],
+               $10, NOW())
+       ON CONFLICT (date, token, strategy_id) DO UPDATE SET
+         ws_1min_close  = EXCLUDED.ws_1min_close,
+         ws_1min_ts     = EXCLUDED.ws_1min_ts,
+         ws_1min_volume = EXCLUDED.ws_1min_volume,
+         ws_5min_close  = EXCLUDED.ws_5min_close,
+         ws_5min_ts     = EXCLUDED.ws_5min_ts,
+         ws_5min_volume = EXCLUDED.ws_5min_volume,
+         rsi            = EXCLUDED.rsi,
+         fetched_at     = NOW()`,
+      [
+        date, sym, token,
+        d1.closes, d1.ts, d1.vols,
+        d5.closes, d5.ts, d5.vols,
+        rsi != null ? +rsi.toFixed(2) : null
+      ]
+    );
+    saved++;
+  }
+  return { sym, days_saved: saved, dates };
+}
+
+app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
+  if (historicalRunning) {
+    return res.status(409).json({ error: 'Historical fetch already running' });
+  }
+  historicalRunning = true;
+
+  const days = Math.min(Math.max(+req.body?.days || HISTORICAL_DAYS_DEFAULT, 1), 5);
+  const t0 = Date.now();
+  const summary = { ok: 0, failed: 0, skipped: 0, days_saved: 0, total: STOCKS.length };
+  const errors = [];
+
+  const DELAY_MS = 320;   // Angel rate-limit: ~3/sec
+  const queue = [...STOCKS];
+  let processed = 0;
+
+  try {
+    while (queue.length) {
+      const stock = queue.shift();
+      try {
+        const r = await backfillOneStock(stock, days);
+        if (r.days_saved > 0) {
+          summary.ok++;
+          summary.days_saved += r.days_saved;
+        } else {
+          summary.skipped++;
+        }
+      } catch (e) {
+        summary.failed++;
+        if (errors.length < 20) errors.push(`${stock.sym}: ${e.message}`);
+      }
+      processed++;
+      if (processed % 25 === 0) {
+        console.log(`📥 Historical: ${processed}/${STOCKS.length} | ok=${summary.ok} fail=${summary.failed}`);
+      }
+      await new Promise(r => setTimeout(r, DELAY_MS));
+    }
+
+    const elapsed = Math.round((Date.now() - t0) / 1000);
+    console.log(`✅ Historical DONE ${elapsed}s | ok=${summary.ok} skip=${summary.skipped} fail=${summary.failed} days=${summary.days_saved}`);
+
+    // Rebuild memory after backfill
+    try {
+      await loadPrevWSClosesFromDB();
+      await loadTodayWSClosesFromDB();
+      seedRSIStateFromMemory();
+      console.log('🔄 WS caches reloaded after backfill');
+    } catch (e) { console.error('Post-backfill reload failed:', e.message); }
+
+    res.json({ ok: true, elapsed_sec: elapsed, summary, errors });
+  } catch (e) {
+    console.error('Historical fetch error:', e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    historicalRunning = false;
+  }
+});
+
+
+/* ============================================================
    SECTION 8 — DAY H/L/C FETCH (15:31 IST)
    ============================================================ */
 async function fetchDayHLC() {
@@ -2178,7 +2388,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.2`);
+  console.log(`✅ Server on port ${PORT} — v5.4`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 

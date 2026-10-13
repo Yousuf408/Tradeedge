@@ -1,13 +1,11 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.2
-   v5.1 changes:
-   - Margin service ab REST → Quote → BS JWT fallback use karta hai
-   v5.2 changes:
-   - BS upsert now writes day_high, day_low, day_close, prev_close
-   - prevCloseCache populated from Angel q.close (official)
-   - loadPrevCloseFromDB reads BS-first, 15m fallback
-   - Momentum ab 15m table pe depend nahi (LTP WS se, prevClose BS se)
-   - Removed loadLatestPivotFromDB() startup call
+   server.js — TradeAlgo Pro backend  |  v5.3
+   v5.1: Margin service JWT fallback
+   v5.2: BS upsert writes day_high/low/close/prev_close;
+         prevCloseCache from Angel q.close;
+         loadPrevCloseFromDB reads BS-first;
+         Momentum 15m-independent; pivot load removed
+   v5.3: NSE 1-min test route added (/api/admin/test-nse)
    ============================================================ */
 
 import express from 'express';
@@ -50,6 +48,7 @@ import {
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 
 import { registerAdminRoutes } from './admin.js';
+import { runNseTest } from './nse-fetch-test.js';
 
 import {
   initMarginService,
@@ -226,9 +225,7 @@ const getOrbState = (token, date) => orbState.get(`${token}_${date}`) || {
 
 
 /* ============================================================
-   SECTION 4.1 — PREV CLOSE
-   v5.2: BS-first (Angel q.close via prev_close column),
-         15m table fallback.
+   SECTION 4.1 — PREV CLOSE (BS-first)
    ============================================================ */
 const prevCloseCache = new Map();
 
@@ -237,7 +234,6 @@ async function loadPrevCloseFromDB() {
     const activeTokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
     const latestDate = getIST().toISOString().split('T')[0];
 
-    // Try BS table first (Angel q.close = official prevClose)
     const { rows: bsRows } = await db.query(
       `SELECT DISTINCT ON (token) token, prev_close
        FROM strategy_bs_snapshot
@@ -254,7 +250,6 @@ async function loadPrevCloseFromDB() {
       return;
     }
 
-    // Fallback: 15m table
     const { rows: mRows } = await db.query(
       `SELECT DISTINCT ON (token) token, day_close
        FROM angel_15m_candle
@@ -1572,6 +1567,18 @@ app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* v5.3: NSE test route — temporary, for validation */
+app.get('/api/admin/test-nse', auth, adminOnly, async (req, res) => {
+  try {
+    console.log('🚀 NSE test starting...');
+    const result = await runNseTest();
+    res.json(result);
+  } catch (e) {
+    console.error('NSE test failed:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
   try {
     const broker = req.body?.broker || 'angelone';
@@ -1752,7 +1759,6 @@ async function autoFetchPreopen() {
 
 /* ============================================================
    SECTION 11 — BS FETCH (9:15 + 30s interval) + MINUTE SELF-COLLECT
-   v5.2: now writes day_high, day_low, day_close, prev_close
    ============================================================ */
 let bsIntervalTimer = null;
 let bsRunning = false;
@@ -1780,7 +1786,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
     const minuteChanges = [];
 
     const bTokens = [], bSyms = [], bBuy = [], bSell = [], bLtp = [], bVol = [], bOpen = [];
-    const bHigh = [], bLow = [], bClose = [], bPivot = [], bRsi = [];
+    const bHigh = [], bLow = [], bClose = [], bPivot = [], bPrevClose = [], bRsi = [];
     const vTokens = [], vVols = [];
 
     for (const r of results) {
@@ -1812,7 +1818,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
           rsi
         });
 
-        // v5.2: populate prevCloseCache from Angel q.close
         if (r.prevClose && r.prevClose > 0) {
           prevCloseCache.set(String(r.token), +r.prevClose);
         }
@@ -1820,7 +1825,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
         const flushed = updateMinuteBuffer(r.token, r.ltp);
         if (flushed) minuteChanges.push({ token: String(r.token), ts: flushed.ts, close: flushed.close });
 
-        // Compute pivot for display (using day's H/L + current ltp)
         const pivot = (r.dayHigh && r.dayLow && r.ltp)
           ? +(((r.dayHigh + r.dayLow + r.ltp) / 3).toFixed(4))
           : null;
@@ -1834,8 +1838,9 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
         bOpen.push(r.dayOpen ?? null);
         bHigh.push(r.dayHigh ?? null);
         bLow.push(r.dayLow ?? null);
-        bClose.push(r.ltp ?? null);           // today's running close = current ltp
+        bClose.push(r.ltp ?? null);
         bPivot.push(pivot);
+        bPrevClose.push(r.prevClose ?? null);
         bRsi.push(rsi);
       }
     }
@@ -1853,11 +1858,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
 
     if (!volumeOnly && bTokens.length) {
       try {
-        // v5.2: also upsert prev_close (Angel q.close = official prevClose)
-        const bPrevClose = results
-          .filter(r => bTokens.includes(String(r.token)))
-          .map(r => r.prevClose ?? null);
-
         await db.query(
           `INSERT INTO strategy_bs_snapshot AS s (
              date, sym, token, strategy_id,
@@ -2150,7 +2150,7 @@ function startMarginRefreshLoop() {
 
 
 /* ============================================================
-   SECTION 13 — DB CACHE LOADER (v5.2: LTP skip)
+   SECTION 13 — DB CACHE LOADER
    ============================================================ */
 async function loadScreenerCacheFromDB() {
   try {
@@ -2158,7 +2158,6 @@ async function loadScreenerCacheFromDB() {
     if (!p.date) return;
     const activeTokens = STOCKS.map(s => String(s.token));
 
-    // v5.2: LTP 15m table se NAHI padhte — WS source of truth.
     const { rows } = await db.query(
       `SELECT token, open, high, low, close, volume,
               q15_open, q15_high, q15_low, q15_close
@@ -2171,7 +2170,6 @@ async function loadScreenerCacheFromDB() {
       } else if (r.q15_high > 0 && r.q15_low > 0) {
         setCachedCandle(r.token, p.date, [0, +r.q15_open, +r.q15_high, +r.q15_low, +r.q15_close, 0]);
       }
-      // ltp NOT set — WS provides
     }
     console.log(`📦 Loaded ${rows.length} candles for ${p.date} (WS provides LTP)`);
     await loadOrbStateFromDB(p.date);
@@ -2194,7 +2192,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.2`);
+  console.log(`✅ Server on port ${PORT} — v5.3`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 
@@ -2210,7 +2208,6 @@ app.listen(PORT, async () => {
   await loadScreenerCacheFromDB();
   await loadPrevCloseFromDB();
   await loadQuoteCacheFromDB();
-  // loadLatestPivotFromDB() — Momentum ke liye zaroorat nahi
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();

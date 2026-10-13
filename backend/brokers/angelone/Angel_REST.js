@@ -19,7 +19,7 @@
 
 import crypto from 'crypto';
 
-const BASE_URL = 'https://apiconnect.angelbroking.in';
+const BASE_URL = 'https://apiconnect.angelone.in';
 const API_KEY = process.env.ANGEL_API_KEY;
 const CLIENT_ID = process.env.ANGEL_CLIENT_ID;
 const PIN = process.env.ANGEL_PIN;

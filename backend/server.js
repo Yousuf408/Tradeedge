@@ -2273,9 +2273,12 @@ app.listen(PORT, async () => {
   scheduleBSAutoFetch();
   scheduleFinalFlush();
   scheduleMorningPreload();
-  startMarginRefreshLoop();
+   startMarginRefreshLoop();
 
   maybeRefreshMargins('angelone', { force: true }).catch(() => {});
+
+  // NSE test — ek baar startup pe
+  runNseTest().then(r => console.log('🎯 NSE test result:', JSON.stringify(r))).catch(e => console.error('NSE test failed:', e.message));
 
   console.log('ℹ️  Schedule: WS@9:14:55 | Preopen@9:13:30 | BS@9:15 (30s) | Quote@9:30 | HLC@15:31 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');
 });

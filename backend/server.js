@@ -1602,40 +1602,56 @@ function getAnyAngelJwt() {
 }
 
 async function fetchAngelInterval(token, interval, daysBack) {
-  const JWT = getAnyAngelJwt();
-  if (!JWT) throw new Error('No Angel JWT');
-
   const nowIST = getIST();
   const toDate = nowIST.toISOString().split('T')[0];
   const fromMs = nowIST.getTime() - (daysBack + 6) * 24 * 3600 * 1000;   // v5.15: 10 working days ≈ 14 calendar
   const fromDate = new Date(fromMs).toISOString().split('T')[0];
 
-  const r = await fetch(ANGEL_HISTORICAL_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      'X-UserType': 'USER',
-      'X-SourceID': 'WEB',
-      'X-ClientLocalIP': '127.0.0.1',
-      'X-ClientPublicIP': '127.0.0.1',
-      'X-MACAddress': '00:00:00:00:00:00',
-      'X-PrivateKey': process.env.ANGEL_API_KEY,
-      'Authorization': 'Bearer ' + JWT
-    },
-    body: JSON.stringify({
-      exchange: 'NSE',
-      symboltoken: String(token),
-      interval,
-      fromdate: `${fromDate} 09:15`,
-      todate: `${toDate} 15:30`
-    })
-  });
+  const doRequest = async (jwt) => {
+    const r = await fetch(ANGEL_HISTORICAL_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-UserType': 'USER',
+        'X-SourceID': 'WEB',
+        'X-ClientLocalIP': '127.0.0.1',
+        'X-ClientPublicIP': '127.0.0.1',
+        'X-MACAddress': '00:00:00:00:00:00',
+        'X-PrivateKey': process.env.ANGEL_API_KEY,
+        'Authorization': 'Bearer ' + jwt
+      },
+      body: JSON.stringify({
+        exchange: 'NSE',
+        symboltoken: String(token),
+        interval,
+        fromdate: `${fromDate} 09:15`,
+        todate: `${toDate} 15:30`
+      })
+    });
+    if (r.status === 401 || r.status === 403) return { authFail: true, msg: `HTTP ${r.status}` };
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    if (!j.status || !Array.isArray(j.data)) {
+      if (/invalid token|session expired|token expired/i.test(j.message || '')) return { authFail: true, msg: j.message };
+      throw new Error(j.message || 'no data');
+    }
+    return { data: j.data };
+  };
 
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  const j = await r.json();
-  if (!j.status || !Array.isArray(j.data)) throw new Error(j.message || 'no data');
-  return j.data;   // [ [ts, o, h, l, c, v], ... ]
+  let jwt = getAnyAngelJwt();
+  if (!jwt) throw new Error('No Angel JWT');
+  let out = await doRequest(jwt);
+  if (out.authFail) {
+    // v5.16: token mar gaya → AUTO RE-LOGIN → ek retry (Invalid Token avalanche fix)
+    console.log(`🔑 Historical auth fail (${out.msg}) — re-login + retry`);
+    await loginREST().catch(e => console.error('🔑 re-login failed:', e.message));
+    jwt = getAnyAngelJwt();
+    if (!jwt) throw new Error('No Angel JWT after re-login');
+    out = await doRequest(jwt);
+    if (out.authFail) throw new Error(out.msg + ' (after re-login)');
+  }
+  return out.data;   // [ [ts, o, h, l, c, v], ... ]
 }
 
 function groupCandlesByDate(raw, shiftMin = 0) {

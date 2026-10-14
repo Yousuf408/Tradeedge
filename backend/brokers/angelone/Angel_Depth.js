@@ -1,14 +1,22 @@
 /* ============================================================
-   Angel_Depth.js — v0.9 (DIAGNOSTIC BUILD)
+   Angel_Depth.js — v1.0 (MODE 3 SNAP QUOTE / DEPTH)
    ------------------------------------------------------------
-   Mode 3 (Snap Quote / Depth) ka alag WebSocket connection.
-   ABHI KA MAQSAD: sirf packet capture + field dump taaki
-   123/xxx-byte depth layout ke exact offsets confirm ho sakein.
-
-   - Enable: env DEPTH_DIAG=true  (default OFF = kuch nahi hota)
-   - Tokens: env DEPTH_DIAG_TOKENS="token1,token2,..." ya default pehle 5 stocks
-   - Main Angel_WS.js (quote feed) se koi lena-dena nahi — alag connection
-   - Parse confirm hone ke baad v1.0 me asli depth parser aayega
+   Alag WebSocket connection — sirf depth data (buyers vs sellers)
+   Packet 379 bytes — layout CONFIRMED via hex diagnostic (2026-10-14):
+     [0]      mode (3)
+     [1]      exchange (1=NSE)
+     [2-26]   token (25B ascii)
+     [27-34]  sequence
+     [35-42]  exchange timestamp (ms)
+     [43-50]  LTP (paise ÷100)
+     [51-58]  last traded qty
+     [59-66]  avg traded price = VWAP (paise ÷100)
+     [67-74]  cumulative volume
+     [347-354] TOTAL BUY QTY   ← buyers
+     [355-362] TOTAL SELL QTY  ← sellers
+     [363-370] alt buy  (validation log)
+     [371-378] alt sell (validation log)
+   Quota: mode3 = 3 subscription/token → max ~333 tokens/connection
    ============================================================ */
 
 import WebSocket from 'ws';
@@ -23,16 +31,17 @@ let feedToken = null;
 let apiKey = null;
 let clientCode = null;
 let depthTokens = [];
-let onPacket = null;
+let onDepth = null;
 let heartbeatTimer = null;
 let reconnectTimer = null;
+let _validateLogged = new Set();
 
-export function startDepthWS({ feedToken: ft, apiKey: key, clientCode: code, tokens, onPacket: cb }) {
+export function startDepthWS({ feedToken: ft, apiKey: key, clientCode: code, tokens, onDepth: cb }) {
   feedToken = ft;
   apiKey = key;
   clientCode = code;
   depthTokens = [...tokens];
-  onPacket = cb;
+  onDepth = cb;
   shouldRun = true;
   connect();
 }
@@ -42,6 +51,23 @@ export function stopDepthWS() {
   clearInterval(heartbeatTimer);
   clearTimeout(reconnectTimer);
   if (ws) { try { ws.close(); } catch {} ws = null; }
+}
+
+/* Live list badlo (top-300 change% refresh) — resubscribe */
+export function resubscribeDepth(tokens) {
+  depthTokens = [...tokens];
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ action: 0, params: { mode: 3, tokenList: [] } }));
+    sendSubscribe();
+  }
+}
+
+export function getDepthStatus() {
+  return {
+    running: shouldRun,
+    connected: !!(ws && ws.readyState === WebSocket.OPEN),
+    tokenCount: depthTokens.length
+  };
 }
 
 function connect() {
@@ -59,16 +85,8 @@ function connect() {
   });
 
   ws.on('open', () => {
-    console.log(`🧪 DEPTH WS connected (${depthTokens.length} tokens, mode=3)`);
-    ws.send(JSON.stringify({
-      action: 1,
-      params: {
-        mode: 3,   // SNAP QUOTE / DEPTH
-        tokenList: [
-          { exchangeType: 1, tokens: depthTokens }
-        ]
-      }
-    }));
+    console.log(`🧿 Depth WS connected (${depthTokens.length} tokens, mode=3)`);
+    sendSubscribe();
     heartbeatTimer = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) { try { ws.send('ping'); } catch {} }
     }, HEARTBEAT_MS);
@@ -76,32 +94,41 @@ function connect() {
 
   ws.on('message', (data) => {
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    if (buf.length < 30) return;   // heartbeat / ack
+    if (buf.length < 30) return;
     try {
-      const token = buf.slice(2, 27).toString('ascii').replace(/\0+$/, '').trim();
-      // har 8-byte int64 field ka raw + price-form dump (offset 27 se aage)
-      const fields = [];
-      for (let off = 27; off + 8 <= buf.length; off += 8) {
-        const raw = Number(buf.readBigInt64LE(off));
-        fields.push({ off, raw, price: +(raw / 100).toFixed(2) });
-      }
-      if (onPacket) onPacket({ token, len: buf.length, fields, hex: buf.toString('hex') });
+      const d = parseDepth(buf);
+      if (d && onDepth) onDepth(d);
     } catch (e) {
-      console.error('🧪 DEPTH parse error:', e.message);
+      console.error('🧿 Depth parse error:', e.message);
     }
   });
 
   ws.on('close', (code, reason) => {
-    console.log(`🧪 DEPTH WS closed code=${code} reason=${reason?.toString() || ''}`);
+    console.log(`🧿 Depth WS closed code=${code} reason=${reason?.toString() || ''}`);
     handleDrop();
   });
 
   ws.on('error', (e) => {
-    console.log('🧪 DEPTH WS error:', e.message);
+    console.log('🧿 Depth WS error:', e.message);
     handleDrop();
   });
 
   ws.on('ping', () => { try { ws.pong(); } catch {} });
+}
+
+function sendSubscribe() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!depthTokens.length) return;
+  ws.send(JSON.stringify({
+    action: 1,
+    params: {
+      mode: 3,
+      tokenList: [
+        { exchangeType: 1, tokens: depthTokens }
+      ]
+    }
+  }));
+  console.log(`🧿 Depth subscribed: ${depthTokens.length} tokens (quota ${depthTokens.length * 3}/1000)`);
 }
 
 function handleDrop() {
@@ -109,4 +136,36 @@ function handleDrop() {
   clearTimeout(reconnectTimer);
   if (!shouldRun) return;
   reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+}
+
+function parseDepth(buf) {
+  const len = buf.length;
+  if (len !== 379) return null;
+
+  const token = buf.slice(2, 27).toString('ascii').replace(/\0+$/, '').trim();
+  if (!token) return null;
+
+  const ltp = Number(buf.readBigInt64LE(43)) / 100;
+  if (!Number.isFinite(ltp) || ltp <= 0 || ltp > 10000000) return null;
+
+  const ltq     = Number(buf.readBigInt64LE(51));
+  const avg     = Number(buf.readBigInt64LE(59)) / 100;
+  const volume  = Number(buf.readBigInt64LE(67));
+  const buyQty  = Number(buf.readBigInt64LE(347));
+  const sellQty = Number(buf.readBigInt64LE(355));
+  const altBuy  = Number(buf.readBigInt64LE(363));
+  const altSell = Number(buf.readBigInt64LE(371));
+
+  return {
+    token,
+    ltp: +ltp.toFixed(2),
+    ltq: Number.isFinite(ltq) && ltq >= 0 ? ltq : null,
+    avgPrice: Number.isFinite(avg) && avg > 0 ? +avg.toFixed(2) : null,
+    volume: Number.isFinite(volume) && volume >= 0 ? volume : null,
+    buyQty: Number.isFinite(buyQty) && buyQty >= 0 ? buyQty : null,
+    sellQty: Number.isFinite(sellQty) && sellQty >= 0 ? sellQty : null,
+    altBuy, altSell,
+    ts: Date.now(),
+    shouldValidate: !_validateLogged.has(token) && (_validateLogged.add(token), true)
+  };
 }

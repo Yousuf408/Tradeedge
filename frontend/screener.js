@@ -339,7 +339,7 @@ function updateNiftyHeader() {
 /* ============================================================
    SECTION 3.3 — FAST CELL UPDATE (SSE LTP)
    ============================================================ */
-function updateLTPCells(ticks) {
+function updateLTPCells(ticks, vwaps) {
   const rows = document.querySelectorAll('#screenerBody tr[data-token]');
   if (!rows.length) return;
   const rowMap = {};
@@ -369,6 +369,13 @@ function updateLTPCells(ticks) {
     const mqEl = row.querySelector('.maxqty-cell');
     if (mqEl) {
       mqEl.textContent = computeMaxQty(token, +price);
+    }
+
+    // v4.7: tick-by-tick VWAP (exchange avg price, SSE ltp event ke saath)
+    if (vwaps && vwaps[token] != null) {
+      SCREENER_VWAP[token] = vwaps[token];
+      const vwEl = row.querySelector('.vwap-cell');
+      if (vwEl) vwEl.textContent = '₹' + (+vwaps[token]).toFixed(2);
     }
   }
 }
@@ -666,7 +673,7 @@ function startSSE() {
           SCREENER_LTP[NIFTY50_TOKEN] = msg.ticks[NIFTY50_TOKEN];
           updateNiftyHeader();
         }
-        updateLTPCells(msg.ticks);
+        updateLTPCells(msg.ticks, msg.vwaps);
       }
       else if (msg.type === 'bs' && msg.bs) {
         for (const [token, v] of Object.entries(msg.bs)) {
@@ -826,7 +833,7 @@ function renderScreenerTable() {
         <td style="white-space:nowrap;font-weight:700;color:#F5A623">${SCREENER_RSI_FIRST[s.token] != null ? (+SCREENER_RSI_FIRST[s.token]).toFixed(1) : '—'}</td>
         <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
         <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">${bs?.volume ? formatQty(bs.volume) : '—'}</td>
-        <td style="white-space:nowrap;font-weight:700;color:#6C5CE7">${SCREENER_VWAP[s.token] != null ? '₹' + (+SCREENER_VWAP[s.token]).toFixed(2) : '—'}</td>
+        <td class="vwap-cell" style="white-space:nowrap;font-weight:700;color:#6C5CE7">${SCREENER_VWAP[s.token] != null ? '₹' + (+SCREENER_VWAP[s.token]).toFixed(2) : '—'}</td>
         <td style="white-space:nowrap"><span style="color:var(--text-muted)">—</span></td>
         <td class="maxqty-cell" style="font-weight:700;color:#6C5CE7">${maxQty}</td>
         <td style="color:var(--text-muted);font-size:11px;font-family:ui-monospace,monospace">${lastUpdate}</td>

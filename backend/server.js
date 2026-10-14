@@ -895,8 +895,6 @@ function broadcastLTP(token, ltp) {
   }, 100);
 }
 
-  })}\n\n`);
-}
 
 
 function broadcastBS(fetchedAt) {
@@ -2189,8 +2187,6 @@ app.listen(PORT, async () => {
   if (dow >= 1 && dow <= 5 && mins >= 916 && mins <= 940) {
     console.log('🔔 Late startup — fetching day H/L/C');
     fetchDayHLC();
-  }
-
   }
 
   const bsStart = 9 * 3600 + 15 * 60;

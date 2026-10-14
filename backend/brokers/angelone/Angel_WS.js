@@ -1,5 +1,5 @@
 /* ============================================================
-   Angel_WS.js — v1.7
+   Angel_WS.js — v1.8
    WebSocket live feed — reconnects + gap backfill support
 
    CHANGELOG v1.4:
@@ -24,6 +24,12 @@
        Close  @ 107  (prev day close)
        Open   @ 115
    - Legacy 115-byte path untouched (rollback safe)
+
+   CHANGELOG v1.8 (2026-10-14):
+   - EXCHANGE VWAP: avg traded price field parse hota hai
+       123-byte: @ 59-66   |   115-byte: @ 59-66
+     → tick.avgPrice (paise ÷100) = TRUE cumulative VWAP
+   - Server isko live VWAP column + ws_1min_vwap series me use karta hai
    ============================================================ */
 
 import WebSocket from 'ws';
@@ -205,29 +211,21 @@ function clearTimers() {
      [35-42]  exchange timestamp (int64 LE, epoch ms)
      [43-50]  LTP (int64 LE, price × 100 in paise)
 
-   Quote mode (123 bytes) — NEW v1.7 LAYOUT (confirmed via hex):
-     [0]      mode
-     [1]      exchange type
-     [2-26]   token
-     [27-34]  sequence
-     [35-42]  exchange timestamp
+   Quote mode (123 bytes) — v1.7 layout + v1.8 avg:
      [43-50]  LTP        (paise ÷100)
-     [51-58]  last traded qty
-     [59-66]  avg traded price (paise ÷100)
+     [51-58]  last traded qty / time block
+     [59-66]  AVG TRADED PRICE = TRUE VWAP (paise ÷100)   ← v1.8
      [67-74]  VOLUME traded today (raw shares)
-     [75-90]  unknown/reserved (16 bytes)
      [91-98]  low       (paise ÷100)
      [99-106] high      (paise ÷100)
      [107-114] close    (paise ÷100, prev day close)
      [115-122] open     (paise ÷100)
 
-   Quote mode (115 bytes) — LEGACY (kept for rollback):
+   Quote mode (115 bytes) — LEGACY (rollback safe):
      [43-50]  last traded time
+     [59-66]  avg traded price (VWAP)                     ← v1.8
      [67-74]  volume
-     [75-82]  open
-     [83-90]  high
-     [91-98]  low
-     [99-106] close
+     [75-82]  open | [83-90] high | [91-98] low | [99-106] close
      [107-114] LTP
    ============================================================ */
 function parseTick(buffer) {
@@ -249,14 +247,15 @@ function parseTick(buffer) {
   if (len === 51) {
     const ltp = Number(buf.readBigInt64LE(43)) / 100;
     if (!Number.isFinite(ltp) || ltp <= 0 || ltp > 10000000) return null;
-    return { token, ltp: +ltp.toFixed(2), volume: null };
+    return { token, ltp: +ltp.toFixed(2), volume: null, avgPrice: null };
   }
 
-  /* ---- Quote mode (123 bytes) — v1.7 NEW layout ---- */
+  /* ---- Quote mode (123 bytes) — v1.7 layout + v1.8 VWAP ---- */
   if (len === 123) {
     const ltp = Number(buf.readBigInt64LE(43)) / 100;
     if (!Number.isFinite(ltp) || ltp <= 0 || ltp > 10000000) return null;
 
+    const avg    = Number(buf.readBigInt64LE(59)) / 100;   // v1.8: exchange VWAP
     const volume = Number(buf.readBigInt64LE(67));
     const low    = Number(buf.readBigInt64LE(91))  / 100;
     const high   = Number(buf.readBigInt64LE(99))  / 100;
@@ -266,6 +265,7 @@ function parseTick(buffer) {
     return {
       token,
       ltp: +ltp.toFixed(2),
+      avgPrice: Number.isFinite(avg) && avg > 0 ? +avg.toFixed(2) : null,
       volume: Number.isFinite(volume) && volume >= 0 ? volume : null,
       open:  open  > 0 ? +open.toFixed(2)  : null,
       high:  high  > 0 ? +high.toFixed(2)  : null,
@@ -278,6 +278,7 @@ function parseTick(buffer) {
   const ltp = Number(buf.readBigInt64LE(107)) / 100;
   if (!Number.isFinite(ltp) || ltp <= 0 || ltp > 10000000) return null;
 
+  const avg    = Number(buf.readBigInt64LE(59)) / 100;   // v1.8
   const volume = Number(buf.readBigInt64LE(67));
   const open   = Number(buf.readBigInt64LE(75)) / 100;
   const high   = Number(buf.readBigInt64LE(83)) / 100;
@@ -287,6 +288,7 @@ function parseTick(buffer) {
   return {
     token,
     ltp: +ltp.toFixed(2),
+    avgPrice: Number.isFinite(avg) && avg > 0 ? +avg.toFixed(2) : null,
     volume: Number.isFinite(volume) && volume >= 0 ? volume : null,
     open:  open  > 0 ? +open.toFixed(2)  : null,
     high:  high  > 0 ? +high.toFixed(2)  : null,

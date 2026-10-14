@@ -52,7 +52,7 @@ import {
 } from './brokers/angelone/Angel_BS.js';
 
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
-import { startDepthWS } from './brokers/angelone/Angel_Depth.js';   // v5.11: mode-3 depth (DIAG gate ke saath)
+import { startDepthWS, resubscribeDepth, getDepthStatus } from './brokers/angelone/Angel_Depth.js';   // v5.12: mode-3 depth LIVE engine
 
 import {
   initAutoTrader, onEntryScan, onTickPos, loadOpenPositions, getPositions
@@ -923,7 +923,11 @@ async function maybeRefreshMargins(broker = 'angelone', { force = false } = {}) 
    SECTION 5 — WEBSOCKET + SSE + BATCHED LTP
    ============================================================ */
 let wsStarted = false;
-let depthDiagStarted = false;   // v5.11
+let depthStarted = false;       // v5.12
+const depthCache = new Map();   // token -> latest depth packet
+const depthSec = new Map();     // token -> per-second ratio samples (last 60)
+let depthPend = new Map();
+let depthTimer = null;
 
 const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000);
 const ltpWriteQueue = new Map();
@@ -1098,28 +1102,9 @@ function startWebSocketForReadyPhase() {
     wsStarted = true;
     console.log(`🔌 WS started for ${tokens.length} tokens`);
 
-    // v5.11: DEPTH DIAGNOSTIC — sirf env DEPTH_DIAG=true pe; alag connection, main feed untouched
-    if (String(process.env.DEPTH_DIAG).toLowerCase() === 'true' && !depthDiagStarted) {
-      depthDiagStarted = true;
-      const diagTokens = process.env.DEPTH_DIAG_TOKENS
-        ? process.env.DEPTH_DIAG_TOKENS.split(',').map(t => t.trim()).filter(Boolean)
-        : STOCKS.slice(0, 5).map(s => String(s.token));
-      let dumps = 0;
-      startDepthWS({
-        feedToken,
-        apiKey: process.env.ANGEL_API_KEY,
-        clientCode: process.env.ANGEL_CLIENT_ID,
-        tokens: diagTokens,
-        onPacket: (p) => {
-          if (dumps < 6) {
-            dumps++;
-            console.log(`🧪 DEPTH[${p.len}] token=${p.token}`);
-            console.log(`🧪 FIELDS: ` + p.fields.map(f => `${f.off}:${f.raw}(₹${f.price})`).join(' '));
-            if (dumps === 1) console.log(`🧪 HEX: ${p.hex}`);
-          }
-        }
-      });
-      console.log(`🧪 DEPTH DIAG started for tokens: ${diagTokens.join(',')}`);
+    // v5.12: DEPTH LIVE engine — top-300 change% + chips + positions (alag connection)
+    if (String(process.env.DEPTH_LIVE || 'true') === 'true' && !depthStarted) {
+      startDepthLive(feedToken);
     }
   } catch (e) { console.error('WS start failed:', e.message); }
 }
@@ -1139,6 +1124,80 @@ setInterval(() => {
   else stopWebSocketIfNeeded();
 }, 5 * 1000);
 
+
+/* ============================================================
+   SECTION 5.9 — DEPTH ENGINE (v5.12): tick-by-tick buyers vs sellers
+   - top-300 live change% + chips + open positions = depth list (10-min refresh)
+   - depthCache = latest book; depthSec = per-second ratio samples (continuity)
+   - SSE 'depth' event (500ms batch) + minute snapshot me depth-preferred
+   ============================================================ */
+function onDepthPacket(d) {
+  if (d.buyQty == null || d.sellQty == null) return;
+  depthCache.set(d.token, d);
+
+  if (d.shouldValidate) {
+    const bs = bsCache.get(d.token);
+    console.log(`🧿 VALIDATE ${d.token}: depth buy/sell=${d.buyQty}/${d.sellQty} alt=${d.altBuy}/${d.altSell} | REST=${bs?.buyQty ?? '-'}/${bs?.sellQty ?? '-'}`);
+  }
+
+  const tot = (d.buyQty || 0) + (d.sellQty || 0);
+  const r = tot > 0 ? d.buyQty / tot : 0.5;
+  const secKey = Math.floor(Date.now() / 1000);
+  let arr = depthSec.get(d.token);
+  if (!arr) { arr = []; depthSec.set(d.token, arr); }
+  if (!arr.length || arr[arr.length - 1].sec !== secKey) {
+    arr.push({ sec: secKey, r });
+    if (arr.length > 60) arr.shift();
+  } else {
+    arr[arr.length - 1].r = r;
+  }
+
+  broadcastDepth(d.token, d, r);
+}
+
+function broadcastDepth(token, d, r) {
+  if (!sseClients.size) return;
+  depthPend.set(token, { b: d.buyQty, s: d.sellQty, r: +r.toFixed(3), ltp: d.ltp });
+  if (depthTimer) return;
+  depthTimer = setTimeout(() => {
+    depthTimer = null;
+    if (!depthPend.size) return;
+    sseSend(`data: ${JSON.stringify({ type: 'depth', depth: Object.fromEntries(depthPend) })}\n\n`);
+    depthPend.clear();
+  }, 500);
+}
+
+function computeDepthList() {
+  const scored = STOCKS.map(s => {
+    const t = String(s.token);
+    const ltp = getCachedLTP(t) ?? bsCache.get(t)?.ltp ?? null;
+    const pc = prevCloseCache.get(t) || null;
+    const chg = (ltp && pc && pc > 0) ? ((ltp - pc) / pc) * 100 : -Infinity;
+    return { t, chg };
+  }).sort((a, b) => b.chg - a.chg);
+  const set = new Set(scored.slice(0, 300).map(x => x.t));
+  for (const t of chipList.keys()) set.add(String(t));          // chips hamesha
+  for (const p of getPositions()) {                              // open positions hamesha
+    if (p.status === 'open') set.add(String(p.token));
+  }
+  return [...set].slice(0, 330);
+}
+
+function startDepthLive(feedToken) {
+  depthStarted = true;
+  const list = computeDepthList();
+  startDepthWS({
+    feedToken,
+    apiKey: process.env.ANGEL_API_KEY,
+    clientCode: process.env.ANGEL_CLIENT_ID,
+    tokens: list,
+    onDepth: onDepthPacket
+  });
+  setInterval(() => {
+    if (!shouldStartWS() || !depthStarted) return;
+    resubscribeDepth(computeDepthList());   // 10-min me list refresh (top-300 change%)
+  }, 10 * 60 * 1000);
+}
 
 /* ============================================================
    SECTION 6 — MIDDLEWARE + HELPERS
@@ -2312,6 +2371,15 @@ function computeBuyersGroups() {
     const cont = strongMin >= Math.max(1, Math.ceil(n * 0.6));
     buyersInfo.set(token, { ratio: +latest.toFixed(3), cont, n });
   }
+  // v5.12: depth overlay — tick-level continuity (60-sec window)
+  for (const [token, arr] of depthSec) {
+    if (!arr.length) continue;
+    const latest = arr[arr.length - 1].r;
+    if (latest < 0.55) continue;
+    const strong = arr.filter(x => x.r >= 0.55).length;
+    const cont = strong >= Math.max(1, Math.ceil(arr.length * 0.6));
+    buyersInfo.set(token, { ratio: +latest.toFixed(3), cont, n: arr.length, src: 'depth' });
+  }
   return buyersInfo;
 }
 
@@ -2326,11 +2394,16 @@ function broadcastBuyers() {
 async function appendBSMinuteSnapshot(prevKey, prevTs, date) {
   const tokens = [], buys = [], sells = [], tss = [];
   for (const st of STOCKS) {
-    const bs = bsCache.get(String(st.token));
-    if (!bs || bs.buyQty == null || bs.sellQty == null) continue;
-    tokens.push(String(st.token));
-    buys.push(bs.buyQty);
-    sells.push(bs.sellQty);
+    const tk = String(st.token);
+    const dc = depthCache.get(tk);
+    const fresh = dc && (Date.now() - dc.ts) < 5000;   // v5.12: depth fresh ho to wahi (tick-exact)
+    const bs = bsCache.get(tk);
+    const bq = fresh ? dc.buyQty : bs?.buyQty;
+    const sq = fresh ? dc.sellQty : bs?.sellQty;
+    if (bq == null || sq == null) continue;
+    tokens.push(tk);
+    buys.push(bq);
+    sells.push(sq);
     tss.push(prevTs);
   }
   if (!tokens.length) return;

@@ -19,7 +19,7 @@
            - Momentum table se Pivot + Target/SL columns REMOVED
            - "Buy / Sell" header → "B/S Volume"
            - Controls compact (Capital input same row)
-           (Advance ORB branch untouched — Pivot/Target/SL wahi chahiye)
+           (Advance ORB branch untouched — Pivot/Target/SL wahi chahiye).
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];

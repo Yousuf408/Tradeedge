@@ -34,6 +34,7 @@ let depthTokens = [];
 let onDepth = null;
 let heartbeatTimer = null;
 let reconnectTimer = null;
+let reconnectDelay = RECONNECT_DELAY_MS;   // v1.1: exponential backoff (429 se bachne ke liye)
 let _validateLogged = new Set();
 
 export function startDepthWS({ feedToken: ft, apiKey: key, clientCode: code, tokens, onDepth: cb }) {
@@ -85,6 +86,7 @@ function connect() {
   });
 
   ws.on('open', () => {
+    reconnectDelay = RECONNECT_DELAY_MS;   // reset backoff on success
     console.log(`🧿 Depth WS connected (${depthTokens.length} tokens, mode=3)`);
     sendSubscribe();
     heartbeatTimer = setInterval(() => {
@@ -135,7 +137,8 @@ function handleDrop() {
   clearInterval(heartbeatTimer);
   clearTimeout(reconnectTimer);
   if (!shouldRun) return;
-  reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+  reconnectTimer = setTimeout(connect, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 60000);   // 5s → 10s → 20s → 40s → 60s cap
 }
 
 function parseDepth(buf) {

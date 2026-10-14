@@ -46,7 +46,7 @@ let SCREENER_ACTIVE_STRATEGY = 'momentum';
 const NIFTY50_TOKEN = '99926000';
 const CURRENT_STRATEGY = 'momentum';
 
-let PER_TRADE = 25000;
+let PER_TRADE = Number(localStorage.getItem('ta_capital') || 25000);   // v4.6: per-user capital (localStorage)
 const BATCH_SIZE = 20;
 const BATCH_DELAY = 150;
 
@@ -60,6 +60,7 @@ async function initScreener() {
     return;
   }
   setupControls();
+  postCapital();          // v5.7: page load pe capital sync (server restart ke baad bhi)
   await loadStockList();
   await loadLTP();
   await loadChips();
@@ -129,7 +130,24 @@ function renderStrategyControls() {
 
 function onPerTradeChange() {
   PER_TRADE = +document.getElementById('perTradeInput').value || 25000;
+  localStorage.setItem('ta_capital', String(PER_TRADE));
+  postCapital();          // v5.7: server ko real-time batao (per-user qty ke liye)
   renderScreenerTable();
+}
+
+/* v5.7: capital server ko bhejo (debounced) — server memory me per-user rakhta hai */
+let CAPITAL_POST_TIMER = null;
+function postCapital() {
+  clearTimeout(CAPITAL_POST_TIMER);
+  CAPITAL_POST_TIMER = setTimeout(async () => {
+    try {
+      await fetch(API + '/api/auto/capital', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
+        body: JSON.stringify({ value: PER_TRADE })
+      });
+    } catch (e) { console.error('Capital sync failed:', e); }
+  }, 600);
 }
 
 

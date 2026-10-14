@@ -957,15 +957,24 @@ function sseSend(payload) {
   }
 }
 
+const ssePendingVwap = new Map();   // v5.9: tick-by-tick VWAP (exchange avg) SSE ke saath
+
 function broadcastLTP(token, ltp) {
   if (!sseClients.size) return;
   ssePending.set(String(token), ltp);
+  const vw = lastWsAvg.get(String(token));
+  if (vw != null) ssePendingVwap.set(String(token), vw);
   if (sseFlushTimer) return;
   sseFlushTimer = setTimeout(() => {
     sseFlushTimer = null;
     if (!ssePending.size) return;
-    const payload = `data: ${JSON.stringify({ type: 'ltp', ticks: Object.fromEntries(ssePending) })}\n\n`;
+    const payload = `data: ${JSON.stringify({
+      type: 'ltp',
+      ticks: Object.fromEntries(ssePending),
+      vwaps: Object.fromEntries(ssePendingVwap)
+    })}\n\n`;
     ssePending.clear();
+    ssePendingVwap.clear();
     sseSend(payload);
   }, 100);
 }
@@ -986,7 +995,6 @@ function broadcastBS(fetchedAt) {
         rsi: v.rsi ?? null,
         leverage: lev ?? null,
         marginPerShare: lev && v.ltp ? +(v.ltp / lev).toFixed(4) : null,
-        vwap: lastWsAvg.get(t) ?? computeVWAP(t),   // v5.8
         rsiFirst: v.rsiFirst ?? null
       }];
     }))

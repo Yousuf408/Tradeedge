@@ -943,6 +943,10 @@ const depthCache = new Map();   // token -> latest depth packet
 const depthSec = new Map();     // token -> per-second ratio samples (last 60)
 let depthPend = new Map();
 let depthTimer = null;
+let lastDepthPacket = 0;        // v5.14: watchdog ke liye
+let depthPktCount = 0;          // v5.14: per-minute rate log
+let depthRestarts = 0;          // v5.14: adaptive quota cap ke liye
+let depthWatchdog = null;
 
 const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000);
 const ltpWriteQueue = new Map();
@@ -1150,6 +1154,8 @@ setInterval(() => {
    ============================================================ */
 function onDepthPacket(d) {
   if (d.buyQty == null || d.sellQty == null) return;
+  lastDepthPacket = Date.now();
+  depthPktCount++;
   depthCache.set(d.token, d);
 
   if (d.shouldValidate) {
@@ -1197,7 +1203,8 @@ function computeDepthList() {
   for (const p of getPositions()) {                              // open positions hamesha
     if (p.status === 'open') set.add(String(p.token));
   }
-  return [...set].slice(0, 330);
+  const cap = depthRestarts >= 3 ? 150 : (depthRestarts >= 1 ? 250 : 330);   // v5.14: 429 se bache to quota khud ghire
+  return [...set].slice(0, cap);
 }
 
 function startDepthLive(feedToken) {
@@ -1213,6 +1220,31 @@ function startDepthLive(feedToken) {
     if (!shouldStartWS() || !depthStarted) return;
     resubscribeDepth(computeDepthList());   // 10-min me list refresh (top-300 change%)
   }, 10 * 60 * 1000);
+
+  // v5.14: WATCHDOG — depth mari ho ya packets ruk gaye ho to 60-90s me zinda karo
+  if (!depthWatchdog) {
+    depthWatchdog = setInterval(() => {
+      if (!shouldStartWS()) return;
+      const st = getDepthStatus();
+      const silentMs = Date.now() - lastDepthPacket;
+      if (depthPktCount > 0 || lastDepthPacket) {
+        console.log(`🧿 depth rate: ${depthPktCount} pkt/min | connected=${st.connected} | tokens=${st.tokenCount}`);
+      }
+      depthPktCount = 0;
+      if (!st.connected || silentMs > 90000) {
+        depthRestarts++;
+        console.warn(`🧿 Depth WATCHDOG: restart #${depthRestarts} (connected=${st.connected}, silent=${Math.round(silentMs / 1000)}s)`);
+        try { stopDepthWS(); } catch {}
+        startDepthLive(getLastFeedToken());
+      }
+    }, 60000);
+  }
+}
+
+/* feedToken dobara chahiye watchdog restart ke liye */
+function getLastFeedToken() {
+  const restSession = getSessionStatusREST();
+  return restSession.loggedIn ? getFeedTokenREST() : getFeedTokenQuote();
 }
 
 /* ============================================================
@@ -1557,7 +1589,7 @@ app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
    SECTION 7.2 — HISTORICAL BACKFILL (v5.4)
    Fetch 1-min + 5-min from Angel REST, overwrite WS columns
    ============================================================ */
-const HISTORICAL_DAYS_DEFAULT = 2;   // v4.9.1: yesterday + today only
+const HISTORICAL_DAYS_DEFAULT = 10;  // v5.15: last 10 working days
 const ANGEL_HISTORICAL_URL = 'https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData';
 let historicalRunning = false;
 const historicalFailed = new Set();   // v4.9.1: pichle run ke failed tokens → agla click sirf inhe retry karega
@@ -1575,7 +1607,7 @@ async function fetchAngelInterval(token, interval, daysBack) {
 
   const nowIST = getIST();
   const toDate = nowIST.toISOString().split('T')[0];
-  const fromMs = nowIST.getTime() - (daysBack + 4) * 24 * 3600 * 1000;
+  const fromMs = nowIST.getTime() - (daysBack + 6) * 24 * 3600 * 1000;   // v5.15: 10 working days ≈ 14 calendar
   const fromDate = new Date(fromMs).toISOString().split('T')[0];
 
   const r = await fetch(ANGEL_HISTORICAL_URL, {
@@ -1606,7 +1638,7 @@ async function fetchAngelInterval(token, interval, daysBack) {
   return j.data;   // [ [ts, o, h, l, c, v], ... ]
 }
 
-function groupCandlesByDate(raw) {
+function groupCandlesByDate(raw, shiftMin = 0) {
   const byDate = {};
   for (const b of raw) {
     let ms;
@@ -1614,7 +1646,7 @@ function groupCandlesByDate(raw) {
     else ms = new Date(b[0]).getTime();
     if (!Number.isFinite(ms)) continue;
 
-    const istD = new Date(ms + 5.5 * 3600 * 1000);
+    const istD = new Date(ms + 5.5 * 3600 * 1000 + shiftMin * 60000);   // v5.15: 5-min label +4 shift
     const date = istD.toISOString().slice(0, 10);
     const hh = istD.getUTCHours();
     const mm = istD.getUTCMinutes();
@@ -1633,7 +1665,7 @@ function groupCandlesByDate(raw) {
   return byDate;
 }
 
-function fillMissingMinutes(by1m) {
+function fillMissingMinutes(by1m, step = 1, first = 555, last = 929) {
   // Angel sirf traded minutes deta hai → khali minutes bhar do
   // (carry-forward close, volume 0) taaki har din 375 continuous candles ho
   // — live WS sampler ki convention se exact match
@@ -1644,7 +1676,7 @@ function fillMissingMinutes(by1m) {
     for (let i = 0; i < src.minutes.length; i++) have.set(src.minutes[i], i);
     const closes = [], ts = [], vols = [], minutes = [];
     let prevClose = src.closes[0];   // leading minutes = pehli candle ka close
-    for (let m = 555; m <= 929; m++) {   // 9:15 → 15:29 IST
+    for (let m = first; m <= last; m += step) {
       const idx = have.get(m);
       let c, v;
       if (idx !== undefined) { c = src.closes[idx]; v = src.vols[idx]; }
@@ -1687,10 +1719,12 @@ async function backfillOneStock(stock, daysBack) {
 
   // 1-min from Angel
   const raw1m = await fetchAngelInterval(token, 'ONE_MINUTE', daysBack);
-  const by1m = fillMissingMinutes(groupCandlesByDate(raw1m));   // v4.9.1: 375 continuous candles
+  const by1m = fillMissingMinutes(groupCandlesByDate(raw1m), 1, 555, 929);   // 375 continuous
 
-  // Derive 5-min
-  const by5m = derive5minFrom1min(by1m);
+  // v5.15: 5-min ALAG API call se (derive nahi) — 400ms gap = rate-limit safe
+  await new Promise(r => setTimeout(r, 400));
+  const raw5m = await fetchAngelInterval(token, 'FIVE_MINUTE', daysBack);
+  const by5m = fillMissingMinutes(groupCandlesByDate(raw5m, 4), 5, 559, 929);   // 75 continuous, ts live-convention match
 
   // Keep last N days
   const dates = Object.keys(by1m).sort().slice(-daysBack);
@@ -1761,7 +1795,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
     return res.status(500).json({ error: 'lock failed: ' + e.message });
   }
 
-  const days = Math.min(Math.max(+req.body?.days || HISTORICAL_DAYS_DEFAULT, 1), 5);
+  const days = Math.min(Math.max(+req.body?.days || HISTORICAL_DAYS_DEFAULT, 1), 15);
   const t0 = Date.now();
   const summary = { ok: 0, failed: 0, skipped: 0, days_saved: 0, total: STOCKS.length };
   const errors = [];

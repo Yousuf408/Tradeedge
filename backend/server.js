@@ -11,7 +11,7 @@
          Momentum 15m-independent; pivot load removed
    v5.4: NEW admin route — Angel REST 1-min + 5-min candle backfill
          Overwrites ws_1min_close, ws_5min_close (and ts/volume)
-         + RSI recompute. Guarded against concurrent runs..
+         + RSI recompute. Guarded against concurrent runs.
    ============================================================ */
 
 import express from 'express';
@@ -902,15 +902,15 @@ function broadcastBS(fetchedAt) {
   sseSend(`data: ${JSON.stringify({
     type: 'bs', fetchedAt,
     bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => {
-      const m = getMarginInfo('angelone', t);
+      const lev = getLeverage('angelone', t);
       return [t, {
         buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
         volume: v.volume, rank: v.rank,
         preopenPrice: v.preopenPrice ?? null,
         dayOpen: v.dayOpen ?? null,
         rsi: v.rsi ?? null,
-        leverage: m?.leverage ?? null,
-        marginPerShare: m?.marginPerShare ?? null
+        leverage: lev ?? null,
+        marginPerShare: lev && v.ltp ? +(v.ltp / lev).toFixed(4) : null
       }];
     }))
   })}\n\n`);
@@ -1159,7 +1159,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const ltp = getCachedLTP(token) ?? bsCache.get(token)?.ltp ?? null;   // v4.9.4: market band/restart ke baad BS table ka LTP
     const prevClose = prevCloseCache.get(token) || null;
     const bs = bsCache.get(token) || null;
-    const m = getMarginInfo('angelone', token);
+    const lev = getLeverage('angelone', token);
     return {
       token, ltp, prevClose,
       buyQty: bs?.buyQty ?? null,
@@ -1169,8 +1169,8 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       preopenPrice: bs?.preopenPrice ?? null,
       dayOpen: bs?.dayOpen ?? null,
       rsi: bs?.rsi ?? null,
-      leverage: m?.leverage ?? null,
-      marginPerShare: m?.marginPerShare ?? null,
+      leverage: lev ?? null,
+      marginPerShare: lev && ltp ? +(ltp / lev).toFixed(4) : null,
       serverTime
     };
   });

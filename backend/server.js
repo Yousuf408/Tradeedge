@@ -377,7 +377,7 @@ async function loadBSCacheFromDB() {
     if (!p.date) return;
     const activeTokens = STOCKS.map(s => String(s.token));
     const { rows } = await db.query(
-      `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no, preopen_price, preopen_at, day_open, rsi
+      `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no, preopen_price, preopen_at, day_open, rsi, rsi_first
        FROM strategy_bs_snapshot
        WHERE date=$1 AND strategy_id=$2 AND token = ANY($3)`,
       [p.date, 'momentum', activeTokens]
@@ -392,7 +392,8 @@ async function loadBSCacheFromDB() {
         preopenPrice: r.preopen_price != null ? +r.preopen_price : null,
         preopenAt: r.preopen_at,
         dayOpen: r.day_open != null ? +r.day_open : null,
-        rsi: r.rsi != null ? +r.rsi : null
+        rsi: r.rsi != null ? +r.rsi : null,
+        rsiFirst: r.rsi_first != null ? +r.rsi_first : null
       });
     }
     console.log(`💹 Loaded buy/sell for ${rows.length} tokens`);
@@ -503,15 +504,17 @@ async function loadTodayWSClosesFromDB() {
     const today = getIST().toISOString().split('T')[0];
     const activeTokens = STOCKS.map(s => String(s.token));
     const { rows } = await db.query(
-      `SELECT token, ws_1min_close FROM strategy_bs_snapshot
+      `SELECT token, ws_1min_close, ws_1min_volume FROM strategy_bs_snapshot
        WHERE date=$1 AND strategy_id='momentum' AND ws_1min_close IS NOT NULL
          AND token = ANY($2)`,
       [today, activeTokens]
     );
     wsTodayCloses.clear();
+    wsTodayVols.clear();
     for (const r of rows) {
       if (Array.isArray(r.ws_1min_close) && r.ws_1min_close.length > 0) {
         wsTodayCloses.set(String(r.token), r.ws_1min_close.map(c => +c));
+        wsTodayVols.set(String(r.token), Array.isArray(r.ws_1min_volume) ? r.ws_1min_volume.map(v => +v || 0) : []);
       }
     }
     console.log(`📊 WS today closes: ${wsTodayCloses.size} tokens`);
@@ -532,7 +535,7 @@ function seedRSIStateFromMemory() {
   console.log(`🧮 RSI live state seeded: ${n} tokens`);
 }
 
-async function updateRSIFromWS(date) {
+async function updateRSIFromWS(date, prevKey) {
   const toks = [], rsis = [];
   for (const s of STOCKS) {
     const token = String(s.token);
@@ -556,6 +559,23 @@ async function updateRSIFromWS(date) {
        WHERE s.date=$3 AND s.token=v.token AND s.strategy_id='momentum'`,
       [toks, rsis, date]
     );
+    // v5.5: 9:15 candle ke band hote hi RSI FIRST fix karo (poore din ke liye)
+    if (prevKey === '09:15' && toks.length) {
+      try {
+        await db.query(
+          `UPDATE strategy_bs_snapshot AS s SET rsi_first = v.rsi
+           FROM unnest($1::text[], $2::numeric[]) AS v(token, rsi)
+           WHERE s.date=$3 AND s.token=v.token AND s.strategy_id='momentum' AND s.rsi_first IS NULL`,
+          [toks, rsis, date]
+        );
+        for (let i = 0; i < toks.length; i++) {
+          const c = bsCache.get(toks[i]) || {};
+          c.rsiFirst = rsis[i];
+          bsCache.set(toks[i], c);
+        }
+        console.log(`🥇 RSI-first (9:15 candle) locked: ${toks.length} tokens`);
+      } catch (e) { console.error('rsi_first write failed:', e.message); }
+    }
   } catch (e) { console.error('WS RSI update failed:', e.message); }
 }
 
@@ -910,7 +930,9 @@ function broadcastBS(fetchedAt) {
         dayOpen: v.dayOpen ?? null,
         rsi: v.rsi ?? null,
         leverage: lev ?? null,
-        marginPerShare: lev && v.ltp ? +(v.ltp / lev).toFixed(4) : null
+        marginPerShare: lev && v.ltp ? +(v.ltp / lev).toFixed(4) : null,
+        vwap: computeVWAP(t),
+        rsiFirst: v.rsiFirst ?? null
       }];
     }))
   })}\n\n`);
@@ -1171,6 +1193,8 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       rsi: bs?.rsi ?? null,
       leverage: lev ?? null,
       marginPerShare: lev && ltp ? +(ltp / lev).toFixed(4) : null,
+      vwap: computeVWAP(token),
+      rsiFirst: bs?.rsiFirst ?? null,
       serverTime
     };
   });
@@ -1914,7 +1938,7 @@ async function buildChipList(date) {
     if (!pool.length) return;
 
     const readyCount = pool.filter(x =>
-      (bsCache.get(x.token)?.rsi ?? null) != null && getCachedLTP(x.token)
+      (CHIP_TEST_MODE || (bsCache.get(x.token)?.rsi ?? null) != null) && getCachedLTP(x.token)
     ).length;
     const ist = getIST();
     const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();

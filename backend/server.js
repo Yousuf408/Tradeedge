@@ -52,6 +52,7 @@ import {
 } from './brokers/angelone/Angel_BS.js';
 
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
+import { startDepthWS } from './brokers/angelone/Angel_Depth.js';   // v5.11: mode-3 depth (DIAG gate ke saath)
 
 import {
   initAutoTrader, onEntryScan, onTickPos, loadOpenPositions, getPositions
@@ -909,6 +910,7 @@ async function maybeRefreshMargins(broker = 'angelone', { force = false } = {}) 
    SECTION 5 — WEBSOCKET + SSE + BATCHED LTP
    ============================================================ */
 let wsStarted = false;
+let depthDiagStarted = false;   // v5.11
 
 const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000);
 const ltpWriteQueue = new Map();
@@ -1082,6 +1084,30 @@ function startWebSocketForReadyPhase() {
     });
     wsStarted = true;
     console.log(`🔌 WS started for ${tokens.length} tokens`);
+
+    // v5.11: DEPTH DIAGNOSTIC — sirf env DEPTH_DIAG=true pe; alag connection, main feed untouched
+    if (String(process.env.DEPTH_DIAG).toLowerCase() === 'true' && !depthDiagStarted) {
+      depthDiagStarted = true;
+      const diagTokens = process.env.DEPTH_DIAG_TOKENS
+        ? process.env.DEPTH_DIAG_TOKENS.split(',').map(t => t.trim()).filter(Boolean)
+        : STOCKS.slice(0, 5).map(s => String(s.token));
+      let dumps = 0;
+      startDepthWS({
+        feedToken,
+        apiKey: process.env.ANGEL_API_KEY,
+        clientCode: process.env.ANGEL_CLIENT_ID,
+        tokens: diagTokens,
+        onPacket: (p) => {
+          if (dumps < 6) {
+            dumps++;
+            console.log(`🧪 DEPTH[${p.len}] token=${p.token}`);
+            console.log(`🧪 FIELDS: ` + p.fields.map(f => `${f.off}:${f.raw}(₹${f.price})`).join(' '));
+            if (dumps === 1) console.log(`🧪 HEX: ${p.hex}`);
+          }
+        }
+      });
+      console.log(`🧪 DEPTH DIAG started for tokens: ${diagTokens.join(',')}`);
+    }
   } catch (e) { console.error('WS start failed:', e.message); }
 }
 
@@ -1204,6 +1230,11 @@ app.post('/api/auto/capital', auth, (req, res) => {
 app.get('/api/auto/capital', auth, (req, res) => {
   const uid = req.user?.id || req.user?.username || 'admin';
   res.json({ ok: true, capital: userCapital.get(uid) ?? Number(process.env.AUTO_PER_TRADE || 25000) });
+});
+
+/* v5.10: STRONG BUYERS endpoint — page load pe current group */
+app.get('/api/screener/buyers', auth, (req, res) => {
+  res.json({ ok: true, buyers: Object.fromEntries(buyersInfo) });
 });
 
 /* v4.9.4: ORDERS page endpoint — positions + live LTP + Net P&L (per-user) */
@@ -2224,6 +2255,61 @@ function msToNextMinute01() {
   return (60 - s) * 1000 - ms + 1000;   // agle minute ka ~:01
 }
 
+const bsMinBuy = new Map();    // v5.10: token -> per-minute buy qty (memory mirror)
+const bsMinSell = new Map();   // v5.10: token -> per-minute sell qty
+const buyersInfo = new Map();  // v5.10: token -> { ratio, cont, n } (latest minute ka buyers view)
+
+/* v5.10: startup pe aaj ke bs_1min arrays memory me (restart-safe) */
+async function loadBSMinuteArrays(date) {
+  try {
+    const activeTokens = STOCKS.map(s => String(s.token));
+    const { rows } = await db.query(
+      `SELECT token, bs_1min_buy, bs_1min_sell FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND bs_1min_buy IS NOT NULL AND token = ANY($2)`,
+      [date, activeTokens]
+    );
+    bsMinBuy.clear(); bsMinSell.clear();
+    for (const r of rows) {
+      bsMinBuy.set(String(r.token), (r.bs_1min_buy || []).map(x => +x));
+      bsMinSell.set(String(r.token), (r.bs_1min_sell || []).map(x => +x));
+    }
+    if (rows.length) console.log(`⚖️ BS minute arrays loaded: ${rows.length} tokens`);
+  } catch (e) { console.error('BS minute arrays load failed:', e.message); }
+}
+
+/* v5.10: buyers continuity compute — har minute snapshot ke baad
+   ratio = buy/(buy+sell) per minute | strong = latest ratio >= 55%
+   cont   = >=60% minutes me ratio >= 55% (continuous) | warna SPIKE */
+function computeBuyersGroups() {
+  buyersInfo.clear();
+  for (const [token, buys] of bsMinBuy) {
+    const sells = bsMinSell.get(token) || [];
+    const n = Math.min(buys.length, sells.length);
+    if (n < 1) continue;
+    let strongMin = 0;
+    let latest = 0;
+    for (let i = 0; i < n; i++) {
+      const tot = buys[i] + sells[i];
+      if (tot <= 0) continue;
+      const r = buys[i] / tot;
+      if (i === n - 1) latest = r;
+      if (r >= 0.55) strongMin++;
+    }
+    if (latest < 0.55) continue;
+    const cont = strongMin >= Math.max(1, Math.ceil(n * 0.6));
+    buyersInfo.set(token, { ratio: +latest.toFixed(3), cont, n });
+  }
+  return buyersInfo;
+}
+
+function broadcastBuyers() {
+  if (!sseClients.size) return;
+  sseSend(`data: ${JSON.stringify({
+    type: 'buyers',
+    buyers: Object.fromEntries([...buyersInfo.entries()].map(([t, v]) => [t, v]))
+  })}\n\n`);
+}
+
 async function appendBSMinuteSnapshot(prevKey, prevTs, date) {
   const tokens = [], buys = [], sells = [], tss = [];
   for (const st of STOCKS) {
@@ -2235,6 +2321,10 @@ async function appendBSMinuteSnapshot(prevKey, prevTs, date) {
     tss.push(prevTs);
   }
   if (!tokens.length) return;
+  for (let i = 0; i < tokens.length; i++) {
+    const ab = bsMinBuy.get(tokens[i]) || []; ab.push(buys[i]); bsMinBuy.set(tokens[i], ab);
+    const as_ = bsMinSell.get(tokens[i]) || []; as_.push(sells[i]); bsMinSell.set(tokens[i], as_);
+  }
   await db.query(
     `UPDATE strategy_bs_snapshot AS s
      SET bs_1min_buy  = COALESCE(s.bs_1min_buy,  ARRAY[]::numeric[]) || v.b,
@@ -2244,7 +2334,9 @@ async function appendBSMinuteSnapshot(prevKey, prevTs, date) {
      WHERE s.date = $5 AND s.token = v.token AND s.strategy_id = 'momentum'`,
     [tokens, buys, sells, tss, date]
   );
-  console.log(`⚖️ BS minute snapshot: ${tokens.length} tokens @ ${prevKey}`);
+  computeBuyersGroups();
+  broadcastBuyers();
+  console.log(`⚖️ BS minute snapshot: ${tokens.length} tokens @ ${prevKey} | strong buyers: ${buyersInfo.size}`);
 }
 
 function startBSInterval() {
@@ -2381,6 +2473,8 @@ app.listen(PORT, async () => {
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();
   await loadChipListFromDB(getIST().toISOString().split('T')[0]);
+  await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);   // v5.10
+  computeBuyersGroups();
 
   // v4.9.3: AutoTrader init (PAPER mode jab tak env AUTO_TRADE=true na karo)
   initAutoTrader({

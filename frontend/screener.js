@@ -27,6 +27,8 @@ let SCREENER_LEVERAGE = {};
 let SCREENER_MARGIN_PS = {};
 let SCREENER_CHIPS = [];
 let SCREENER_LASTUPD = {};        // v4.4: per-token last BS update time
+let SCREENER_VWAP = {};           // v4.6: live VWAP (ws_1min close+volume se)
+let SCREENER_RSI_FIRST = {};      // v4.6: 9:15 candle ka RSI — poore din FIXED
 let SCREENER_INIT_DONE = false;
 let SCREENER_SSE = null;
 let FETCHING = false;
@@ -604,6 +606,8 @@ async function loadLTP() {
         if (item.dayOpen != null) SCREENER_DAY_OPEN[item.token] = item.dayOpen;
         if (item.rsi != null) SCREENER_RSI[item.token] = item.rsi;
         if (item.serverTime) SCREENER_LASTUPD[item.token] = item.serverTime;
+        if (item.vwap != null) SCREENER_VWAP[item.token] = item.vwap;
+        if (item.rsiFirst != null) SCREENER_RSI_FIRST[item.token] = item.rsiFirst;
         if (item.leverage != null) SCREENER_LEVERAGE[item.token] = item.leverage;
         if (item.marginPerShare != null) SCREENER_MARGIN_PS[item.token] = item.marginPerShare;
 
@@ -654,6 +658,8 @@ function startSSE() {
           if (v.rsi != null) SCREENER_RSI[token] = v.rsi;
           if (v.leverage != null) SCREENER_LEVERAGE[token] = v.leverage;
           if (v.marginPerShare != null) SCREENER_MARGIN_PS[token] = v.marginPerShare;
+          if (v.vwap != null) SCREENER_VWAP[token] = v.vwap;
+          if (v.rsiFirst != null) SCREENER_RSI_FIRST[token] = v.rsiFirst;
         }
         renderScreenerTable();
       }
@@ -699,8 +705,10 @@ function renderScreenerTable() {
       <th>PRE-OPEN</th>
       <th>DAY OPEN</th>
       <th class="th-sortable" onclick="setSort('rsi')">RSI ${sortIndicator('rsi')}</th>
+      <th>RSI 9:15 🔒</th>
       <th>B/S Volume</th>
       <th>Volume</th>
+      <th>VWAP</th>
       <th>20 EMA</th>
       <th>MAXQTY</th>
       <th>LAST UPDATE</th>
@@ -744,11 +752,11 @@ function renderScreenerTable() {
     if (!sorted.length) {
       const isEmptyChipFilter = SCREENER_MOMENTUM_FILTER === 'rsi_chips';
       body.innerHTML = isEmptyChipFilter
-        ? `<tr><td colspan="12" style="text-align:center;padding:60px;color:var(--text-muted)">
+        ? `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
             🔒 No RSI chips locked today.<br>
             <span style="font-size:11px">Chips lock at 9:15 (top-10 rank · gap ≤3% · RSI ≥70)</span>
           </td></tr>`
-        : `<tr><td colspan="12" style="text-align:center;padding:60px;color:var(--text-muted)">
+        : `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
             Loading stocks...<br>Please wait a few seconds.
           </td></tr>`;
       if (count) count.textContent = `0 / ${SCREENER_ALL_STOCKS.length}`;
@@ -797,8 +805,10 @@ function renderScreenerTable() {
         <td style="white-space:nowrap">${preopenCell}</td>
         <td style="white-space:nowrap">${dayOpenCell}</td>
         <td style="white-space:nowrap">${renderRSICell(s.token)}</td>
+        <td style="white-space:nowrap;font-weight:700;color:#F5A623">${SCREENER_RSI_FIRST[s.token] != null ? (+SCREENER_RSI_FIRST[s.token]).toFixed(1) : '—'}</td>
         <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
         <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">${bs?.volume ? formatQty(bs.volume) : '—'}</td>
+        <td style="white-space:nowrap;font-weight:700;color:#6C5CE7">${SCREENER_VWAP[s.token] != null ? '₹' + (+SCREENER_VWAP[s.token]).toFixed(2) : '—'}</td>
         <td style="white-space:nowrap"><span style="color:var(--text-muted)">—</span></td>
         <td class="maxqty-cell" style="font-weight:700;color:#6C5CE7">${maxQty}</td>
         <td style="color:var(--text-muted);font-size:11px;font-family:ui-monospace,monospace">${lastUpdate}</td>

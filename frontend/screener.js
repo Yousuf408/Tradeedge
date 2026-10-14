@@ -339,7 +339,7 @@ function updateNiftyHeader() {
 /* ============================================================
    SECTION 3.3 — FAST CELL UPDATE (SSE LTP)
    ============================================================ */
-function updateLTPCells(ticks, vwaps) {
+function updateLTPCells(ticks, vwaps, rsis) {
   const rows = document.querySelectorAll('#screenerBody tr[data-token]');
   if (!rows.length) return;
   const rowMap = {};
@@ -376,6 +376,13 @@ function updateLTPCells(ticks, vwaps) {
       SCREENER_VWAP[token] = vwaps[token];
       const vwEl = row.querySelector('.vwap-cell');
       if (vwEl) vwEl.textContent = '₹' + (+vwaps[token]).toFixed(2);
+    }
+
+    // v4.8: tick-by-tick live RSI (SSE ltp event ke saath)
+    if (rsis && rsis[token] != null) {
+      SCREENER_RSI[token] = rsis[token];
+      const rsiEl = row.querySelector('.rsi-cell');
+      if (rsiEl) rsiEl.innerHTML = renderRSICell(token);
     }
   }
 }
@@ -673,7 +680,7 @@ function startSSE() {
           SCREENER_LTP[NIFTY50_TOKEN] = msg.ticks[NIFTY50_TOKEN];
           updateNiftyHeader();
         }
-        updateLTPCells(msg.ticks, msg.vwaps);
+        updateLTPCells(msg.ticks, msg.vwaps, msg.rsis);
       }
       else if (msg.type === 'bs' && msg.bs) {
         for (const [token, v] of Object.entries(msg.bs)) {
@@ -829,7 +836,7 @@ function renderScreenerTable() {
         </td>
         <td style="white-space:nowrap">${preopenCell}</td>
         <td style="white-space:nowrap">${dayOpenCell}</td>
-        <td style="white-space:nowrap">${renderRSICell(s.token)}</td>
+        <td class="rsi-cell" style="white-space:nowrap">${renderRSICell(s.token)}</td>
         <td style="white-space:nowrap;font-weight:700;color:#F5A623">${SCREENER_RSI_FIRST[s.token] != null ? (+SCREENER_RSI_FIRST[s.token]).toFixed(1) : '—'}</td>
         <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
         <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">${bs?.volume ? formatQty(bs.volume) : '—'}</td>

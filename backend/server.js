@@ -763,7 +763,10 @@ function parsePreopen(json) {
    ============================================================ */
 const lastLtpAt = new Map();
 const lastWsVolume = new Map();
-const lastWsAvg = new Map();      // v5.8: WS tick ka exchange avg traded price = TRUE VWAP
+const lastWsAvg = new Map();      // v5.8: live VWAP (ab per-trade computed, v5.9)
+const vwapPV = new Map();         // v5.9: Σ(price × Δvol)
+const vwapV = new Map();          // v5.9: Σ(Δvol)
+let vwapDate = null;              // v5.9: din badle pe sums reset
 const prevCumVol = new Map();
 const minVolRing = new Map();
 let wsMinuteKey = null;
@@ -1008,8 +1011,21 @@ function broadcastChip() {
 
 function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
-  if (extra && Number.isFinite(extra.volume) && extra.volume > 0) lastWsVolume.set(String(token), extra.volume);   // v5.7: volume=0 wale bad ticks ignore (spike fix)
-  if (extra && Number.isFinite(extra.avgPrice) && extra.avgPrice > 0) lastWsAvg.set(String(token), extra.avgPrice);  // v5.8: exchange VWAP
+  if (extra && Number.isFinite(extra.volume) && extra.volume > 0) {
+    // v5.9: PER-TRADE TRUE VWAP = Σ(price×Δvol)/Σ(Δvol) — exchange wala hi math, tick-by-tick
+    const tk = String(token);
+    const today = getIST().toISOString().split('T')[0];
+    if (vwapDate !== today) { vwapPV.clear(); vwapV.clear(); vwapDate = today; }
+    const prevVol = lastWsVolume.get(tk);
+    const dv = prevVol == null ? extra.volume : (extra.volume - prevVol);
+    lastWsVolume.set(tk, extra.volume);
+    if (dv > 0) {
+      vwapPV.set(tk, (vwapPV.get(tk) || 0) + ltp * dv);
+      vwapV.set(tk, (vwapV.get(tk) || 0) + dv);
+      const vv = vwapV.get(tk);
+      if (vv > 0) lastWsAvg.set(tk, +((vwapPV.get(tk)) / vv).toFixed(2));
+    }
+  }
 
   if (token === NIFTY50_TOKEN) {
     setCachedLTP(token, ltp);
@@ -1676,7 +1692,19 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
     try {
       await loadPrevWSClosesFromDB();
       await loadTodayWSClosesFromDB();
-      await backfillRsiFirst(getIST().toISOString().split('T')[0]);   // v5.5
+      // v5.9: VWAP sums seed — restart ke baad bhi day-start se accurate
+  {
+    const t0 = getIST().toISOString().split('T')[0];
+    vwapDate = t0;
+    for (const [tk, closes] of wsTodayCloses) {
+      const vols = wsTodayVols.get(tk) || [];
+      let pv = 0, vv = 0;
+      for (let i = 0; i < closes.length; i++) { const v = vols[i] || 0; pv += closes[i] * v; vv += v; }
+      if (vv > 0) { vwapPV.set(tk, pv); vwapV.set(tk, vv); lastWsAvg.set(tk, +(pv / vv).toFixed(2)); }
+    }
+    if (vwapPV.size) console.log(`🧮 VWAP seeded from stored minutes: ${vwapPV.size} tokens`);
+  }
+  await backfillRsiFirst(getIST().toISOString().split('T')[0]);   // v5.5
   seedRSIStateFromMemory();
       console.log('🔄 WS caches reloaded after backfill');
     } catch (e) { console.error('Post-backfill reload failed:', e.message); }

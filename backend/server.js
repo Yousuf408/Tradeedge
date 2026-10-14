@@ -11,7 +11,7 @@
          Momentum 15m-independent; pivot load removed
    v5.4: NEW admin route — Angel REST 1-min + 5-min candle backfill
          Overwrites ws_1min_close, ws_5min_close (and ts/volume)
-         + RSI recompute. Guarded against concurrent runs.
+         + RSI recompute. Guarded against concurrent runs
    ============================================================ */
 
 import express from 'express';

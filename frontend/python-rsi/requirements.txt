@@ -1,4 +1,3 @@
-git+https://github.com/rongardF/tvdatafeed.git
-pandas
+tradingview-screener
 flask
 gunicorn

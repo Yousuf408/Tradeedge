@@ -10,7 +10,7 @@
      isliye broker order har token pe EK BAAR jata hai (pehle position ki qty);
      baaki users ki positions paper-mirror hoti hain.
      Per-user broker connect = baad ka phase.
-   - PAPER mode (default): koi broker order nahi, sirf per-user book
+   - PAPER mode (default): koi broker order nahi, sirf per-user book.
    ============================================================ */
 
 let db = null;

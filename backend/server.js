@@ -11,7 +11,7 @@
          Momentum 15m-independent; pivot load removed
    v5.4: NEW admin route — Angel REST 1-min + 5-min candle backfill
          Overwrites ws_1min_close, ws_5min_close (and ts/volume)
-         + RSI recompute. Guarded against concurrent runs
+         + RSI recompute. Guarded against concurrent runs.
    ============================================================ */
 
 import express from 'express';
@@ -902,7 +902,10 @@ async function maybeRefreshMargins(broker = 'angelone', { force = false } = {}) 
     const { rows } = await db.query(`SELECT value FROM kv_store WHERE key = $1`, ['margin_refresh_' + broker]);
     if (rows.length) markerAge = Date.now() - new Date(rows[0].value).getTime();
   } catch {}
-  const cacheOk = !!getMarginInfo(broker, String(STOCKS[0]?.token));
+  let cacheOk = false;
+  for (let i = 0; i < 20 && !cacheOk; i++) {
+    if (STOCKS[i]) cacheOk = !!getMarginInfo(broker, String(STOCKS[i].token));
+  }
   if (!force) {
     if (cacheOk && markerAge === null) {
       // cache DB se loaded hai, marker nahi — baseline marker likho, refresh NAHI karo (403 bachat)
@@ -2435,6 +2438,7 @@ async function appendBSMinuteSnapshot(prevKey, prevTs, date) {
   );
   computeBuyersGroups();
   broadcastBuyers();
+  if (prevKey === '09:20') backfillRsiFirst(date).catch(() => {});   // v5.13: 9:16 miss ho gaya ho to safety-net
   console.log(`⚖️ BS minute snapshot: ${tokens.length} tokens @ ${prevKey} | strong buyers: ${buyersInfo.size}`);
 }
 
@@ -2553,7 +2557,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.4`);
+  console.log(`✅ Server on port ${PORT} — v5.13`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 

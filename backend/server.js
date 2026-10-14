@@ -763,6 +763,7 @@ function parsePreopen(json) {
    ============================================================ */
 const lastLtpAt = new Map();
 const lastWsVolume = new Map();
+const lastWsAvg = new Map();      // v5.8: WS tick ka exchange avg traded price = TRUE VWAP
 const prevCumVol = new Map();
 const minVolRing = new Map();
 let wsMinuteKey = null;

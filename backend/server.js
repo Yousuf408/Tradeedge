@@ -776,7 +776,8 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     if (close == null) close = bsCache.get(token)?.ltp ?? null;
     if (!Number.isFinite(close) || close <= 0) continue;
 
-    const cum = lastWsVolume.get(token) ?? bsCache.get(token)?.volume ?? null;
+    const cumRaw = lastWsVolume.get(token) ?? bsCache.get(token)?.volume ?? null;
+    const cum = (cumRaw != null && cumRaw > 0) ? cumRaw : null;   // v5.7: 0/negative = invalid
     const prev = prevCumVol.get(token) ?? null;
     let mv = 0;
     if (cum != null && prev != null && cum >= prev) mv = cum - prev;
@@ -997,7 +998,7 @@ function broadcastChip() {
 
 function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
-  if (extra && Number.isFinite(extra.volume)) lastWsVolume.set(String(token), extra.volume);
+  if (extra && Number.isFinite(extra.volume) && extra.volume > 0) lastWsVolume.set(String(token), extra.volume);   // v5.7: volume=0 wale bad ticks ignore (spike fix)
 
   if (token === NIFTY50_TOKEN) {
     setCachedLTP(token, ltp);
@@ -2169,22 +2170,63 @@ function schedulePreopenFetch() {
   }, ms);
 }
 
+/* v5.8: BS fetch ab 30s nahi — har minute :01 pe (minute-end aligned)
+   - fetch ke turant baad pichle minute ka buy/sell snapshot arrays me append
+   - EOD 15:30 pe loop band */
+function msToNextMinute01() {
+  const ist = getIST();
+  const s = ist.getUTCSeconds();
+  const ms = ist.getUTCMilliseconds();
+  return (60 - s) * 1000 - ms + 1000;   // agle minute ka ~:01
+}
+
+async function appendBSMinuteSnapshot(prevKey, prevTs, date) {
+  const tokens = [], buys = [], sells = [], tss = [];
+  for (const st of STOCKS) {
+    const bs = bsCache.get(String(st.token));
+    if (!bs || bs.buyQty == null || bs.sellQty == null) continue;
+    tokens.push(String(st.token));
+    buys.push(bs.buyQty);
+    sells.push(bs.sellQty);
+    tss.push(prevTs);
+  }
+  if (!tokens.length) return;
+  await db.query(
+    `UPDATE strategy_bs_snapshot AS s
+     SET bs_1min_buy  = COALESCE(s.bs_1min_buy,  ARRAY[]::numeric[]) || v.b,
+         bs_1min_sell = COALESCE(s.bs_1min_sell, ARRAY[]::numeric[]) || v.s,
+         bs_1min_ts   = COALESCE(s.bs_1min_ts,   ARRAY[]::timestamptz[]) || v.t
+     FROM unnest($1::text[], $2::numeric[], $3::numeric[], $4::timestamptz[]) AS v(token, b, s, t)
+     WHERE s.date = $5 AND s.token = v.token AND s.strategy_id = 'momentum'`,
+    [tokens, buys, sells, tss, date]
+  );
+  console.log(`⚖️ BS minute snapshot: ${tokens.length} tokens @ ${prevKey}`);
+}
+
 function startBSInterval() {
   if (bsIntervalTimer) return;
-  bsIntervalTimer = setInterval(async () => {
-    const ist = getIST();
-    if (!isTradingDay(ist)) return;
-    const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
-    const end = 15 * 3600 + 30 * 60;
-    if (secs >= end) {
-      clearInterval(bsIntervalTimer);
-      bsIntervalTimer = null;
-      console.log('💹 BS interval stopped (EOD)');
-      return;
-    }
-    try { await autoFetchBS({ silent: true }); } catch (e) { console.error('BS interval error:', e.message); }
-  }, 30000);
-  console.log('💹 BS 30s interval started');
+  const loop = () => {
+    bsIntervalTimer = setTimeout(async () => {
+      const ist = getIST();
+      const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
+      if (!isTradingDay(ist) || secs >= 15 * 3600 + 30 * 60) {
+        bsIntervalTimer = null;
+        console.log('💹 BS minute loop stopped (EOD)');
+        return;
+      }
+      const d = new Date(ist);
+      d.setUTCMinutes(d.getUTCMinutes() - 1);
+      d.setUTCSeconds(0, 0);
+      const prevKey = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+      const prevTs = d.toISOString().replace('Z', '+05:30');
+      const date = ist.toISOString().split('T')[0];
+      try { await autoFetchBS({ silent: true }); } catch (e) { console.error('BS minute error:', e.message); }
+      try { await appendBSMinuteSnapshot(prevKey, prevTs, date); } catch (e) { console.error('BS snapshot failed:', e.message); }
+      loop();
+    }, msToNextMinute01());
+  };
+  loop();
+  console.log('💹 BS 1-min loop started (:01 aligned, 30s interval band)');
 }
 
 function scheduleBSAutoFetch() {

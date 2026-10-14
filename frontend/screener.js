@@ -564,23 +564,24 @@ async function startHistoricalFetch() {
 
   const ok = confirm(
     '📥 Fetch Historical (Angel REST)\n\n' +
-    'Ye last 2 days (yesterday + today) ka 1-min + 5-min candle Angel REST se fetch karega ' +
+    'Ye last 10 working days ka 1-min + 5-min candle Angel REST se fetch karega ' +
+    '(dono intervals alag-alag API call — 776 calls, rate-limit safe) ' +
     'aur ws_1min_close / ws_5min_close columns overwrite karega.\n\n' +
-    'Saare 388 stocks — approx 6-7 minutes (rate-limit safe, 900ms gap).\n\n' +
+    'Saare 388 stocks — approx 8-9 minutes (400ms+900ms gaps).\n\n' +
     'Continue?'
   );
   if (!ok) return;
 
   HISTORICAL_FETCHING = true;
   btn.disabled = true;
-  btn.textContent = '⏳ Historical fetch... (~6-7 min)';
+  btn.textContent = '⏳ Historical fetch... (~8-9 min)';
   showToast('📥 Historical Fetch', 'Starting Angel REST backfill...');
 
   try {
     const r = await fetch(API + '/api/admin/fetch-historical', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
-      body: JSON.stringify({ days: 2 })
+      body: JSON.stringify({ days: 10 })
     });
     const d = await r.json();
 

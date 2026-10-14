@@ -54,8 +54,8 @@ import {
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 
 import {
-  initAutoTrader, onChipLock, onTickPos, loadOpenPositions, getPositions
-} from './autoTrader.js';   // v4.9.3: auto buy/SL/target module
+  initAutoTrader, onEntryScan, onTickPos, loadOpenPositions, getPositions
+} from './autoTrader.js';   // v5.7: auto buy/SL/target module (per-user capital)
 
 import { registerAdminRoutes } from './admin.js';
 
@@ -1157,17 +1157,34 @@ app.get('/api/screener/chips', auth, (req, res) => {
   res.json({ ok: true, date: chipDate, locked: chipDate != null, chips });
 });
 
-/* v4.9.4: ORDERS page endpoint — positions + live LTP + Net P&L */
+/* v5.7: PER-USER CAPITAL (real-time, memory-only — DB me save nahi) */
+const userCapital = new Map();   // userId -> capital
+
+app.post('/api/auto/capital', auth, (req, res) => {
+  const uid = req.user?.id || req.user?.username || 'admin';
+  const val = Number(req.body?.value);
+  if (!Number.isFinite(val) || val <= 0) return res.status(400).json({ error: 'invalid capital' });
+  userCapital.set(uid, val);
+  res.json({ ok: true, userId: uid, capital: val });
+});
+
+app.get('/api/auto/capital', auth, (req, res) => {
+  const uid = req.user?.id || req.user?.username || 'admin';
+  res.json({ ok: true, capital: userCapital.get(uid) ?? Number(process.env.AUTO_PER_TRADE || 25000) });
+});
+
+/* v4.9.4: ORDERS page endpoint — positions + live LTP + Net P&L (per-user) */
 app.get('/api/auto/positions', auth, async (req, res) => {
   try {
     const date = req.query.date || getIST().toISOString().split('T')[0];
+    const uid = req.user?.id || req.user?.username || 'admin';
     const { rows } = await db.query(
       `SELECT date::text AS date, token, sym, qty, entry, sl, t1, t2, stage, peak,
               status, exit_price, exit_reason, entry_at, exit_at
-       FROM auto_positions WHERE date=$1 ORDER BY entry_at`,
-      [date]
+       FROM auto_positions WHERE date=$1 AND user_id=$2 ORDER BY entry_at`,
+      [date, uid]
     );
-    const live = getPositions();
+    const live = getPositions(uid);
     const out = rows.map(r => {
       const lp = live.find(p => p.token === String(r.token));
       const ltp = getCachedLTP(String(r.token)) ?? null;
@@ -2030,9 +2047,7 @@ async function buildChipList(date) {
     }
     chipDate = date;
     console.log(`🔒 Chip list LOCKED for ${date}: ${chips.length} stocks → ${chips.map(c => `${c.sym}(#${c.rank},gap+${c.gapPct}%,RSI${c.rsiAtLock})`).join(', ') || 'none'}`);
-    broadcastChip();
-    // v4.9.3: autoTrader entry — chip lock hote hi RSI>=70 top-10 pe market buy
-    onChipLock(chips, date).catch(e => console.error('🤖 AutoTrader entry error:', e.message));
+    broadcastChip();   // v5.7: chips ab sirf DISPLAY ke liye — entry buildEntryList se hota hai
   } catch (e) { console.error('Chip list build failed:', e.message); }
 }
 
@@ -2073,7 +2088,10 @@ async function buildEntryList(date) {
     const list = cands.slice(0, MAX_ENTRIES);
     entryDate = date;
     console.log(`🎯 Entry scan: ${cands.length} candidates → ${list.length} selected (MAX_ENTRIES=${MAX_ENTRIES}) → ${list.map(c => c.sym).join(', ') || 'none'}`);
-    if (list.length) onChipLock(list, date).catch(e => console.error('🤖 Entry error:', e.message));
+    // v5.7: per-user capital se qty — jo users ka capital real-time aaya hai unke liye
+    const users = [...userCapital.entries()].map(([userId, capital]) => ({ userId, capital }));
+    if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000) });
+    if (list.length) onEntryScan(list, date, users).catch(e => console.error('🤖 Entry error:', e.message));
   } catch (e) { console.error('Entry scan failed:', e.message); }
 }
 
@@ -2286,7 +2304,8 @@ app.listen(PORT, async () => {
     clientCode: process.env.ANGEL_CLIENT_ID,
     symByToken: SYM_BY_TOKEN,
     getLtp: getCachedLTP,
-    perTrade: Number(process.env.AUTO_PER_TRADE || 10000)
+    getLeverage: (broker, token) => getLeverage(broker, token),
+    perTrade: Number(process.env.AUTO_PER_TRADE || 25000)
   });
   await loadOpenPositions(getIST().toISOString().split('T')[0]);
   await loadPrevWSClosesFromDB();

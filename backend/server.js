@@ -896,14 +896,26 @@ function buildLtpMap() {
 }
 
 async function maybeRefreshMargins(broker = 'angelone', { force = false } = {}) {
-  // v5.12: WEEKLY cadence — 7 din se taaza marker ho to Angel API call SKIP (DB cache use hota hai)
+  // v5.13: WEEKLY gate — refresh SIRF jab (a) cache khali ho, ya (b) marker 7 din purana ho, ya (c) force
+  let markerAge = null;
+  try {
+    const { rows } = await db.query(`SELECT value FROM kv_store WHERE key = $1`, ['margin_refresh_' + broker]);
+    if (rows.length) markerAge = Date.now() - new Date(rows[0].value).getTime();
+  } catch {}
+  const cacheOk = !!getMarginInfo(broker, String(STOCKS[0]?.token));
   if (!force) {
-    try {
-      const { rows } = await db.query(`SELECT value FROM kv_store WHERE key = $1`, ['margin_refresh_' + broker]);
-      if (rows.length && (Date.now() - new Date(rows[0].value).getTime()) < 7 * 24 * 3600 * 1000) return;
-    } catch {}
+    if (cacheOk && markerAge === null) {
+      // cache DB se loaded hai, marker nahi — baseline marker likho, refresh NAHI karo (403 bachat)
+      await db.query(
+        `INSERT INTO kv_store (key, value) VALUES ($1, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = kv_store.value`,
+        ['margin_refresh_' + broker]
+      ).catch(() => {});
+      return;
+    }
+    if (markerAge !== null && markerAge < 7 * 24 * 3600 * 1000) return;
+    if (!shouldRefresh(broker)) return;
   }
-  if (!force && !shouldRefresh(broker)) return;
   const ltpMap = buildLtpMap();
   if (!Object.keys(ltpMap).length) {
     console.log(`📊 Margin refresh [${broker}]: skipped (no LTPs yet)`);
@@ -1104,7 +1116,9 @@ function startWebSocketForReadyPhase() {
 
     // v5.12: DEPTH LIVE engine — top-300 change% + chips + positions (alag connection)
     if (String(process.env.DEPTH_LIVE || 'true') === 'true' && !depthStarted) {
-      startDepthLive(feedToken);
+      depthStarted = true;   // flag turant (double-start rokne ke liye)
+      setTimeout(() => startDepthLive(feedToken), 45000);   // v5.13: main WS ke 45s baad (429 se bachat)
+      console.log('🧿 Depth engine scheduled (45s delay)');
     }
   } catch (e) { console.error('WS start failed:', e.message); }
 }
@@ -1184,7 +1198,6 @@ function computeDepthList() {
 }
 
 function startDepthLive(feedToken) {
-  depthStarted = true;
   const list = computeDepthList();
   startDepthWS({
     feedToken,

@@ -1,25 +1,18 @@
 /* ============================================================
-   SCREENER.JS  — v4.3
-   + Default strategy = Momentum
+   SCREENER.JS  — v4.5  (VERIFIED BUILD 2026-10-14)
+   + Default strategy = Momentum (single strategy)
    + Fixed # column (rank from server)
-   + Gap % filter for Top Gainers/Losers
+   + Gap % = BS table (day_open vs prev_close)
    + Volume column (same BS fetch)
-   + 30s REST LTP poll REMOVED — SSE only
-   + Strategy-specific control buttons
-   + PRE-OPEN column (Momentum)
-   + DAY OPEN column (Momentum)
-   + RSI column (Momentum)
-   + EOD closes fetch button (manual)
-   + v3.8: RSI CHIP BAR
-   + v4.0: MAXQTY from real broker leverage
-   + v4.1: 📥 Fetch Historical button (Angel REST 1m+5m backfill)
-   + v4.2: cleanup — Pivot/Target-SL columns removed, B/S Volume rename, compact controls
-   + v4.3: chip BAR removed (duplicate list thi) — "🔒 RSI Chips" filter button wapas
-           (click pe table me chip stocks dikhte hain — ek hi jagah)
-           - Momentum table se Pivot + Target/SL columns REMOVED
-           - "Buy / Sell" header → "B/S Volume"
-           - Controls compact (Capital input same row)
-           (Advance ORB branch untouched — Pivot/Target/SL wahi chahiye).
+   + SSE only (WS → LTP, 30s BS → Buy/Sell/Vol)
+   + PRE-OPEN / DAY OPEN / RSI columns (Momentum)
+   + RSI CHIP BAR nahi — "🔒 RSI Chips" filter button (click → table)
+   + Pivot / Target-SL columns REMOVED (momentum se)
+   + "Buy / Sell" header → "B/S Volume"; compact controls (Capital same row)
+   + 📥 Fetch Historical button (Angel REST 1m+5m, 2 days)
+   v4.4: gap% BS columns pe; orb.serverTime crash fix; safety stubs
+   v4.5: SCOPE FIX — unclosed if + orphan tail removed (runtime-verified:
+         saari global functions scope-clean hain)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -101,7 +94,6 @@ function renderStrategyControls() {
   const btnStyle = 'style="padding:6px 10px;font-size:12px;white-space:nowrap"';
 
   let strategyButtons = '';
-  if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
     strategyButtons = `
       <button id="fetchBSBtn" class="btn btn-primary" ${btnStyle} onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
       <button id="fetchPreopenBtn" class="btn btn-outline" ${btnStyle} onclick="startPreopenFetch()">📡 Fetch Pre-Open</button>
@@ -684,11 +676,6 @@ function stopSSE() {
   }
 }
 
-/* ============================================================
-   SECTION 7 — ORB STAGE RESOLVE
-   ============================================================ */
-  return { label: '— waiting —', color: 'var(--text-muted)', weight: 500 };
-}
 
 /* ============================================================
    SECTION 8 — RENDER

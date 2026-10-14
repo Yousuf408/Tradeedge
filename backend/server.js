@@ -1933,6 +1933,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
 
     if (!volumeOnly) await assignDailyRank(p.date);
     if (!volumeOnly) await buildChipList(p.date);
+    if (!volumeOnly) await buildEntryList(p.date);   // v5.6: entry scan (all stocks)
 
     if (!volumeOnly) {
       maybeRefreshMargins('angelone').catch(e => console.error('margin refresh:', e.message));
@@ -2033,6 +2034,47 @@ async function buildChipList(date) {
     // v4.9.3: autoTrader entry — chip lock hote hi RSI>=70 top-10 pe market buy
     onChipLock(chips, date).catch(e => console.error('🤖 AutoTrader entry error:', e.message));
   } catch (e) { console.error('Chip list build failed:', e.message); }
+}
+
+/* ============================================================
+   v5.6: ENTRY SCAN — poore stock universe se (chip list se independent)
+   - Filters: gap up <= 3%  +  (CHIP_TEST_MODE=false ho to RSI >= 70)
+   - Cap: MAX_ENTRIES (default 10), change% desc order
+   - Trigger: 9:15 ke pehle BS fetch ke baad, din me ek baar
+   - Chip list (UI) alag chalti hai — display ke liye top-10 logic wahi hai
+   ============================================================ */
+const MAX_ENTRIES = Number(process.env.MAX_ENTRIES || 10);
+let entryDate = null;
+
+async function buildEntryList(date) {
+  try {
+    if (entryDate === date) return;
+    const cands = [];
+    for (const st of STOCKS) {
+      const token = String(st.token);
+      const bs = bsCache.get(token);
+      if (!bs) continue;
+      const dayOpen = bs.dayOpen ?? null;
+      const prevClose = prevCloseCache.get(token) || null;
+      if (!dayOpen || !prevClose || prevClose <= 0) continue;
+      const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
+      if (gapPct > 3) continue;                                   // gap up <= 3%
+      const rsi = bs.rsi ?? null;
+      if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue; // RSI >= 70 (test mode me OFF)
+      const ltp = getCachedLTP(token);
+      if (!ltp) continue;
+      const changePct = ((ltp - prevClose) / prevClose) * 100;
+      cands.push({ token, sym: st.sym, rank: bs.rank ?? null, gapPct: +gapPct.toFixed(2), rsiAtLock: rsi, changePct });
+    }
+    const ist = getIST();
+    const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+    if (!cands.length && mins < 9 * 60 + 20) return;   // ticks ready nahi → 30s baad retry
+    cands.sort((a, b) => b.changePct - a.changePct);
+    const list = cands.slice(0, MAX_ENTRIES);
+    entryDate = date;
+    console.log(`🎯 Entry scan: ${cands.length} candidates → ${list.length} selected (MAX_ENTRIES=${MAX_ENTRIES}) → ${list.map(c => c.sym).join(', ') || 'none'}`);
+    if (list.length) onChipLock(list, date).catch(e => console.error('🤖 Entry error:', e.message));
+  } catch (e) { console.error('Entry scan failed:', e.message); }
 }
 
 async function loadChipListFromDB(date) {

@@ -106,7 +106,6 @@ STOCKS.forEach(s => {
 });
 
 const NIFTY50_TOKEN = '99926000';
-const ENTRY_CUTOFF_MINS = Number(process.env.ENTRY_CUTOFF_MINS || 885);
 
 const STRATEGIES = {
   momentum: {
@@ -114,23 +113,10 @@ const STRATEGIES = {
     name: 'Momentum',
     filters: { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 }
   },
-  advance_orb: {
-    id: 'advance_orb',
-    name: 'Advance ORB',
-    filters: { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 }
-  }
 };
 
 const getStrategy = id => STRATEGIES[id] || STRATEGIES.momentum;
 
-function passesStrategy(candle, strategy) {
-  if (!Array.isArray(candle) || candle.length < 5) return false;
-  const high = +candle[2], low = +candle[3], close = +candle[4];
-  if (low <= 0 || high <= low) return false;
-  const rangePct = ((high - low) / low) * 100;
-  const f = strategy.filters;
-  return rangePct <= f.maxRangePct && close >= f.minPrice && close <= f.maxPrice;
-}
 
 
 /* ============================================================
@@ -188,49 +174,6 @@ function countFilled(date) {
 }
 
 
-/* ============================================================
-   SECTION 4 — ORB STATE
-   ============================================================ */
-const orbState = new Map();
-
-async function loadOrbStateFromDB(date) {
-  try {
-    const activeTokens = STOCKS.map(s => String(s.token));
-    const { rows } = await db.query(
-      `SELECT token, low_broken, first_low_break_at, first_low_break_price,
-              pullback_confirmed, first_pullback_at, first_pullback_price,
-              entry_signal, first_entry_at, first_entry_price,
-              target_hit, target_hit_at, sl_hit, sl_hit_at
-       FROM angel_15m_candle WHERE date=$1 AND token = ANY($2)`,
-      [date, activeTokens]
-    );
-    for (const r of rows) {
-      orbState.set(`${r.token}_${date}`, {
-        lowBroken: !!r.low_broken,
-        pullbackConfirmed: !!r.pullback_confirmed,
-        entrySignal: !!r.entry_signal,
-        firstLowBreakAt: r.first_low_break_at,
-        firstPullbackAt: r.first_pullback_at,
-        firstEntryAt: r.first_entry_at,
-        firstLowBreakPrice: r.first_low_break_price != null ? +r.first_low_break_price : null,
-        firstPullbackPrice: r.first_pullback_price != null ? +r.first_pullback_price : null,
-        firstEntryPrice: r.first_entry_price != null ? +r.first_entry_price : null,
-        targetHit: !!r.target_hit,
-        targetHitAt: r.target_hit_at,
-        slHit: !!r.sl_hit,
-        slHitAt: r.sl_hit_at
-      });
-    }
-    console.log(`🎯 Loaded ORB for ${rows.length} stocks`);
-  } catch (e) { console.error('ORB load failed:', e.message); }
-}
-
-const getOrbState = (token, date) => orbState.get(`${token}_${date}`) || {
-  lowBroken: false, pullbackConfirmed: false, entrySignal: false,
-  firstLowBreakAt: null, firstPullbackAt: null, firstEntryAt: null,
-  firstLowBreakPrice: null, firstPullbackPrice: null, firstEntryPrice: null,
-  targetHit: false, targetHitAt: null, slHit: false, slHitAt: null
-};
 
 
 /* ============================================================
@@ -274,56 +217,6 @@ async function loadPrevCloseFromDB() {
 }
 
 
-/* ============================================================
-   SECTION 4.2 — QUOTE H/L CACHE
-   ============================================================ */
-const quoteCache = new Map();
-
-async function loadQuoteCacheFromDB() {
-  try {
-    const p = getScreenerPhase();
-    if (!p.date) return;
-    const activeTokens = STOCKS.map(s => String(s.token));
-    const { rows } = await db.query(
-      `SELECT token, q15_high, q15_low, quote_fetched_at
-       FROM angel_15m_candle
-       WHERE date=$1 AND token = ANY($2) AND q15_high IS NOT NULL`,
-      [p.date, activeTokens]
-    );
-    for (const r of rows) {
-      quoteCache.set(String(r.token), {
-        high: +r.q15_high,
-        low: +r.q15_low,
-        fetchedAt: r.quote_fetched_at
-      });
-    }
-    console.log(`📊 Loaded quote H/L for ${rows.length} tokens`);
-  } catch (e) { console.error('quoteCache load failed:', e.message); }
-}
-
-
-/* ============================================================
-   SECTION 4.3 — PIVOT CACHE
-   ============================================================ */
-const pivotCache = new Map();
-
-async function loadLatestPivotFromDB() {
-  try {
-    const activeTokens = STOCKS.map(s => String(s.token));
-    const today = getIST().toISOString().split('T')[0];
-    const { rows } = await db.query(
-      `SELECT DISTINCT ON (token) token, pivot
-       FROM angel_15m_candle
-       WHERE pivot IS NOT NULL
-         AND token = ANY($1)
-         AND date < $2
-       ORDER BY token, date DESC`,
-      [activeTokens, today]
-    );
-    for (const r of rows) pivotCache.set(String(r.token), +r.pivot);
-    console.log(`📐 Loaded pivot for ${rows.length} tokens`);
-  } catch (e) { console.error('pivot load failed:', e.message); }
-}
 
 
 /* ============================================================
@@ -1002,26 +895,9 @@ function broadcastLTP(token, ltp) {
   }, 100);
 }
 
-function broadcastORB(token, state) {
-  if (!sseClients.size) return;
-  sseSend(`data: ${JSON.stringify({
-    type: 'orb', token,
-    state: {
-      lowBroken: state.lowBroken, pullbackConfirmed: state.pullbackConfirmed, entrySignal: state.entrySignal,
-      firstLowBreakAt: state.firstLowBreakAt, firstPullbackAt: state.firstPullbackAt, firstEntryAt: state.firstEntryAt,
-      firstLowBreakPrice: state.firstLowBreakPrice, firstPullbackPrice: state.firstPullbackPrice, firstEntryPrice: state.firstEntryPrice,
-      targetHit: state.targetHit, targetHitAt: state.targetHitAt, slHit: state.slHit, slHitAt: state.slHitAt
-    }
   })}\n\n`);
 }
 
-function broadcastQuote(fetchedAt) {
-  if (!sseClients.size) return;
-  sseSend(`data: ${JSON.stringify({
-    type: 'quote', fetchedAt,
-    quotes: Object.fromEntries([...quoteCache.entries()].map(([t, v]) => [t, { high: v.high, low: v.low, fetchedAt: v.fetchedAt }]))
-  })}\n\n`);
-}
 
 function broadcastBS(fetchedAt) {
   if (!sseClients.size) return;
@@ -1078,75 +954,6 @@ function handleTick(token, ltp, tickMs, extra) {
   }
 
   const p = getScreenerPhase();
-  if (p.phase !== 'ready' || !p.date) return;
-
-  const candleArr = getCachedCandles([token], p.date)[0]?.candle;
-  if (!Array.isArray(candleArr) || candleArr.length < 5) return;
-
-  const low = +candleArr[3];
-  const high = +candleArr[2];
-  const key = `${token}_${p.date}`;
-  const state = getOrbState(token, p.date);
-  let changed = false;
-
-  if (!state.lowBroken && ltp < low) {
-    state.lowBroken = true;
-    state.firstLowBreakAt = new Date().toISOString();
-    state.firstLowBreakPrice = ltp;
-    db.query(
-      `UPDATE angel_15m_candle SET low_broken=true, first_low_break_at=NOW(), first_low_break_price=$3
-       WHERE date=$1 AND token=$2 AND low_broken=false`,
-      [p.date, token, ltp]
-    ).catch(() => {});
-    changed = true;
-  }
-
-  if (state.lowBroken && !state.pullbackConfirmed && ltp > low && ltp < high) {
-    state.pullbackConfirmed = true;
-    state.firstPullbackAt = new Date().toISOString();
-    state.firstPullbackPrice = ltp;
-    db.query(
-      `UPDATE angel_15m_candle SET pullback_confirmed=true, first_pullback_at=NOW(), first_pullback_price=$3
-       WHERE date=$1 AND token=$2 AND pullback_confirmed=false`,
-      [p.date, token, ltp]
-    ).catch(() => {});
-    changed = true;
-  }
-
-  if (state.pullbackConfirmed && !state.entrySignal && ltp > high) {
-    const ist = getIST();
-    const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-    if (mins < ENTRY_CUTOFF_MINS) {
-      state.entrySignal = true;
-      state.firstEntryAt = new Date().toISOString();
-      state.firstEntryPrice = ltp;
-      db.query(
-        `UPDATE angel_15m_candle SET entry_signal=true, first_entry_at=NOW(), first_entry_price=$3
-         WHERE date=$1 AND token=$2 AND entry_signal=false`,
-        [p.date, token, ltp]
-      ).catch(() => {});
-      changed = true;
-    }
-  }
-
-  if (state.entrySignal && !state.targetHit && !state.slHit) {
-    const target = high * 1.01;
-    if (ltp >= target) {
-      state.targetHit = true;
-      state.targetHitAt = new Date().toISOString();
-      db.query(`UPDATE angel_15m_candle SET target_hit=true, target_hit_at=NOW() WHERE date=$1 AND token=$2 AND target_hit=false`,
-        [p.date, token]).catch(() => {});
-      changed = true;
-    } else if (ltp <= low) {
-      state.slHit = true;
-      state.slHitAt = new Date().toISOString();
-      db.query(`UPDATE angel_15m_candle SET sl_hit=true, sl_hit_at=NOW() WHERE date=$1 AND token=$2 AND sl_hit=false`,
-        [p.date, token]).catch(() => {});
-      changed = true;
-    }
-  }
-
-  if (changed) { orbState.set(key, state); broadcastORB(token, state); }
   queueLtpWrite(token, ltp, p.date);
 }
 
@@ -1252,24 +1059,16 @@ app.get('/api/screener/data', auth, (req, res) => {
     .filter(c => Array.isArray(c.candle) && c.candle.length >= 5)
     .map(c => String(c.token));
 
-  const passing = allCandles.filter(c => passesStrategy(c.candle, strategy));
-  const passingTokens = new Set(passing.map(c => String(c.token)));
-  const passingStocks = STOCKS.filter(s => passingTokens.has(String(s.token)));
 
-  const quotes = {};
-  for (const t of cachedTokens) {
-    const q = quoteCache.get(t);
-    if (q) quotes[t] = { high: q.high, low: q.low, fetchedAt: q.fetchedAt };
-  }
 
   const allCached = allCandles.filter(c => Array.isArray(c.candle) && c.candle.length >= 5);
 
   res.json({
     ok: true, phase: p.phase, date: p.date,
     strategy: strategy.id, strategyName: strategy.name, filters: strategy.filters,
-    filled: passing.length, total: STOCKS.length,
-    cachedTokens, quotes,
-    results: allCached, stocks: passingStocks
+    total: STOCKS.length,
+    cachedTokens,
+    results: allCached, stocks: []
   });
 });
 
@@ -1348,96 +1147,7 @@ app.get('/api/screener/stream', (req, res) => {
   });
 });
 
-app.post('/api/screener/fetch-batch', auth, async (req, res) => {
-  const { tokens } = req.body;
-  if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
-  const p = getScreenerPhase();
-  if (p.phase !== 'ready' && p.phase !== 'weekend' && p.phase !== 'forming') {
-    return res.status(400).json({ error: `Cannot fetch in phase: ${p.phase}` });
-  }
-  if (!p.date) return res.status(400).json({ error: 'No date available' });
 
-  try {
-    const results = await getCandlesForTokens(tokens, p.date);
-    for (const r of results) {
-      const c = r.candle;
-      if (Array.isArray(c) && c.length >= 5) {
-        db.query(
-          `INSERT INTO angel_15m_candle (date, token, sym, open, high, low, close, volume, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-           ON CONFLICT (date, token) DO UPDATE SET
-             sym=EXCLUDED.sym, open=EXCLUDED.open, high=EXCLUDED.high,
-             low=EXCLUDED.low, close=EXCLUDED.close, volume=EXCLUDED.volume,
-             updated_at=NOW()`,
-          [p.date, r.token, SYM_BY_TOKEN[r.token] || '?', c[1], c[2], c[3], c[4], c[5] || 0]
-        ).catch(() => {});
-        if (!orbState.has(`${r.token}_${p.date}`)) {
-          orbState.set(`${r.token}_${p.date}`, {
-            lowBroken: false, pullbackConfirmed: false, entrySignal: false,
-            firstLowBreakAt: null, firstPullbackAt: null, firstEntryAt: null,
-            firstLowBreakPrice: null, firstPullbackPrice: null, firstEntryPrice: null,
-            targetHit: false, targetHitAt: null, slHit: false, slHitAt: null
-          });
-        }
-      }
-    }
-    console.log(`📊 REST fetch: ${results.length}/${tokens.length} candles`);
-    res.json({ ok: true, date: p.date, results });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/screener/fetch-quote-batch', auth, async (req, res) => {
-  const { tokens } = req.body;
-  if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
-  const p = getScreenerPhase();
-  if (!p.date) return res.status(400).json({ error: 'No trading date' });
-
-  try {
-    const quotes = await fetchQuotesForTokens(tokens);
-    const fetchedAt = new Date();
-    const results = [];
-
-    for (const q of quotes) {
-      if (!q || !q.token) continue;
-      if (!Number.isFinite(q.high) || !Number.isFinite(q.low) || q.high <= 0 || q.low <= 0) continue;
-
-      const token = String(q.token);
-      quoteCache.set(token, { high: q.high, low: q.low, fetchedAt });
-
-      db.query(
-        `INSERT INTO angel_15m_candle (date, token, sym, q15_open, q15_high, q15_low, q15_close, quote_fetched_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-         ON CONFLICT (date, token) DO UPDATE SET
-           sym=EXCLUDED.sym,
-           q15_open=EXCLUDED.q15_open, q15_high=EXCLUDED.q15_high,
-           q15_low=EXCLUDED.q15_low, q15_close=EXCLUDED.q15_close,
-           quote_fetched_at=EXCLUDED.quote_fetched_at, updated_at=NOW()`,
-        [p.date, token, SYM_BY_TOKEN[token] || '?', q.open || q.low, q.high, q.low, q.ltp || q.high, fetchedAt]
-      ).catch(() => {});
-
-      setCachedCandle(token, p.date, [0, q.open || q.low, q.high, q.low, q.ltp || q.high, 0]);
-      if (q.ltp) setCachedLTP(token, q.ltp);
-
-      if (!orbState.has(`${token}_${p.date}`)) {
-        orbState.set(`${token}_${p.date}`, {
-          lowBroken: false, pullbackConfirmed: false, entrySignal: false,
-          firstLowBreakAt: null, firstPullbackAt: null, firstEntryAt: null,
-          firstLowBreakPrice: null, firstPullbackPrice: null, firstEntryPrice: null,
-          targetHit: false, targetHitAt: null, slHit: false, slHitAt: null
-        });
-      }
-
-      results.push({ token, open: q.open, high: q.high, low: q.low, close: q.ltp, prevClose: q.close });
-    }
-
-    broadcastQuote(fetchedAt);
-    console.log(`📊 Quote fetch: ${results.length}/${tokens.length} processed`);
-    res.json({ ok: true, date: p.date, fetchedAt, results });
-  } catch (e) {
-    console.error('fetch-quote-batch failed:', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
 
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
@@ -1448,15 +1158,12 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
   const serverTime = new Date().toISOString();
   const enriched = tokens.map(t => {
     const token = String(t);
-    const state = getOrbState(token, p.date);
     const ltp = getCachedLTP(token) ?? bsCache.get(token)?.ltp ?? null;   // v4.9.4: market band/restart ke baad BS table ka LTP
     const prevClose = prevCloseCache.get(token) || null;
-    const quote = quoteCache.get(token) || null;
-    const pivot = pivotCache.get(token) || null;
     const bs = bsCache.get(token) || null;
     const m = getMarginInfo('angelone', token);
     return {
-      token, ltp, prevClose, pivot,
+      token, ltp, prevClose,
       buyQty: bs?.buyQty ?? null,
       sellQty: bs?.sellQty ?? null,
       bsVolume: bs?.volume ?? null,
@@ -1466,22 +1173,6 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       rsi: bs?.rsi ?? null,
       leverage: m?.leverage ?? null,
       marginPerShare: m?.marginPerShare ?? null,
-      highQuote: quote?.high ?? null,
-      lowQuote: quote?.low ?? null,
-      quoteFetchedAt: quote?.fetchedAt ?? null,
-      lowBroken: state.lowBroken,
-      pullbackConfirmed: state.pullbackConfirmed,
-      entrySignal: state.entrySignal,
-      newLowAt: state.firstLowBreakAt,
-      pullbackAt: state.firstPullbackAt,
-      breakoutAt: state.firstEntryAt,
-      lowBreakPrice: state.firstLowBreakPrice,
-      pullbackPrice: state.firstPullbackPrice,
-      entryPrice: state.firstEntryPrice,
-      targetHit: state.targetHit,
-      targetHitAt: state.targetHitAt,
-      slHit: state.slHit,
-      slHitAt: state.slHitAt,
       serverTime
     };
   });
@@ -1976,60 +1667,6 @@ async function fetchDayHLC() {
 }
 
 
-/* ============================================================
-   SECTION 9 — AUTO QUOTE FETCH @ 09:30:10 IST
-   ============================================================ */
-async function autoFetchQuote() {
-  try {
-    if (!isTradingDay(getIST())) { console.log('📊 Auto-quote: non-trading day'); return; }
-    const p = getScreenerPhase();
-    if (!p.date) return;
-
-    const allTokens = STOCKS.map(s => String(s.token));
-    console.log(`📊 Auto-quote: fetching ${allTokens.length} tokens...`);
-    const t0 = Date.now();
-
-    const savedTokens = new Set();
-    const fetchedAt = new Date();
-
-    const quotes = await fetchQuotesForTokens(allTokens);
-    for (const q of quotes) {
-      if (!q || !q.token) continue;
-      if (!Number.isFinite(q.high) || !Number.isFinite(q.low) || q.high <= 0 || q.low <= 0) continue;
-
-      const token = String(q.token);
-      quoteCache.set(token, { high: q.high, low: q.low, fetchedAt });
-
-      db.query(
-        `INSERT INTO angel_15m_candle (date, token, sym, q15_open, q15_high, q15_low, q15_close, quote_fetched_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-         ON CONFLICT (date, token) DO UPDATE SET
-           sym=EXCLUDED.sym,
-           q15_open=EXCLUDED.q15_open, q15_high=EXCLUDED.q15_high,
-           q15_low=EXCLUDED.q15_low, q15_close=EXCLUDED.q15_close,
-           quote_fetched_at=EXCLUDED.quote_fetched_at, updated_at=NOW()`,
-        [p.date, token, SYM_BY_TOKEN[token] || '?', q.open || q.low, q.high, q.low, q.ltp || q.high, fetchedAt]
-      ).catch(() => {});
-
-      setCachedCandle(token, p.date, [0, q.open || q.low, q.high, q.low, q.ltp || q.high, 0]);
-      if (q.ltp) setCachedLTP(token, q.ltp);
-
-      if (!orbState.has(`${token}_${p.date}`)) {
-        orbState.set(`${token}_${p.date}`, {
-          lowBroken: false, pullbackConfirmed: false, entrySignal: false,
-          firstLowBreakAt: null, firstPullbackAt: null, firstEntryAt: null,
-          firstLowBreakPrice: null, firstPullbackPrice: null, firstEntryPrice: null,
-          targetHit: false, targetHitAt: null, slHit: false, slHitAt: null
-        });
-      }
-      savedTokens.add(token);
-    }
-
-    broadcastQuote(fetchedAt);
-    console.log(`✅ Auto-quote: ${savedTokens.size}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
-  } catch (e) { console.error('Auto-quote failed:', e.message); }
-}
-
 
 /* ============================================================
    SECTION 10 — AUTO PRE-OPEN @ 9:13:30 IST
@@ -2387,11 +2024,6 @@ function scheduleDailyHLC() {
   setTimeout(async () => { await fetchDayHLC(); scheduleDailyHLC(); }, ms);
 }
 
-function scheduleQuoteAutoFetch() {
-  const ms = msUntil(9, 30, 1) + 10000;
-  console.log(`⏰ Next auto-quote in ${Math.round(ms / 60000)} min`);
-  setTimeout(async () => { await autoFetchQuote(); scheduleQuoteAutoFetch(); }, ms);
-}
 
 function schedulePreopenFetch() {
   const ms = msUntil(9, 13, 1) + 30000;
@@ -2490,7 +2122,6 @@ async function loadScreenerCacheFromDB() {
       }
     }
     console.log(`📦 Loaded ${rows.length} candles for ${p.date} (WS provides LTP)`);
-    await loadOrbStateFromDB(p.date);
   } catch (e) { console.error('DB load failed:', e.message); }
 }
 
@@ -2525,7 +2156,6 @@ app.listen(PORT, async () => {
   await loadHolidaysFromDB();
   await loadScreenerCacheFromDB();
   await loadPrevCloseFromDB();
-  await loadQuoteCacheFromDB();
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();
@@ -2561,20 +2191,6 @@ app.listen(PORT, async () => {
     fetchDayHLC();
   }
 
-  if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && mins >= 570 && mins <= 585) {
-    const pQ = getScreenerPhase();
-    if (pQ.date) {
-      try {
-        const { rows } = await db.query(
-          'SELECT COUNT(*) AS cnt FROM angel_15m_candle WHERE date=$1 AND q15_high IS NOT NULL',
-          [pQ.date]
-        );
-        if (+rows[0].cnt === 0) {
-          console.log('🔔 Late startup — running auto-quote catch-up');
-          autoFetchQuote().catch(e => console.error('catch-up failed:', e.message));
-        }
-      } catch (e) { console.error('catch-up failed:', e.message); }
-    }
   }
 
   const bsStart = 9 * 3600 + 15 * 60;
@@ -2598,7 +2214,6 @@ app.listen(PORT, async () => {
   }
 
   scheduleDailyHLC();
-  scheduleQuoteAutoFetch();
   schedulePreopenFetch();
   scheduleBSAutoFetch();
   scheduleFinalFlush();

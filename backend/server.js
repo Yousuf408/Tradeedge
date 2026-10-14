@@ -896,6 +896,13 @@ function buildLtpMap() {
 }
 
 async function maybeRefreshMargins(broker = 'angelone', { force = false } = {}) {
+  // v5.12: WEEKLY cadence — 7 din se taaza marker ho to Angel API call SKIP (DB cache use hota hai)
+  if (!force) {
+    try {
+      const { rows } = await db.query(`SELECT value FROM kv_store WHERE key = $1`, ['margin_refresh_' + broker]);
+      if (rows.length && (Date.now() - new Date(rows[0].value).getTime()) < 7 * 24 * 3600 * 1000) return;
+    } catch {}
+  }
   if (!force && !shouldRefresh(broker)) return;
   const ltpMap = buildLtpMap();
   if (!Object.keys(ltpMap).length) {
@@ -903,6 +910,12 @@ async function maybeRefreshMargins(broker = 'angelone', { force = false } = {}) 
     return;
   }
   await refreshMargins(broker, STOCKS, ltpMap);
+  await db.query(
+    `INSERT INTO kv_store (key, value) VALUES ($1, NOW())
+     ON CONFLICT (key) DO UPDATE SET value = NOW()`,
+    ['margin_refresh_' + broker]
+  ).catch(() => {});
+  console.log(`📊 Margin refreshed [${broker}] — agla auto refresh 7 din baad`);
 }
 
 
@@ -2408,7 +2421,7 @@ function startMarginRefreshLoop() {
     if (secs < 9 * 3600 + 15 * 60 || secs > 15 * 3600 + 30 * 60) return;
     maybeRefreshMargins('angelone').catch(() => {});
   }, 5 * 60 * 1000);
-  console.log('📊 Margin refresh loop started (30-min cadence, from 9:15)');
+  console.log('📊 Margin loop: 5-min check, WEEKLY-gated (kv_store marker) — API call sirf 7 din me ek');
 }
 
 

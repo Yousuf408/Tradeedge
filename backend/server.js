@@ -960,13 +960,16 @@ function sseSend(payload) {
   }
 }
 
-const ssePendingVwap = new Map();   // v5.9: tick-by-tick VWAP (exchange avg) SSE ke saath
+const ssePendingVwap = new Map();   // v5.9: tick-by-tick VWAP SSE ke saath
+const ssePendingRsi = new Map();    // v5.10: tick-by-tick live RSI SSE ke saath
 
 function broadcastLTP(token, ltp) {
   if (!sseClients.size) return;
   ssePending.set(String(token), ltp);
   const vw = lastWsAvg.get(String(token));
   if (vw != null) ssePendingVwap.set(String(token), vw);
+  const rs = bsCache.get(String(token))?.rsi;
+  if (rs != null) ssePendingRsi.set(String(token), rs);
   if (sseFlushTimer) return;
   sseFlushTimer = setTimeout(() => {
     sseFlushTimer = null;
@@ -974,10 +977,12 @@ function broadcastLTP(token, ltp) {
     const payload = `data: ${JSON.stringify({
       type: 'ltp',
       ticks: Object.fromEntries(ssePending),
-      vwaps: Object.fromEntries(ssePendingVwap)
+      vwaps: Object.fromEntries(ssePendingVwap),
+      rsis: Object.fromEntries(ssePendingRsi)
     })}\n\n`;
     ssePending.clear();
     ssePendingVwap.clear();
+    ssePendingRsi.clear();
     sseSend(payload);
   }, 100);
 }

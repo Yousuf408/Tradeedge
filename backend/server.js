@@ -802,10 +802,11 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
       `UPDATE strategy_bs_snapshot AS s
        SET ws_1min_close  = COALESCE(s.ws_1min_close,  ARRAY[]::numeric[]) || v.c,
            ws_1min_ts     = COALESCE(s.ws_1min_ts,     ARRAY[]::timestamptz[]) || v.t,
-           ws_1min_volume = COALESCE(s.ws_1min_volume, ARRAY[]::numeric[]) || v.vol
-       FROM unnest($1::text[], $2::numeric[], $3::timestamptz[], $4::numeric[]) AS v(token, c, t, vol)
-       WHERE s.date = $5 AND s.token = v.token AND s.strategy_id = 'momentum'`,
-      [tokens, closes, tss, minVols, date]
+           ws_1min_volume = COALESCE(s.ws_1min_volume, ARRAY[]::numeric[]) || v.vol,
+           ws_1min_vwap   = COALESCE(s.ws_1min_vwap,   ARRAY[]::numeric[]) || v.w
+       FROM unnest($1::text[], $2::numeric[], $3::timestamptz[], $4::numeric[], $5::numeric[]) AS v(token, c, t, vol, w)
+       WHERE s.date = $6 AND s.token = v.token AND s.strategy_id = 'momentum'`,
+      [tokens, closes, tss, minVols, vwaps, date]
     );
     if (isFive) {
       await db.query(
@@ -984,7 +985,7 @@ function broadcastBS(fetchedAt) {
         rsi: v.rsi ?? null,
         leverage: lev ?? null,
         marginPerShare: lev && v.ltp ? +(v.ltp / lev).toFixed(4) : null,
-        vwap: computeVWAP(t),
+        vwap: lastWsAvg.get(t) ?? computeVWAP(t),   // v5.8
         rsiFirst: v.rsiFirst ?? null
       }];
     }))
@@ -999,6 +1000,7 @@ function broadcastChip() {
 function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
   if (extra && Number.isFinite(extra.volume) && extra.volume > 0) lastWsVolume.set(String(token), extra.volume);   // v5.7: volume=0 wale bad ticks ignore (spike fix)
+  if (extra && Number.isFinite(extra.avgPrice) && extra.avgPrice > 0) lastWsAvg.set(String(token), extra.avgPrice);  // v5.8: exchange VWAP
 
   if (token === NIFTY50_TOKEN) {
     setCachedLTP(token, ltp);
@@ -1263,7 +1265,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       rsi: bs?.rsi ?? null,
       leverage: lev ?? null,
       marginPerShare: lev && ltp ? +(ltp / lev).toFixed(4) : null,
-      vwap: computeVWAP(token),
+      vwap: lastWsAvg.get(token) ?? computeVWAP(token),   // v5.8: exchange VWAP live, fallback computed
       rsiFirst: bs?.rsiFirst ?? null,
       serverTime
     };

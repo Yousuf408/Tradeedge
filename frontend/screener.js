@@ -833,6 +833,19 @@ function placeOrder(sym) {
 }
 
 /* ============================================================
+   SECTION 10.1 — SAFETY STUBS (v4.4)
+   ORB removal ke baad koi purana caller (admin.js / cached HTML /
+   purana onclick) in functions ko call kare to page crash na ho.
+   ============================================================ */
+function loadCachedData() { return Promise.resolve(); }
+function startFetch() { if (typeof showToast === 'function') showToast('⚠️ Removed', 'Advance ORB fetch hata diya gaya'); }
+function startQuoteFetch() { if (typeof showToast === 'function') showToast('⚠️ Removed', 'Advance ORB fetch hata diya gaya'); }
+function startDayHLCFetch() { if (typeof showToast === 'function') showToast('⚠️ Removed', 'Advance ORB fetch hata diya gaya'); }
+function onStrategyChange() { /* strategy switch removed — momentum only */ }
+function setStageFilter() { /* ORB filter removed */ }
+function renderChipBar() { /* chip bar removed — RSI Chips filter use karo */ }
+
+/* ============================================================
    SECTION 10 — HELPERS
    ============================================================ */
 function setPill(text, color) {

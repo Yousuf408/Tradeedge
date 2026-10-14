@@ -230,6 +230,11 @@ const minuteBuffer = new Map();
 const RSI_SOURCE = process.env.RSI_SOURCE || 'ws';
 const wsPrevCloses = new Map();
 const wsTodayCloses = new Map();
+const wsTodayVols = new Map();     // v5.5: aaj ke ws_1min_volume (VWAP ke liye)
+
+// v5.5: TESTING MODE — true = chip filter me RSI>=70 skip (sirf gap<=3% + top-10)
+// Testing khatam hone ke baad Render env me CHIP_TEST_MODE=false karna = RSI filter wapas
+const CHIP_TEST_MODE = String(process.env.CHIP_TEST_MODE || 'true') === 'true';
 const rsiState = new Map();
 
 const chipList = new Map();
@@ -535,6 +540,50 @@ function seedRSIStateFromMemory() {
   console.log(`🧮 RSI live state seeded: ${n} tokens`);
 }
 
+/* v5.5: VWAP = Σ(close×vol) / Σ(vol) — aaj ke ws_1min closes+volumes se */
+function computeVWAP(token) {
+  const c = wsTodayCloses.get(String(token));
+  const v = wsTodayVols.get(String(token));
+  if (!c || !v || !c.length) return null;
+  let pv = 0, vv = 0;
+  for (let i = 0; i < c.length; i++) {
+    const vol = v[i] || 0;
+    pv += c[i] * vol;
+    vv += vol;
+  }
+  return vv > 0 ? +(pv / vv).toFixed(2) : null;
+}
+
+/* v5.5: restart ke baad aaj ka rsi_first backfill (09:15 candle se) */
+async function backfillRsiFirst(date) {
+  try {
+    const activeTokens = STOCKS.map(s => String(s.token));
+    const { rows } = await db.query(
+      `SELECT token, ws_1min_close FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND rsi_first IS NULL
+         AND ws_1min_close IS NOT NULL AND array_length(ws_1min_close,1) > 0
+         AND token = ANY($2)`,
+      [date, activeTokens]
+    );
+    const toks = [], rsis = [];
+    for (const r of rows) {
+      const series = (wsPrevCloses.get(String(r.token)) || []).concat([+r.ws_1min_close[0]]);
+      const rsi = computeRSIWilder(series);
+      if (rsi == null) continue;
+      toks.push(String(r.token)); rsis.push(+rsi.toFixed(2));
+    }
+    if (toks.length) {
+      await db.query(
+        `UPDATE strategy_bs_snapshot AS s SET rsi_first=v.rsi
+         FROM unnest($1::text[], $2::numeric[]) AS v(token, rsi)
+         WHERE s.date=$3 AND s.token=v.token AND s.strategy_id='momentum' AND s.rsi_first IS NULL`,
+        [toks, rsis, date]
+      );
+      console.log(`🥇 rsi_first backfill: ${toks.length} tokens for ${date}`);
+    }
+  } catch (e) { console.error('rsi_first backfill failed:', e.message); }
+}
+
 async function updateRSIFromWS(date, prevKey) {
   const toks = [], rsis = [];
   for (const s of STOCKS) {
@@ -772,8 +821,11 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
       const arr = wsTodayCloses.get(tokens[i]) || [];
       arr.push(closes[i]);
       wsTodayCloses.set(tokens[i], arr);
+      const va = wsTodayVols.get(tokens[i]) || [];
+      va.push(minVols[i]);
+      wsTodayVols.set(tokens[i], va);
     }
-    if (RSI_SOURCE === 'ws') await updateRSIFromWS(date);
+    if (RSI_SOURCE === 'ws') await updateRSIFromWS(date, prevKey);
 
     console.log(`🕐 WS minute-close: ${tokens.length} tokens @ ${prevKey}${isFive ? ' (5m)' : ''}`);
   } catch (e) { console.error('WS minute-close flush failed:', e.message); }
@@ -1595,7 +1647,8 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
     try {
       await loadPrevWSClosesFromDB();
       await loadTodayWSClosesFromDB();
-      seedRSIStateFromMemory();
+      await backfillRsiFirst(getIST().toISOString().split('T')[0]);   // v5.5
+  seedRSIStateFromMemory();
       console.log('🔄 WS caches reloaded after backfill');
     } catch (e) { console.error('Post-backfill reload failed:', e.message); }
 
@@ -1956,7 +2009,7 @@ async function buildChipList(date) {
       const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
       const rsi = bsCache.get(x.token)?.rsi ?? null;
       if (gapPct > 3) continue;
-      if (rsi == null || rsi < 70) continue;
+      if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;   // TEST MODE me RSI filter OFF
       chips.push({
         token: x.token,
         sym: SYM_BY_TOKEN[x.token] || '?',

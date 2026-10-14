@@ -410,7 +410,7 @@ function renderBuySellCell(token) {
       <div style="background:rgba(225,112,85,0.25);border-radius:3px;height:6px;overflow:hidden;position:relative">
         <div style="position:absolute;left:0;top:0;bottom:0;width:${buyPct}%;background:var(--success)"></div>
       </div>
-      <div style="font-size:9px;color:var(--text-muted);font-family:ui-monospace,monospace">${formatQty(bs.buyQty)} / ${formatQty(bs.sellQty)}</div>
+      <div style="font-size:9px;color:var(--text-muted);font-family:ui-monospace,monospace">${(+bs.buyQty).toLocaleString('en-IN')} / ${(+bs.sellQty).toLocaleString('en-IN')}</div>
     </div>`;
 }
 

@@ -33,6 +33,7 @@ let SCREENER_RSI = {};
 let SCREENER_LEVERAGE = {};
 let SCREENER_MARGIN_PS = {};
 let SCREENER_CHIPS = [];
+let SCREENER_LASTUPD = {};        // v4.4: per-token last BS update time
 let SCREENER_INIT_DONE = false;
 let SCREENER_SSE = null;
 let FETCHING = false;
@@ -610,6 +611,7 @@ async function loadLTP() {
         if (item.preopenPrice != null) SCREENER_PREOPEN[item.token] = { price: item.preopenPrice };
         if (item.dayOpen != null) SCREENER_DAY_OPEN[item.token] = item.dayOpen;
         if (item.rsi != null) SCREENER_RSI[item.token] = item.rsi;
+        if (item.serverTime) SCREENER_LASTUPD[item.token] = item.serverTime;
         if (item.leverage != null) SCREENER_LEVERAGE[item.token] = item.leverage;
         if (item.marginPerShare != null) SCREENER_MARGIN_PS[item.token] = item.marginPerShare;
 
@@ -795,7 +797,7 @@ function renderScreenerTable() {
 
       const rank = bs?.rank ?? '—';
 
-      const lastUpdate = formatTimeIST(orb.serverTime);
+      const lastUpdate = formatTimeIST(SCREENER_LASTUPD[s.token]);
       const rowClass = '';
 
       return `<tr class="${rowClass}" data-token="${s.token}">

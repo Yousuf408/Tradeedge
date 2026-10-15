@@ -1,17 +1,29 @@
 /* ============================================================
-   autoTrader.js — v1.2 (per-user capital & positions)
+   autoTrader.js — v1.3 (Top Performing entry rules)
    ------------------------------------------------------------
    - Capital user ke browser se real-time aata hai (POST /api/auto/capital)
      → server memory me per-user; DB me capital SAVE NAHI hota
    - Positions per-user: auto_positions me user_id ke saath (DB = record)
    - Qty = floor(user_capital × leverage / LTP)  ← page ke MAXQTY jaisi
-   - SL/T1/T2/trail/15:00 square-off rules wahi (v1.0 jaise)
+   - v1.3 TRADE RULES (server v5.20 entry engine ke saath):
+       · Candidate universe = Top Performing chip (gap-up <3% wale stocks)
+       · Entry  = day-open se +1% cross hone pe (9:15–11:00 window, server side)
+       · SL     = DAY OPEN price (initial)
+       · +0.7%  = entry se upar → SL = COST (entry price)      [stage 1]
+       · T1 +1% = hit → SL = T1, phir TRAIL ON (peak − 0.2%)   [stage 2]
+       · T2 +1.5% = milestone — trail continue, koi booking nahi [stage 3]
+       · Exit = LTP ≤ SL (SL / BE_SL / TRAIL_SL) ya 15:00 square-off
    - LIVE mode (AUTO_TRADE=true): broker account EK hai (server wala),
      isliye broker order har token pe EK BAAR jata hai (pehle position ki qty);
      baaki users ki positions paper-mirror hoti hain.
-     Per-user broker connect = baad ka phase.
-   - PAPER mode (default): koi broker order nahi, sirf per-user book.
+   - PAPER mode (default): koi broker order nahi, sirf per-user book
    ============================================================ */
+
+/* v1.3: trade rule constants (env se override possible) */
+const BE_TRIGGER_PCT = Number(process.env.AT_BE_PCT ?? 0.7);    // entry +0.7% → SL = cost
+const T1_PCT         = Number(process.env.AT_T1_PCT ?? 1.0);    // T1 = entry +1%
+const T2_PCT         = Number(process.env.AT_T2_PCT ?? 1.5);    // T2 = entry +1.5% (milestone)
+const TRAIL_PCT      = Number(process.env.AT_TRAIL_PCT ?? 0.2); // T1 ke baad peak se trail %
 
 let db = null;
 let getJwt = null;
@@ -40,7 +52,7 @@ export function initAutoTrader(deps) {
   getLtp = deps.getLtp || (() => null);
   getLev = deps.getLeverage || null;
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
-  console.log(`🤖 AutoTrader init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} (per-user capital)`);
+  console.log(`🤖 AutoTrader v1.3 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | rules: SL=DayOpen · +${BE_TRIGGER_PCT}%→Cost · T1=+${T1_PCT}%→SL@T1+trail${TRAIL_PCT}% · T2=+${T2_PCT}% milestone`);
   startSquareOffWatch();
 }
 
@@ -101,58 +113,78 @@ export async function onEntryScan(cands, date, users) {
         : Math.floor(u.capital / (ltp * 0.01));
       if (qty < 1) continue;
 
+      // v1.3: SL = DAY OPEN (entry engine cand.dayOpen bhejta hai); fallback = 1% below entry
+      const dayOpen = (c.dayOpen != null && +c.dayOpen > 0) ? +c.dayOpen : null;
       const pos = {
         userId: u.userId, token, sym: c.sym || symByToken[token] || '?', qty,
         entry: +ltp.toFixed(2),
-        sl: +(ltp * 0.99).toFixed(2),
-        t1: +(ltp * 1.015).toFixed(2),
-        t2: +(ltp * 1.02).toFixed(2),
+        sl: dayOpen != null ? +dayOpen.toFixed(2) : +(ltp * 0.99).toFixed(2),
+        t1: +(ltp * (1 + T1_PCT / 100)).toFixed(2),
+        t2: +(ltp * (1 + T2_PCT / 100)).toFixed(2),
         stage: 0, peak: +ltp.toFixed(2),
         status: 'open', reason: null, exitPrice: null,
         entryAt: new Date().toISOString(), exitAt: null
       };
       positions.set(key, pos);
+      if (dayOpen == null) console.warn(`🤖 ⚠️ ${pos.sym}: dayOpen missing → SL fallback 1% below entry`);
 
       // LIVE: broker order token-pe-ek-baar (single account), qty = pehli position
       if (live && !liveOrdered.has(token)) {
         liveOrdered.add(token);
         try {
           const oid = await placeOrder({ token, sym: pos.sym, side: 'BUY', qty: pos.qty });
-          console.log(`🤖 BUY ${pos.sym} qty=${pos.qty} @${pos.entry} user=${u.userId} order=${oid}`);
+          console.log(`🤖 BUY ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl}${dayOpen != null ? '(dayOpen)' : '(fallback)'} T1=${pos.t1} T2=${pos.t2} user=${u.userId} order=${oid}`);
         } catch (e) {
           console.error(`🤖 BUY failed ${pos.sym}: ${e.message}`);
         }
       } else if (!live) {
-        console.log(`🤖 [PAPER] BUY ${pos.sym} qty=${pos.qty} @${pos.entry} user=${u.userId} (capital ₹${u.capital})`);
+        console.log(`🤖 [PAPER] BUY ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl}${dayOpen != null ? '(dayOpen)' : '(fallback)'} T1=${pos.t1} T2=${pos.t2} user=${u.userId} (capital ₹${u.capital})`);
       }
       savePos(pos, date).catch(() => {});
     }
   }
 }
 
-/* ---------- TICK MONITOR: SL / T1 / T2 / trail (sab users) ---------- */
+/* ---------- TICK MONITOR: SL / BE / T1 / T2 / trail (sab users) ----------
+   v1.3 stages: 0=fresh (SL@dayOpen) → 1=BE (+0.7% → SL@cost)
+                → 2=T1 hit (SL@T1, trail peak−0.2% ON) → 3=T2 milestone (trail continue) */
 export function onTickPos(token, ltp) {
   const tk = String(token);
   for (const [key, pos] of positions) {
     if (pos.token !== tk || pos.status !== 'open') continue;
     let changed = false;
+    const beTrigger = pos.entry * (1 + BE_TRIGGER_PCT / 100);
 
-    if (pos.stage === 0 && ltp >= pos.t1) {
-      pos.stage = 1; pos.sl = pos.entry; changed = true;
-      console.log(`🤖 ${pos.sym} T1 hit (${ltp}) → SL = entry ${pos.sl} [${pos.userId}]`);
+    // +0.7% entry se upar → SL = COST (entry price)
+    if (pos.stage === 0 && ltp >= beTrigger) {
+      pos.stage = 1;
+      if (pos.entry > pos.sl) pos.sl = pos.entry;
+      changed = true;
+      console.log(`🤖 ${pos.sym} +${BE_TRIGGER_PCT}% cross (${ltp}) → SL = COST ${pos.sl} [${pos.userId}]`);
     }
-    if (pos.stage === 1 && ltp >= pos.t2) {
-      pos.stage = 2; pos.sl = pos.t1; pos.peak = ltp; changed = true;
-      console.log(`🤖 ${pos.sym} T2 hit (${ltp}) → SL = T1 ${pos.sl}, trail 0.3% ON [${pos.userId}]`);
-    }
-    if (pos.stage === 2) {
+    // T1 (+1%) hit → SL = T1, trail ON (stage 0 se direct jump bhi possible)
+    if ((pos.stage === 0 || pos.stage === 1) && ltp >= pos.t1) {
+      pos.stage = 2;
+      if (pos.t1 > pos.sl) pos.sl = pos.t1;
       if (ltp > pos.peak) pos.peak = ltp;
-      const trail = +(pos.peak * 0.997).toFixed(2);
+      changed = true;
+      console.log(`🤖 ${pos.sym} T1 hit (${ltp}) → SL = T1 ${pos.sl}, trail ${TRAIL_PCT}% ON [${pos.userId}]`);
+    }
+    // T2 (+1.5%) = milestone only — trail continue, koi exit nahi
+    if (pos.stage === 2 && ltp >= pos.t2) {
+      pos.stage = 3;
+      changed = true;
+      console.log(`🤖 ${pos.sym} T2 hit (${ltp}) → milestone, trail ${TRAIL_PCT}% continues [${pos.userId}]`);
+    }
+    // T1 ke baad trail: peak − 0.2%
+    if (pos.stage >= 2) {
+      if (ltp > pos.peak) pos.peak = ltp;
+      const trail = +(pos.peak * (1 - TRAIL_PCT / 100)).toFixed(2);
       if (trail > pos.sl) { pos.sl = trail; changed = true; }
     }
 
     if (ltp <= pos.sl) {
-      exitPosition(pos, ltp, pos.stage === 2 ? 'TRAIL_SL' : (pos.stage === 1 ? 'BE_SL' : 'SL'));
+      exitPosition(pos, ltp, pos.stage >= 2 ? 'TRAIL_SL' : (pos.stage === 1 ? 'BE_SL' : 'SL'));
       continue;
     }
     if (changed) savePos(pos, posDate).catch(() => {});
@@ -250,3 +282,6 @@ export function getPositions(userId) {
   }
   return out;
 }
+
+/* v1.3: server entry-engine restart-safe seeding ke liye — positions kis date ke hain */
+export function getPositionDate() { return posDate; }

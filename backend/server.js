@@ -12,6 +12,13 @@
    v5.4: NEW admin route — Angel REST 1-min + 5-min candle backfill
          Overwrites ws_1min_close, ws_5min_close (and ts/volume)
          + RSI recompute. Guarded against concurrent runs.
+   v5.20: ENTRY TRIGGER ENGINE (purana one-shot buildEntryList HATAYA) —
+         - Candidates = 🏆 Top Performing rules: gap-up < 3% (>=3% exclude) +
+           change% > 0 + day-open se +1% (ENTRY_OPEN_GAIN_PCT) cross
+         - Window 9:15–11:00 IST, har 5s scan, per-token din me EK entry,
+           cap MAX_ENTRIES (default 10)
+         - cands me dayOpen jata hai → autoTrader v1.3 SL = DAY OPEN rakhta hai
+         - buildChipList gap filter bhi >= 3% exclude (consistency)
    ============================================================ */
 
 import express from 'express';
@@ -55,8 +62,8 @@ import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 import { startDepthWS, resubscribeDepth, getDepthStatus } from './brokers/angelone/Angel_Depth.js';   // v5.12: mode-3 depth LIVE engine
 
 import {
-  initAutoTrader, onEntryScan, onTickPos, loadOpenPositions, getPositions
-} from './autoTrader.js';   // v5.7: auto buy/SL/target module (per-user capital)
+  initAutoTrader, onEntryScan, onTickPos, loadOpenPositions, getPositions, getPositionDate
+} from './autoTrader.js';   // v5.7: auto buy/SL/target module (per-user capital) · v5.20: +getPositionDate
 
 import { registerAdminRoutes } from './admin.js';
 
@@ -2164,7 +2171,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
 
     if (!volumeOnly) await assignDailyRank(p.date);
     if (!volumeOnly) await buildChipList(p.date);
-    if (!volumeOnly) await buildEntryList(p.date);   // v5.6: entry scan (all stocks)
+    // v5.20: entry ab apne 5s interval engine se hota hai (startEntryEngine) — BS fetch pe depend nahi
 
     if (!volumeOnly) {
       maybeRefreshMargins('angelone').catch(e => console.error('margin refresh:', e.message));
@@ -2240,7 +2247,7 @@ async function buildChipList(date) {
       if (!dayOpen || !prevClose || prevClose <= 0) continue;
       const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
       const rsi = bsCache.get(x.token)?.rsi ?? null;
-      if (gapPct > 3) continue;
+      if (gapPct >= 3) continue;   // v5.20: gap-up >= 3% exclude (exactly 3% bhi out)
       if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;   // TEST MODE me RSI filter OFF
       chips.push({
         token: x.token,
@@ -2261,52 +2268,107 @@ async function buildChipList(date) {
     }
     chipDate = date;
     console.log(`🔒 Chip list LOCKED for ${date}: ${chips.length} stocks → ${chips.map(c => `${c.sym}(#${c.rank},gap+${c.gapPct}%,RSI${c.rsiAtLock})`).join(', ') || 'none'}`);
-    broadcastChip();   // v5.7: chips ab sirf DISPLAY ke liye — entry buildEntryList se hota hai
+    broadcastChip();   // v5.7: chips sirf DISPLAY ke liye — entry v5.20 entry engine se hota hai
   } catch (e) { console.error('Chip list build failed:', e.message); }
 }
 
 /* ============================================================
-   v5.6: ENTRY SCAN — poore stock universe se (chip list se independent)
-   - Filters: gap up <= 3%  +  (CHIP_TEST_MODE=false ho to RSI >= 70)
-   - Cap: MAX_ENTRIES (default 10), change% desc order
-   - Trigger: 9:15 ke pehle BS fetch ke baad, din me ek baar
-   - Chip list (UI) alag chalti hai — display ke liye top-10 logic wahi hai
+   v5.20: ENTRY TRIGGER ENGINE — 🏆 Top Performing rules se entries
+   ------------------------------------------------------------
+   Purana v5.6 buildEntryList (din me ek baar, change%-top-10 turant buy) HATAYA.
+   Ab entry TAB hoti hai jab stock day-open se +ENTRY_OPEN_GAIN_PCT (default 1%)
+   pehli baar cross kare:
+     - gap-up >= ENTRY_GAP_MAX_PCT (default 3%) → EXCLUDE (fake spike / unsafe)
+     - change% (vs prev_close) > 0 zaroori
+     - CHIP_TEST_MODE=false ho to RSI >= 70 bhi (existing behaviour)
+     - Window: ENTRY_START_MIN..ENTRY_END_MIN (default 9:15–11:00 IST)
+     - Har ENTRY_SCAN_MS (default 5s) scan; per-token din me EK entry;
+       total cap MAX_ENTRIES (default 10)
+     - Restart-safe: aaj ke positions DB se loaded hain to un tokens ko
+       already-entered maante hain
+     - cand me dayOpen bhi jata hai → autoTrader v1.3 SL = DAY OPEN banata hai
    ============================================================ */
 const MAX_ENTRIES = Number(process.env.MAX_ENTRIES || 10);
-let entryDate = null;
+const ENTRY_OPEN_GAIN_PCT = Number(process.env.ENTRY_OPEN_GAIN_PCT || 1.0);   // open se +1% cross = entry
+const ENTRY_GAP_MAX_PCT = Number(process.env.ENTRY_GAP_MAX_PCT || 3.0);       // gap >= 3% exclude
+const ENTRY_START_MIN = Number(process.env.ENTRY_START_MIN || 9 * 60 + 15);   // 9:15 IST
+const ENTRY_END_MIN = Number(process.env.ENTRY_END_MIN || 11 * 60);           // 11:00 IST
+const ENTRY_SCAN_MS = Number(process.env.ENTRY_SCAN_MS || 5000);
 
-async function buildEntryList(date) {
+let entryDay = null;
+const entryTriggered = new Set();   // tokens jinpe aaj entry ja chuki (ya DB me position hai)
+let entryCount = 0;
+
+function runEntryScan(date) {
   try {
-    if (entryDate === date) return;
+    if (!date) return;
+    if (entryDay !== date) {
+      entryDay = date;
+      entryTriggered.clear();
+      entryCount = 0;
+      // restart-safe seeding: autoTrader ke paas is date ke positions pehle se hain?
+      if (getPositionDate() === date) {
+        for (const p of getPositions()) entryTriggered.add(String(p.token));
+        entryCount = entryTriggered.size;
+        if (entryCount) console.log(`🎯 Entry engine: ${entryCount} tokens aaj already-entered (DB positions se seed)`);
+      }
+    }
+
+    const ist = getIST();
+    const dow = ist.getUTCDay();
+    if (dow < 1 || dow > 5 || !isTradingDay(ist)) return;
+    const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+    if (mins < ENTRY_START_MIN || mins >= ENTRY_END_MIN) return;   // 9:15–11:00 window
+    if (entryCount >= MAX_ENTRIES) return;
+
     const cands = [];
     for (const st of STOCKS) {
       const token = String(st.token);
+      if (entryTriggered.has(token)) continue;
       const bs = bsCache.get(token);
       if (!bs) continue;
       const dayOpen = bs.dayOpen ?? null;
       const prevClose = prevCloseCache.get(token) || null;
       if (!dayOpen || !prevClose || prevClose <= 0) continue;
       const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
-      if (gapPct > 3) continue;                                   // gap up <= 3%
-      const rsi = bs.rsi ?? null;
-      if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue; // RSI >= 70 (test mode me OFF)
+      if (gapPct >= ENTRY_GAP_MAX_PCT) continue;                   // gap-up >= 3% = avoid
       const ltp = getCachedLTP(token);
       if (!ltp) continue;
+      const openGainPct = ((ltp - dayOpen) / dayOpen) * 100;
+      if (openGainPct < ENTRY_OPEN_GAIN_PCT) continue;             // open se +1% cross nahi hua
       const changePct = ((ltp - prevClose) / prevClose) * 100;
-      cands.push({ token, sym: st.sym, rank: bs.rank ?? null, gapPct: +gapPct.toFixed(2), rsiAtLock: rsi, changePct });
+      if (changePct <= 0) continue;                                // din me negative → skip
+      const rsi = bs.rsi ?? null;
+      if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;  // RSI >= 70 (test mode me OFF)
+      cands.push({
+        token, sym: st.sym, dayOpen: +(+dayOpen).toFixed(2),
+        gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), changePct: +changePct.toFixed(2)
+      });
     }
-    const ist = getIST();
-    const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-    if (!cands.length && mins < 9 * 60 + 20) return;   // ticks ready nahi → 30s baad retry
-    cands.sort((a, b) => b.changePct - a.changePct);
-    const list = cands.slice(0, MAX_ENTRIES);
-    entryDate = date;
-    console.log(`🎯 Entry scan: ${cands.length} candidates → ${list.length} selected (MAX_ENTRIES=${MAX_ENTRIES}) → ${list.map(c => c.sym).join(', ') || 'none'}`);
+    if (!cands.length) return;
+
+    cands.sort((a, b) => b.openGainPct - a.openGainPct);           // sabse strong open-gain pehle
+    const list = cands.slice(0, MAX_ENTRIES - entryCount);
+    for (const c of list) entryTriggered.add(c.token);
+    entryCount += list.length;
+
+    const hh = String(ist.getUTCHours()).padStart(2, '0');
+    const mi = String(ist.getUTCMinutes()).padStart(2, '0');
+    console.log(`🎯 Entry trigger ${hh}:${mi} — ${list.length} BUY: ${list.map(c => `${c.sym}(open+${c.openGainPct}%,gap+${c.gapPct}%,chg+${c.changePct}%)`).join(', ')} | today ${entryCount}/${MAX_ENTRIES}`);
+
     // v5.7: per-user capital se qty — jo users ka capital real-time aaya hai unke liye
     const users = [...userCapital.entries()].map(([userId, capital]) => ({ userId, capital }));
     if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000) });
-    if (list.length) onEntryScan(list, date, users).catch(e => console.error('🤖 Entry error:', e.message));
+    onEntryScan(list, date, users).catch(e => console.error('🤖 Entry error:', e.message));
   } catch (e) { console.error('Entry scan failed:', e.message); }
+}
+
+function startEntryEngine() {
+  setInterval(() => {
+    const p = getScreenerPhase();
+    if (p && p.date) runEntryScan(p.date);
+  }, ENTRY_SCAN_MS);
+  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | rule: open-gain >= +${ENTRY_OPEN_GAIN_PCT}% & gap < ${ENTRY_GAP_MAX_PCT}% & change% > 0 | cap ${MAX_ENTRIES}`);
 }
 
 async function loadChipListFromDB(date) {
@@ -2686,8 +2748,9 @@ app.listen(PORT, async () => {
   scheduleFinalFlush();
   scheduleMorningPreload();
   startMarginRefreshLoop();
+  startEntryEngine();   // v5.20: Top Performing entry trigger (9:15–11:00, 5s scan)
 
   maybeRefreshMargins('angelone', { force: true }).catch(() => {});
 
-  console.log('ℹ️  Schedule: WS@9:14:55 | Preopen@9:13:30 | BS@9:15 (30s) | Quote@9:30 | HLC@15:31 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');
+  console.log('ℹ️  Schedule: WS@9:14:55 | Preopen@9:13:30 | BS@9:15 (30s) | Quote@9:30 | EntryScan@9:15-11:00 (5s) | HLC@15:31 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');
 });

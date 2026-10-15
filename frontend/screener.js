@@ -1,7 +1,7 @@
 /* ============================================================
-   SCREENER.JS  — v4.5  (VERIFIED BUILD 2026-10-14)
+   SCREENER.JS  — v4.6  (TOP PERFORMING BUILD)
    + Default strategy = Momentum (single strategy)
-   + Fixed # column (rank from server)
+   + `#` column = TOP PERFORMING index (open-gain% desc) — sirf usi tab me
    + Gap % = BS table (day_open vs prev_close)
    + Volume column (same BS fetch)
    + SSE only (WS → LTP, 30s BS → Buy/Sell/Vol)
@@ -13,6 +13,13 @@
    v4.4: gap% BS columns pe; orb.serverTime crash fix; safety stubs
    v4.5: SCOPE FIX — unclosed if + orphan tail removed (runtime-verified:
          saari global functions scope-clean hain)
+   v4.6: 🏆 TOP PERFORMING tab (DEFAULT) — sirf woh stocks jo DAY OPEN se
+         +0.90% ya usse zyada upar hain. Index numbering (#) = open-gain%
+         descending (sabse zyada gain = #1).
+         Purana change%-wala `#` rank column (server rank_no) UI se HATA DIYA —
+         ab `#` column sirf Top Performing tab me dikhta hai.
+         Server ka rank_no logic untouched (chip-lock usi pe depend karta hai).
+         Live re-rank: SSE ltp ticks pe 2s throttle se table re-render.
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -37,9 +44,14 @@ let DAYHLC_FETCHING = false;
 let EOD_FETCHING = false;
 let HISTORICAL_FETCHING = false;   // v4.1
 
-let SCREENER_MOMENTUM_FILTER = 'all';
-let SCREENER_SORT_BY = 'change';
+let SCREENER_MOMENTUM_FILTER = 'open_gain';   // v4.6: Top Performing = default tab
+let SCREENER_SORT_BY = 'open_gain';
 let SCREENER_SORT_DIR = 'desc';
+
+/* v4.6: Top Performing tab ka rule — DAY OPEN se minimum gain % */
+const OPEN_GAIN_MIN_PCT = 0.90;
+let OPEN_GAIN_RANK = {};              // token -> 1..N (open-gain desc, sirf Top Performing tab)
+let OPEN_GAIN_RERENDER_TIMER = null;  // 2s throttle timer
 
 let SCREENER_ACTIVE_STRATEGY = 'momentum';
 
@@ -170,9 +182,31 @@ async function loadChips() {
 
 function setMomentumFilter(key) {
   SCREENER_MOMENTUM_FILTER = key;
-  SCREENER_SORT_BY = 'change';
+  // v4.6: Top Performing tab apne open-gain order me; baaki tabs change% me
+  SCREENER_SORT_BY = (key === 'open_gain') ? 'open_gain' : 'change';
   SCREENER_SORT_DIR = 'desc';
   renderScreenerTable();
+}
+
+/* v4.6: Top Performing tab active ho to SSE ticks pe 2s me ek baar re-render
+   (warna naye qualify/drop hone wale stocks + ranking update nahi honge) */
+function scheduleOpenGainRerender() {
+  if (SCREENER_MOMENTUM_FILTER !== 'open_gain') return;
+  if (OPEN_GAIN_RERENDER_TIMER) return;
+  OPEN_GAIN_RERENDER_TIMER = setTimeout(() => {
+    OPEN_GAIN_RERENDER_TIMER = null;
+    if (SCREENER_MOMENTUM_FILTER === 'open_gain') renderScreenerTable();
+  }, 2000);
+}
+
+/* v4.6: kitne stocks abhi +0.90% open-gain rule pass kar rahe hain (chip count badge) */
+function countOpenGainStocks() {
+  let n = 0;
+  for (const s of SCREENER_ALL_STOCKS) {
+    const og = computeOpenGainPct(s.token);
+    if (og !== null && og >= OPEN_GAIN_MIN_PCT) n++;
+  }
+  return n;
 }
 
 function renderChips() {
@@ -184,7 +218,9 @@ function renderChips() {
       const active = SCREENER_MOMENTUM_FILTER === key ? 'active' : '';
       return `<button class="filter-chip ${active}" onclick="setMomentumFilter('${key}')">${label}</button>`;
     };
+    const ogCount = countOpenGainStocks();
     el.innerHTML =
+      chip('open_gain', `🏆 Top Performing (${ogCount})`) +
       chip('all', 'All') +
       chip('top_gainers', '🚀 Top 15 Gainers') +
       chip('top_losers', '📉 Top 15 Losers') +
@@ -221,6 +257,10 @@ function getSortValue(stock, field) {
     const v = computeChangePct(stock.token);
     return v === null ? -Infinity : v;
   }
+  if (field === 'open_gain') {                       // v4.6: Top Performing sort
+    const og = computeOpenGainPct(stock.token);
+    return og === null ? -Infinity : og;
+  }
   if (field === 'ltp') return SCREENER_LTP[stock.token] ?? -Infinity;
   if (field === 'rsi') return SCREENER_RSI[stock.token] ?? -Infinity;
   return 0;
@@ -256,6 +296,24 @@ function computeGapPct(token) {
   const prev = SCREENER_PREV_CLOSE[token];
   if (!dayOpen || !prev || prev <= 0) return null;
   return ((dayOpen - prev) / prev) * 100;
+}
+
+/* v4.6: DAY OPEN se gain % = (LTP - dayOpen) / dayOpen * 100 */
+function computeOpenGainPct(token) {
+  const ltp = SCREENER_LTP[token];
+  const dayOpen = SCREENER_DAY_OPEN[token];
+  const o = dayOpen != null ? +dayOpen : null;
+  if (!ltp || !o || o <= 0) return null;
+  return ((+ltp - o) / o) * 100;
+}
+
+/* v4.6: DAY OPEN cell ke neeche chhota open-gain% badge */
+function renderOpenGainSub(token) {
+  const og = computeOpenGainPct(token);
+  if (og === null) return '';
+  const pos = og >= 0;
+  const color = pos ? 'var(--success)' : 'var(--danger)';
+  return `<span class="ogain-sub" style="display:block;font-size:10px;font-weight:700;color:${color}">${pos ? '+' : ''}${og.toFixed(2)}% open</span>`;
 }
 
 function computeMaxQty(token, ltp) {
@@ -365,6 +423,10 @@ function updateLTPCells(ticks, vwaps, rsis) {
       }
     }
 
+
+    // v4.6: open-gain% badge live update (Top Performing ranking 2s throttle se)
+    const ogEl = row.querySelector('.ogain-cell');
+    if (ogEl) ogEl.innerHTML = renderOpenGainSub(token);
 
     const mqEl = row.querySelector('.maxqty-cell');
     if (mqEl) {
@@ -682,6 +744,7 @@ function startSSE() {
           updateNiftyHeader();
         }
         updateLTPCells(msg.ticks, msg.vwaps, msg.rsis);
+        scheduleOpenGainRerender();      // v4.6: Top Performing live re-rank (2s)
       }
       else if (msg.type === 'bs' && msg.bs) {
         for (const [token, v] of Object.entries(msg.bs)) {
@@ -730,8 +793,12 @@ function renderScreenerTable() {
      v4.2: Pivot + Target/SL columns removed; Buy/Sell → B/S Volume
      ============================================================ */
   if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
+    // v4.6: `#` = Top Performing index (open-gain% desc). Baaki tabs me column hi nahi.
+    const isOpenGainTab = SCREENER_MOMENTUM_FILTER === 'open_gain';
+    const COLSPAN = isOpenGainTab ? 14 : 13;
     head.innerHTML = `<tr>
-      <th style="width:36px">#</th>
+      ${isOpenGainTab ? `<th class="th-sortable" style="width:46px" onclick="setSort('open_gain')"
+          title="Top Performing rank — DAY OPEN se gain % (click to re-sort)">#${sortIndicator('open_gain')}</th>` : ''}
       <th>Stock / Company</th>
       <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
           <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
@@ -750,7 +817,13 @@ function renderScreenerTable() {
 
     let filtered = [...SCREENER_ALL_STOCKS];
 
-    if (SCREENER_MOMENTUM_FILTER === 'top_gainers') {
+    if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
+      // v4.6: 🏆 Top Performing — sirf woh stocks jo DAY OPEN se +0.90% ya usse zyada upar hain
+      filtered = filtered.filter(s => {
+        const og = computeOpenGainPct(s.token);
+        return og !== null && og >= OPEN_GAIN_MIN_PCT;
+      });
+    } else if (SCREENER_MOMENTUM_FILTER === 'top_gainers') {
       filtered = filtered
         .filter(s => {
           const chg = computeChangePct(s.token);
@@ -780,17 +853,30 @@ function renderScreenerTable() {
       filtered.sort((a, b) => (rankBy[String(a.token)] ?? 999) - (rankBy[String(b.token)] ?? 999));
     }
 
+    // v4.6: Top Performing index number — hamesha open-gain% desc se
+    //        (user dusre column pe sort kare to bhi #1 = best performer rahega)
+    OPEN_GAIN_RANK = {};
+    if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
+      [...filtered]
+        .sort((a, b) => getSortValue(b, 'open_gain') - getSortValue(a, 'open_gain'))
+        .forEach((s, i) => { OPEN_GAIN_RANK[String(s.token)] = i + 1; });
+    }
+
     const sorted = sortStocks(filtered);
 
     if (!sorted.length) {
-      const isEmptyChipFilter = SCREENER_MOMENTUM_FILTER === 'rsi_chips';
-      body.innerHTML = isEmptyChipFilter
-        ? `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
-            🔒 No RSI chips locked today.<br>
-            <span style="font-size:11px">Chips lock at 9:15 (top-10 rank · gap ≤3% · RSI ≥70)</span>
-          </td></tr>`
-        : `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
-            Loading stocks...<br>Please wait a few seconds.
+      let emptyMsg;
+      if (SCREENER_MOMENTUM_FILTER === 'rsi_chips') {
+        emptyMsg = `🔒 No RSI chips locked today.<br>
+            <span style="font-size:11px">Chips lock at 9:15 (top-10 rank · gap ≤3% · RSI ≥70)</span>`;
+      } else if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
+        emptyMsg = `🏆 Abhi koi stock DAY OPEN se <b>+${OPEN_GAIN_MIN_PCT.toFixed(2)}%</b> upar nahi hai.<br>
+            <span style="font-size:11px">Live ticks pe har 2 second auto-refresh · DAY OPEN data pehle B/S fetch se aata hai</span>`;
+      } else {
+        emptyMsg = `Loading stocks...<br>Please wait a few seconds.`;
+      }
+      body.innerHTML = `<tr><td colspan="${COLSPAN}" style="text-align:center;padding:60px;color:var(--text-muted)">
+            ${emptyMsg}
           </td></tr>`;
       if (count) count.textContent = `0 / ${SCREENER_ALL_STOCKS.length}`;
       renderChips();
@@ -820,16 +906,14 @@ function renderScreenerTable() {
         : '<span style="color:var(--text-muted)">—</span>';
 
       const dayOpenCell = dayOpen
-        ? `<span style="font-weight:700">₹${(+dayOpen).toFixed(2)}</span>`
-        : '<span style="color:var(--text-muted)">—</span>';
-
-      const rank = bs?.rank ?? '—';
+        ? `<span style="font-weight:700">₹${(+dayOpen).toFixed(2)}</span><span class="ogain-cell">${renderOpenGainSub(s.token)}</span>`
+        : '<span style="color:var(--text-muted)">—</span><span class="ogain-cell"></span>';
 
       const lastUpdate = formatTimeIST(SCREENER_LASTUPD[s.token]);
       const rowClass = '';
 
       return `<tr class="${rowClass}" data-token="${s.token}">
-        <td style="font-weight:700;color:var(--text-muted);font-size:12px">${rank}</td>
+        ${isOpenGainTab ? `<td style="font-weight:800;color:#6C5CE7;font-size:12px;text-align:center">${OPEN_GAIN_RANK[String(s.token)] ?? '—'}</td>` : ''}
         <td><span class="sym">${s.sym}</span><span class="tok">${s.token}</span></td>
         <td style="white-space:nowrap">
           <span class="cell-primary ltp-cell">${ltp ? '₹' + (+ltp).toFixed(2) : '—'}</span>

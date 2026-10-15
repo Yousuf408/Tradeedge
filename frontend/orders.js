@@ -1,11 +1,12 @@
 /* ============================================================
-   ORDERS.JS — v1.1 (FINAL)
+   ORDERS.JS — v1.2 (autoTrader v1.3 stage labels)
    AutoTrader positions page — Entry / SL / T1 / T2 / Net P&L
    ------------------------------------------------------------
    - Data: GET /api/auto/positions (3s poll jab page active ho)
    - Nav click pe page khud activate karta hai (app.js pe depend nahi)
    - Stats: NET P&L (total), OPEN, CLOSED, WINS
    - Table: TIME · STOCK · STATUS · QTY · ENTRY · LTP · SL(live trail)
+   - v1.2: stage labels autoTrader v1.3 ke rules pe (BE@+0.7% / T1=+1% / T2=+1.5%)
             · T1 ✓ · T2 ✓ · NET P&L ₹/% · EXIT reason+time
    ============================================================ */
 
@@ -75,9 +76,11 @@ function ordINR(v) {
 
 function ordStatus(p) {
   if (p.status === 'open') {
-    if (p.stage >= 2) return '<span style="color:#6C5CE7;font-weight:800">🟢 OPEN · T2✓ trail</span>';
-    if (p.stage === 1) return '<span style="color:#F5A623;font-weight:800">🟢 OPEN · T1✓</span>';
-    return '<span style="color:var(--success);font-weight:800">🟢 OPEN</span>';
+    // v1.2: autoTrader v1.3 stages — 0=fresh(SL@dayOpen) 1=SL@Cost 2=T1✓trail 3=T2✓trail
+    if (p.stage >= 3) return '<span style="color:#6C5CE7;font-weight:800">🟢 OPEN · T2✓ trail</span>';
+    if (p.stage === 2) return '<span style="color:#6C5CE7;font-weight:800">🟢 OPEN · T1✓ trail</span>';
+    if (p.stage === 1) return '<span style="color:#F5A623;font-weight:800">🟢 OPEN · SL@Cost</span>';
+    return '<span style="color:var(--success);font-weight:800">🟢 OPEN · SL@DayOpen</span>';
   }
   const rsn = p.exitReason || 'EXIT';
   const col = rsn === 'SL' ? 'var(--danger)'
@@ -118,8 +121,8 @@ function renderOrders() {
   /* ---- positions table ---- */
   const rows = ps.map(p => {
     const pnlCol = p.pnl > 0 ? 'var(--success)' : p.pnl < 0 ? 'var(--danger)' : 'var(--text-secondary)';
-    const t1hit = (p.stage >= 1 || (p.exitPrice != null && p.exitPrice >= p.t1));
-    const t2hit = (p.stage >= 2 || (p.exitPrice != null && p.exitPrice >= p.t2));
+    const t1hit = (p.stage >= 2 || (p.exitPrice != null && p.exitPrice >= p.t1));
+    const t2hit = (p.stage >= 3 || (p.exitPrice != null && p.exitPrice >= p.t2));
     return `<tr>
       <td style="font-family:ui-monospace,monospace;font-size:11px;color:var(--text-muted);white-space:nowrap">${ordTime(p.entryAt)}</td>
       <td><span class="sym">${p.sym}</span><span class="tok">${p.token}</span></td>

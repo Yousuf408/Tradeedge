@@ -388,6 +388,29 @@ function updateLTPCells(ticks, vwaps, rsis) {
 }
 
 /* ============================================================
+   SECTION 3.35 — DEPTH CELLS (v4.9): tick-by-tick buyers/sellers (mode-3 depth se)
+   ============================================================ */
+function updateDepthCells(depth) {
+  const rows = document.querySelectorAll('#screenerBody tr[data-token]');
+  if (!rows.length) return;
+  const rowMap = {};
+  rows.forEach(r => { rowMap[r.dataset.token] = r; });
+  for (const [token, d] of Object.entries(depth)) {
+    const existing = SCREENER_BS[token] || {};
+    SCREENER_BS[token] = {
+      buyQty: d.b ?? existing.buyQty,
+      sellQty: d.s ?? existing.sellQty,
+      volume: existing.volume,
+      rank: existing.rank
+    };
+    const row = rowMap[token];
+    if (!row) continue;
+    const bsEl = row.querySelector('.bs-cell');
+    if (bsEl) bsEl.innerHTML = renderBuySellCell(token);
+  }
+}
+
+/* ============================================================
    SECTION 3.4 — BUY/SELL CELL
    ============================================================ */
 function renderBuySellCell(token) {
@@ -696,6 +719,9 @@ function startSSE() {
         }
         renderScreenerTable();
       }
+      else if (msg.type === 'depth' && msg.depth) {
+        updateDepthCells(msg.depth);
+      }
       else if (msg.type === 'chip' && msg.chips) {
         SCREENER_CHIPS = msg.chips;
         renderScreenerTable();
@@ -839,7 +865,7 @@ function renderScreenerTable() {
         <td style="white-space:nowrap">${dayOpenCell}</td>
         <td class="rsi-cell" style="white-space:nowrap">${renderRSICell(s.token)}</td>
         <td style="white-space:nowrap;font-weight:700;color:#F5A623">${SCREENER_RSI_FIRST[s.token] != null ? (+SCREENER_RSI_FIRST[s.token]).toFixed(1) : '—'}</td>
-        <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
+        <td class="bs-cell" style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
         <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">${bs?.volume ? formatQty(bs.volume) : '—'}</td>
         <td class="vwap-cell" style="white-space:nowrap;font-weight:700;color:#6C5CE7">${SCREENER_VWAP[s.token] != null ? '₹' + (+SCREENER_VWAP[s.token]).toFixed(2) : '—'}</td>
         <td style="white-space:nowrap"><span style="color:var(--text-muted)">—</span></td>

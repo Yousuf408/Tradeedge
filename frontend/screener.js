@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.6  (TOP PERFORMING BUILD)
+   SCREENER.JS  — v4.6.1  (TOP PERFORMING BUILD)
    + Default strategy = Momentum (single strategy)
    + `#` column = TOP PERFORMING index (open-gain% desc) — sirf usi tab me
    + Gap % = BS table (day_open vs prev_close)
@@ -20,6 +20,12 @@
          ab `#` column sirf Top Performing tab me dikhta hai.
          Server ka rank_no logic untouched (chip-lock usi pe depend karta hai).
          Live re-rank: SSE ltp ticks pe 2s throttle se table re-render.
+   v4.6.1: negative-change guard — open-gain >= +0.90% KE SAATH change% (vs prev
+           close) bhi > 0 hona zaroori; gap-down recoveries Top Performing me nahi.
+   v4.7: Top Performing rule UPDATE —
+         - open-gain threshold 0.90% → +0.95% (DAY OPEN se)
+         - gap-up >= 3% wale stocks EXCLUDE (fake morning spikes / unsafe entry)
+         Backend entry engine (server v5.20) bhi isi universe se entries leta hai.
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -48,8 +54,15 @@ let SCREENER_MOMENTUM_FILTER = 'open_gain';   // v4.6: Top Performing = default 
 let SCREENER_SORT_BY = 'open_gain';
 let SCREENER_SORT_DIR = 'desc';
 
-/* v4.6: Top Performing tab ka rule — DAY OPEN se minimum gain % */
-const OPEN_GAIN_MIN_PCT = 0.90;
+/* v4.7: Top Performing tab ka rule — DAY OPEN se minimum gain % */
+const OPEN_GAIN_MIN_PCT = 0.95;
+/* v4.7: gap-up (day_open vs prev_close) >= itna % ho to stock EXCLUDE —
+   3%+ gap-up = fake move ka risk, safe entry nahi. */
+const OPEN_GAIN_MAX_GAP_PCT = 3.0;
+/* v4.6.1: "negative" stocks rokne ke liye — change% (vs PREV CLOSE) bhi > 0 hona chahiye.
+   Gap-down stocks jo open se recover karke +0.9% dikhte hain par din me abhi bhi
+   negative hain, wo Top Performing me NAHI aayenge. False = purana behaviour. */
+const OPEN_GAIN_REQUIRE_POSITIVE_CHANGE = true;
 let OPEN_GAIN_RANK = {};              // token -> 1..N (open-gain desc, sirf Top Performing tab)
 let OPEN_GAIN_RERENDER_TIMER = null;  // 2s throttle timer
 
@@ -199,13 +212,10 @@ function scheduleOpenGainRerender() {
   }, 2000);
 }
 
-/* v4.6: kitne stocks abhi +0.90% open-gain rule pass kar rahe hain (chip count badge) */
+/* v4.7: kitne stocks abhi +0.95% open-gain (gap <3%, change% >0) rule pass kar rahe hain (chip count badge) */
 function countOpenGainStocks() {
   let n = 0;
-  for (const s of SCREENER_ALL_STOCKS) {
-    const og = computeOpenGainPct(s.token);
-    if (og !== null && og >= OPEN_GAIN_MIN_PCT) n++;
-  }
+  for (const s of SCREENER_ALL_STOCKS) if (passesOpenGain(s.token)) n++;
   return n;
 }
 
@@ -305,6 +315,20 @@ function computeOpenGainPct(token) {
   const o = dayOpen != null ? +dayOpen : null;
   if (!ltp || !o || o <= 0) return null;
   return ((+ltp - o) / o) * 100;
+}
+
+/* v4.7: Top Performing ka single gate — filter + count dono yahi use karte hain
+   Rule: open-gain >= +0.95%  AND  change% > 0  AND  gap-up < 3% */
+function passesOpenGain(token) {
+  const og = computeOpenGainPct(token);
+  if (og === null || og < OPEN_GAIN_MIN_PCT) return false;
+  if (OPEN_GAIN_REQUIRE_POSITIVE_CHANGE) {
+    const chg = computeChangePct(token);
+    if (chg === null || chg <= 0) return false;
+  }
+  const gap = computeGapPct(token);                       // v4.7: gap-up >= 3% exclude
+  if (gap !== null && gap >= OPEN_GAIN_MAX_GAP_PCT) return false;
+  return true;
 }
 
 /* v4.6: DAY OPEN cell ke neeche chhota open-gain% badge */
@@ -818,11 +842,8 @@ function renderScreenerTable() {
     let filtered = [...SCREENER_ALL_STOCKS];
 
     if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
-      // v4.6: 🏆 Top Performing — sirf woh stocks jo DAY OPEN se +0.90% ya usse zyada upar hain
-      filtered = filtered.filter(s => {
-        const og = computeOpenGainPct(s.token);
-        return og !== null && og >= OPEN_GAIN_MIN_PCT;
-      });
+      // v4.7: 🏆 Top Performing — DAY OPEN se +0.95% upar, gap-up <3%, change% positive
+      filtered = filtered.filter(s => passesOpenGain(s.token));
     } else if (SCREENER_MOMENTUM_FILTER === 'top_gainers') {
       filtered = filtered
         .filter(s => {
@@ -870,7 +891,7 @@ function renderScreenerTable() {
         emptyMsg = `🔒 No RSI chips locked today.<br>
             <span style="font-size:11px">Chips lock at 9:15 (top-10 rank · gap ≤3% · RSI ≥70)</span>`;
       } else if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
-        emptyMsg = `🏆 Abhi koi stock DAY OPEN se <b>+${OPEN_GAIN_MIN_PCT.toFixed(2)}%</b> upar nahi hai.<br>
+        emptyMsg = `🏆 Abhi koi stock DAY OPEN se <b>+${OPEN_GAIN_MIN_PCT.toFixed(2)}%</b> (change% positive, gap-up < ${OPEN_GAIN_MAX_GAP_PCT}%) nahi hai.<br>
             <span style="font-size:11px">Live ticks pe har 2 second auto-refresh · DAY OPEN data pehle B/S fetch se aata hai</span>`;
       } else {
         emptyMsg = `Loading stocks...<br>Please wait a few seconds.`;

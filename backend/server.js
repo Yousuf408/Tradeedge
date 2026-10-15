@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.4
+   server.js — TradeAlgo Pro backend  |  v5.17
    v5.1: Margin service JWT fallback
    v5.2: BS upsert writes day_high/low/close/prev_close;
    v5.3: prev_close hardening —
@@ -802,6 +802,7 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
   const isFive = Number(prevKey.slice(3)) % 5 === 4;
   const tss = tokens.map(() => prevTs);
   const vols5 = isFive ? tokens.map(t => (minVolRing.get(t) || []).reduce((a, b) => a + b, 0)) : [];
+  const vwaps = tokens.map(t => lastWsAvg.get(t) ?? computeVWAP(t) ?? 0);   // v5.9: minute-end VWAP snapshot
   try {
     await db.query(
       `UPDATE strategy_bs_snapshot AS s
@@ -2607,7 +2608,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.13`);
+  console.log(`✅ Server on port ${PORT} — v5.17`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 

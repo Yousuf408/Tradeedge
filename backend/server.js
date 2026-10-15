@@ -1,5 +1,14 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.17
+   server.js — TradeAlgo Pro backend  |  v5.19
+   v5.19: Depth list = TOP-100 change% (pehle 300). Env DEPTH_TOP_COUNT se
+          badal sakte ho (default 100). Chips + open positions hamesha included.
+          Quota: ~100 tokens × 3 = 300/1000 → 429 risk almost zero, book fresh.
+   v5.18: B/S Volume = SIRF WS depth (mode-3). REST buy_qty/sell_qty ko
+          frontend paths (SSE 'bs' + POST /api/screener/ltp) se hata diya —
+          minute-REST ab depth cells ko stomp nahi karega.
+          Rollback: Render env BS_SOURCE=rest (koi code change nahi).
+          DB snapshot (strategy_bs_snapshot.buy_qty/sell_qty) waise hi REST se
+          likha jata rahega = record/history safe.
    v5.1: Margin service JWT fallback
    v5.2: BS upsert writes day_high/low/close/prev_close;
    v5.3: prev_close hardening —
@@ -229,6 +238,16 @@ const todayCloses = new Map();
 const minuteBuffer = new Map();
 
 const RSI_SOURCE = process.env.RSI_SOURCE || 'ws';
+
+// v5.18: B/S Volume ka source
+//   'ws'   (default) = sirf Angel mode-3 depth WS (tick-by-tick, 500ms batch)
+//   'rest'           = purana Angel REST (har minute) — rollback ke liye
+const BS_SOURCE = String(process.env.BS_SOURCE || 'ws').toLowerCase();
+// depth kitna purana ho to use "stale" maan ke frontend ko null bhejein
+const BS_DEPTH_MAX_AGE_MS = Number(process.env.BS_DEPTH_MAX_AGE_MS || 120000);
+// v5.19: depth list kitne top change% stocks ki ho (pehle 300, ab 100)
+const DEPTH_TOP_COUNT = Number(process.env.DEPTH_TOP_COUNT || 100);
+
 const wsPrevCloses = new Map();
 const wsTodayCloses = new Map();
 const wsTodayVols = new Map();     // v5.5: aaj ke ws_1min_volume (VWAP ke liye)
@@ -949,6 +968,37 @@ let depthPktCount = 0;          // v5.14: per-minute rate log
 let depthRestarts = 0;          // v5.14: adaptive quota cap ke liye
 let depthWatchdog = null;
 
+/* v5.18: B/S ka single source-of-truth helper
+   BS_SOURCE='ws'  → depthCache se (fresh ho tabhi), warna null (frontend "—" dikhayega)
+   BS_SOURCE='rest'→ bsCache (purana REST) — sirf rollback ke liye
+   NOTE: REST wala buy/sell ab SSE/ltp me nahi jata, isliye minute-render
+         depth cells ko overwrite nahi karta. */
+function getBSForToken(token) {
+  const tk = String(token);
+  if (BS_SOURCE === 'rest') {
+    const v = bsCache.get(tk);
+    if (!v || v.buyQty == null || v.sellQty == null) return null;
+    return { buyQty: +v.buyQty, sellQty: +v.sellQty, src: 'rest', age: null };
+  }
+  const d = depthCache.get(tk);
+  if (!d || d.buyQty == null || d.sellQty == null) return null;
+  const ageMs = Date.now() - (d.ts || 0);
+  if (ageMs > BS_DEPTH_MAX_AGE_MS) return null;      // 2 min purana = stale
+  return { buyQty: +d.buyQty, sellQty: +d.sellQty, src: 'depth', age: Math.round(ageMs / 1000) };
+}
+
+/* v5.18: depth coverage — kitne tokens ka book fresh hai (log + /api/status ke liye) */
+function getDepthCoverage(freshMs = 5000) {
+  const now = Date.now();
+  let fresh = 0, stale = 0;
+  for (const [, d] of depthCache) {
+    if (d && d.buyQty != null && (now - (d.ts || 0)) <= freshMs) fresh++;
+    else stale++;
+  }
+  return { cache: depthCache.size, fresh, stale, source: BS_SOURCE };
+}
+
+
 const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000);
 const ltpWriteQueue = new Map();
 let ltpWriteTimer = null;
@@ -1031,11 +1081,18 @@ function broadcastLTP(token, ltp) {
 function broadcastBS(fetchedAt) {
   if (!sseClients.size) return;
   sseSend(`data: ${JSON.stringify({
-    type: 'bs', fetchedAt,
+    type: 'bs', fetchedAt, bsSource: BS_SOURCE,
     bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => {
       const lev = getLeverage('angelone', t);
+      // v5.18: B/S = WS depth only (REST buy/sell yahan se comment/hata diya).
+      // Purana line (rollback ref): buyQty: v.buyQty, sellQty: v.sellQty,
+      const dp = getBSForToken(t);
       return [t, {
-        buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
+        buyQty: dp ? dp.buyQty : null,
+        sellQty: dp ? dp.sellQty : null,
+        bsSrc: dp ? dp.src : null,
+        bsAge: dp ? dp.age : null,
+        ltp: v.ltp,
         volume: v.volume, rank: v.rank,
         preopenPrice: v.preopenPrice ?? null,
         dayOpen: v.dayOpen ?? null,
@@ -1122,7 +1179,7 @@ function startWebSocketForReadyPhase() {
     wsStarted = true;
     console.log(`🔌 WS started for ${tokens.length} tokens`);
 
-    // v5.12: DEPTH LIVE engine — top-300 change% + chips + positions (alag connection)
+    // v5.12: DEPTH LIVE engine — top-100 change% + chips + positions (alag connection) — v5.19
     if (String(process.env.DEPTH_LIVE || 'true') === 'true' && !depthStarted) {
       depthStarted = true;   // flag turant (double-start rokne ke liye)
       setTimeout(() => startDepthLive(feedToken), 45000);   // v5.13: main WS ke 45s baad (429 se bachat)
@@ -1149,7 +1206,7 @@ setInterval(() => {
 
 /* ============================================================
    SECTION 5.9 — DEPTH ENGINE (v5.12): tick-by-tick buyers vs sellers
-   - top-300 live change% + chips + open positions = depth list (10-min refresh)
+   - top-100 live change% + chips + open positions = depth list (10-min refresh) — v5.19
    - depthCache = latest book; depthSec = per-second ratio samples (continuity)
    - SSE 'depth' event (500ms batch) + minute snapshot me depth-preferred
    ============================================================ */
@@ -1199,12 +1256,15 @@ function computeDepthList() {
     const chg = (ltp && pc && pc > 0) ? ((ltp - pc) / pc) * 100 : -Infinity;
     return { t, chg };
   }).sort((a, b) => b.chg - a.chg);
-  const set = new Set(scored.slice(0, 300).map(x => x.t));
+  const set = new Set(scored.slice(0, DEPTH_TOP_COUNT).map(x => x.t));   // v5.19: top-100 (env DEPTH_TOP_COUNT)
   for (const t of chipList.keys()) set.add(String(t));          // chips hamesha
   for (const p of getPositions()) {                              // open positions hamesha
     if (p.status === 'open') set.add(String(p.token));
   }
-  const cap = depthRestarts >= 3 ? 150 : (depthRestarts >= 1 ? 250 : 330);   // v5.14: 429 se bache to quota khud ghire
+  // v5.19: cap ab list-size ke hisaab se — restart hone pe chips/positions hi trim honge
+  const cap = depthRestarts >= 3 ? Math.max(50, Math.round(DEPTH_TOP_COUNT * 0.6))
+            : (depthRestarts >= 1 ? Math.round(DEPTH_TOP_COUNT * 0.85)
+            : (DEPTH_TOP_COUNT + 40));
   return [...set].slice(0, cap);
 }
 
@@ -1219,7 +1279,7 @@ function startDepthLive(feedToken) {
   });
   setInterval(() => {
     if (!shouldStartWS() || !depthStarted) return;
-    resubscribeDepth(computeDepthList());   // 10-min me list refresh (top-300 change%)
+    resubscribeDepth(computeDepthList());   // 10-min me list refresh (top-100 change%)
   }, 10 * 60 * 1000);
 
   // v5.14: WATCHDOG — depth mari ho ya packets ruk gaye ho to 60-90s me zinda karo
@@ -1229,7 +1289,8 @@ function startDepthLive(feedToken) {
       const st = getDepthStatus();
       const silentMs = Date.now() - lastDepthPacket;
       if (depthPktCount > 0 || lastDepthPacket) {
-        console.log(`🧿 depth rate: ${depthPktCount} pkt/min | connected=${st.connected} | tokens=${st.tokenCount}`);
+        const cov = getDepthCoverage(5000);
+        console.log(`🧿 depth rate: ${depthPktCount} pkt/min | connected=${st.connected} | tokens=${st.tokenCount} | book cache=${cov.cache} (fresh<5s=${cov.fresh}, stale=${cov.stale}) | B/S source=${BS_SOURCE}`);
       }
       depthPktCount = 0;
       if (!st.connected || silentMs > 90000) {
@@ -1293,10 +1354,12 @@ app.get('/api/strategies', auth, (req, res) => {
 
 app.get('/api/screener/status', auth, (req, res) => {
   const p = getScreenerPhase();
+  const dst = (() => { try { return getDepthStatus(); } catch { return { connected: false, tokenCount: 0 }; } })();
   res.json({
     phase: p.phase, date: p.date || null,
     filled: p.date ? countFilled(p.date) : 0, total: STOCKS.length,
-    ws: getWSStatus()
+    ws: getWSStatus(),
+    depth: { ...dst, ...getDepthCoverage(5000), bsSource: BS_SOURCE }   // v5.18: B/S WS coverage check
   });
 });
 
@@ -1436,10 +1499,13 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const prevClose = prevCloseCache.get(token) || null;
     const bs = bsCache.get(token) || null;
     const lev = getLeverage('angelone', token);
+    const dp = getBSForToken(token);   // v5.18: B/S = WS depth only (REST comment)
     return {
       token, ltp, prevClose,
-      buyQty: bs?.buyQty ?? null,
-      sellQty: bs?.sellQty ?? null,
+      buyQty: dp ? dp.buyQty : null,
+      sellQty: dp ? dp.sellQty : null,
+      bsSrc: dp ? dp.src : null,
+      bsAge: dp ? dp.age : null,
       bsVolume: bs?.volume ?? null,
       rank: bs?.rank ?? null,
       preopenPrice: bs?.preopenPrice ?? null,

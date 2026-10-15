@@ -1,16 +1,21 @@
 /* ============================================================
-   SCREENER.JS  — v4.5  (VERIFIED BUILD 2026-10-14)
+   SCREENER.JS  — v4.10  (WS-only B/S build)
    + Default strategy = Momentum (single strategy)
    + Fixed # column (rank from server)
    + Gap % = BS table (day_open vs prev_close)
    + Volume column (same BS fetch)
-   + SSE only (WS → LTP, 30s BS → Buy/Sell/Vol)
+   + SSE only (WS → LTP; B/S → depth WS)
    + PRE-OPEN / DAY OPEN / RSI columns (Momentum)
    + RSI CHIP BAR nahi — "🔒 RSI Chips" filter button (click → table)
    + Pivot / Target-SL columns REMOVED (momentum se)
    + "Buy / Sell" header → "B/S Volume"; compact controls (Capital same row)
-   + 📥 Fetch Historical button (Angel REST 1m+5m, 2 days)
+   + 📥 Fetch Historical button (Angel REST 1m+5m)
    v4.4: gap% BS columns pe; orb.serverTime crash fix; safety stubs
+   v4.10: B/S Volume column ab SIRF Angel depth WS (mode-3) se —
+          minute REST 'bs' event ab depth cells ko stomp nahi karta
+          (null aaye to purana depth value preserve hota hai).
+          + har cell pe source/age marker (WS = green dot, >20s = dim)
+          + header me live coverage badge: "B/S WS:<n>"
    v4.5: SCOPE FIX — unclosed if + orphan tail removed (runtime-verified:
          saari global functions scope-clean hain)
    ============================================================ */
@@ -42,6 +47,12 @@ let SCREENER_SORT_BY = 'change';
 let SCREENER_SORT_DIR = 'desc';
 
 let SCREENER_ACTIVE_STRATEGY = 'momentum';
+
+/* v4.10: depth (WS) tracking — B/S ka sirf yahi source hai */
+const DEPTH_SEEN = new Map();          // token -> client ts of last depth packet
+let SCREENER_BS_SOURCE = 'ws';         // server 'bs' event se confirm hota hai
+let DEPTH_BADGE_TIMER = null;
+
 
 const NIFTY50_TOKEN = '99926000';
 const CURRENT_STRATEGY = 'momentum';
@@ -388,26 +399,56 @@ function updateLTPCells(ticks, vwaps, rsis) {
 }
 
 /* ============================================================
-   SECTION 3.35 — DEPTH CELLS (v4.9): tick-by-tick buyers/sellers (mode-3 depth se)
+   SECTION 3.35 — DEPTH CELLS (v4.10): B/S = SIRF WS depth (mode-3)
+   - server har 500ms me un tokens ka batch bhejta hai jinka book badla
+   - REST ab is column ko touch nahi karta (stomp bug fix)
    ============================================================ */
+function depthLiveCount(winMs = 5000) {
+  const now = Date.now();
+  let n = 0;
+  for (const [, ts] of DEPTH_SEEN) if (now - ts <= winMs) n++;
+  return n;
+}
+
+function depthBadgeText() {
+  return ` · B/S ${SCREENER_BS_SOURCE === 'rest' ? 'REST' : 'WS'}:${depthLiveCount()}`;
+}
+
+function updateDepthBadge() {
+  const count = document.getElementById('screenerCount');
+  if (!count) return;
+  const base = count.dataset.base || count.textContent.split(' · ')[0];
+  count.dataset.base = base;
+  count.textContent = base + depthBadgeText();
+}
+
+function startDepthBadgeTimer() {
+  if (DEPTH_BADGE_TIMER) return;
+  DEPTH_BADGE_TIMER = setInterval(updateDepthBadge, 2000);   // stale tokens badge se gir jaayein
+}
+
 function updateDepthCells(depth) {
   const rows = document.querySelectorAll('#screenerBody tr[data-token]');
-  if (!rows.length) return;
   const rowMap = {};
   rows.forEach(r => { rowMap[r.dataset.token] = r; });
+  const now = Date.now();
   for (const [token, d] of Object.entries(depth)) {
+    DEPTH_SEEN.set(token, now);
     const existing = SCREENER_BS[token] || {};
     SCREENER_BS[token] = {
       buyQty: d.b ?? existing.buyQty,
       sellQty: d.s ?? existing.sellQty,
       volume: existing.volume,
-      rank: existing.rank
+      rank: existing.rank,
+      bsSrc: 'depth',          // v4.10: source marker
+      bsTs: now                // v4.10: kitna fresh hai
     };
     const row = rowMap[token];
     if (!row) continue;
     const bsEl = row.querySelector('.bs-cell');
     if (bsEl) bsEl.innerHTML = renderBuySellCell(token);
   }
+  updateDepthBadge();
 }
 
 /* ============================================================
@@ -416,16 +457,23 @@ function updateDepthCells(depth) {
 function renderBuySellCell(token) {
   const bs = SCREENER_BS[token];
   if (!bs || bs.buyQty == null || bs.sellQty == null) {
-    return '<span style="color:var(--text-muted)">—</span>';
+    return '<span style="color:var(--text-muted)" title="Depth WS me ye token nahi / book update nahi aaya">—</span>';
   }
-  const total = bs.buyQty + bs.sellQty;
+  const total = (+bs.buyQty) + (+bs.sellQty);
   if (total <= 0) return '<span style="color:var(--text-muted)">—</span>';
   const buyPct = (bs.buyQty / total) * 100;
   const sellPct = 100 - buyPct;
   const color = buyPct > 55 ? 'var(--success)' : buyPct < 45 ? 'var(--danger)' : 'var(--text-secondary)';
   const arrow = buyPct > 55 ? '▲' : buyPct < 45 ? '▼' : '•';
+  // v4.10: freshness — depth packet kitna purana (WS live = green dot)
+  const ageSec = bs.bsTs ? Math.round((Date.now() - bs.bsTs) / 1000) : null;
+  const fresh = ageSec != null && ageSec <= 5;
+  const dim = ageSec != null && ageSec > 20;
+  const dot = bs.bsSrc === 'depth'
+    ? `<span style="color:${fresh ? 'var(--success)' : 'var(--text-muted)'};font-size:8px" title="WS depth · ${ageSec}s pehle">●</span> `
+    : '';
   return `
-    <div style="display:flex;flex-direction:column;gap:2px;min-width:80px">
+    <div style="display:flex;flex-direction:column;gap:2px;min-width:80px;opacity:${dim ? 0.5 : 1}">
       <div style="display:flex;justify-content:space-between;font-size:11px;font-weight:700;color:${color}">
         <span>${arrow} ${buyPct.toFixed(0)}%</span>
         <span style="color:var(--text-muted);font-weight:500">${sellPct.toFixed(0)}%</span>
@@ -433,7 +481,7 @@ function renderBuySellCell(token) {
       <div style="background:rgba(225,112,85,0.25);border-radius:3px;height:6px;overflow:hidden;position:relative">
         <div style="position:absolute;left:0;top:0;bottom:0;width:${buyPct}%;background:var(--success)"></div>
       </div>
-      <div style="font-size:9px;color:var(--text-muted);font-family:ui-monospace,monospace">${(+bs.buyQty).toLocaleString('en-IN')} / ${(+bs.sellQty).toLocaleString('en-IN')}</div>
+      <div style="font-size:9px;color:var(--text-muted);font-family:ui-monospace,monospace">${dot}${(+bs.buyQty).toLocaleString('en-IN')} / ${(+bs.sellQty).toLocaleString('en-IN')}</div>
     </div>`;
 }
 
@@ -670,11 +718,15 @@ async function loadLTP() {
         if (item.buyQty != null || item.sellQty != null || item.rank != null) {
           const existing = SCREENER_BS[item.token] || {};
           SCREENER_BS[item.token] = {
-            buyQty: item.buyQty ?? existing.buyQty,
-            sellQty: item.sellQty ?? existing.sellQty,
-            volume: item.bsVolume ?? existing.volume,
-            rank: item.rank ?? existing.rank
+            buyQty: item.buyQty ?? existing.buyQty ?? null,
+            sellQty: item.sellQty ?? existing.sellQty ?? null,
+            volume: item.bsVolume ?? existing.volume ?? null,
+            rank: item.rank ?? existing.rank ?? null,
+            // v4.10: source + age (server depth bhejta hai to bsSrc='depth')
+            bsSrc: (item.buyQty != null ? (item.bsSrc || 'rest') : existing.bsSrc) || null,
+            bsTs: (item.buyQty != null ? Date.now() - ((item.bsAge || 0) * 1000) : existing.bsTs) || null
           };
+          if (item.bsSrc === 'depth' && item.buyQty != null) DEPTH_SEEN.set(String(item.token), Date.now() - ((item.bsAge || 0) * 1000));
         }
       }
     }
@@ -690,6 +742,7 @@ function startSSE() {
   if (SCREENER_SSE) return;
   const url = API + '/api/screener/stream?token=' + encodeURIComponent(getToken());
   SCREENER_SSE = new EventSource(url);
+  startDepthBadgeTimer();   // v4.10: B/S WS coverage badge live rakho
 
   SCREENER_SSE.addEventListener('hello', () => {
     console.log('📡 SSE connected');
@@ -707,8 +760,22 @@ function startSSE() {
         updateLTPCells(msg.ticks, msg.vwaps, msg.rsis);
       }
       else if (msg.type === 'bs' && msg.bs) {
+        if (msg.bsSource) SCREENER_BS_SOURCE = msg.bsSource;
         for (const [token, v] of Object.entries(msg.bs)) {
-          SCREENER_BS[token] = { buyQty: v.buyQty, sellQty: v.sellQty, volume: v.volume, rank: v.rank };
+          // v4.10: REST STOMP FIX — buyQty/sellQty null aaye to purana DEPTH value
+          // preserve karo (pehle yahan REST value depth ko overwrite kar deti thi).
+          const existing = SCREENER_BS[token] || {};
+          const keepDepth = (v.buyQty == null || v.sellQty == null) && existing.bsSrc === 'depth';
+          SCREENER_BS[token] = {
+            buyQty: v.buyQty ?? (keepDepth ? existing.buyQty : null),
+            sellQty: v.sellQty ?? (keepDepth ? existing.sellQty : null),
+            volume: v.volume ?? existing.volume ?? null,
+            rank: v.rank ?? existing.rank ?? null,
+            bsSrc: v.buyQty != null ? (v.bsSrc || 'rest') : (keepDepth ? 'depth' : null),
+            bsTs: v.buyQty != null
+              ? (Date.now() - ((v.bsAge || 0) * 1000))
+              : (keepDepth ? existing.bsTs : null)
+          };
           if (v.preopenPrice != null) SCREENER_PREOPEN[token] = { price: v.preopenPrice };
           if (v.dayOpen != null) SCREENER_DAY_OPEN[token] = v.dayOpen;
           if (v.rsi != null) SCREENER_RSI[token] = v.rsi;
@@ -818,7 +885,10 @@ function renderScreenerTable() {
         : `<tr><td colspan="14" style="text-align:center;padding:60px;color:var(--text-muted)">
             Loading stocks...<br>Please wait a few seconds.
           </td></tr>`;
-      if (count) count.textContent = `0 / ${SCREENER_ALL_STOCKS.length}`;
+      if (count) {
+        count.dataset.base = `0 / ${SCREENER_ALL_STOCKS.length}`;
+        count.textContent = count.dataset.base + depthBadgeText();
+      }
       renderChips();
       return;
     }
@@ -874,7 +944,10 @@ function renderScreenerTable() {
         <td class="cell-action"><span style="color:var(--text-muted);font-size:11px">—</span></td></tr>`;
     }).join('');
 
-    if (count) count.textContent = `${sorted.length} / ${SCREENER_ALL_STOCKS.length} shown`;
+    if (count) {
+      count.dataset.base = `${sorted.length} / ${SCREENER_ALL_STOCKS.length} shown`;   // v4.10
+      count.textContent = count.dataset.base + depthBadgeText();
+    }
     renderChips();
     return;
   }

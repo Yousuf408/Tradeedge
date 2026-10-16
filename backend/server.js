@@ -2078,7 +2078,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
           sellQty: r.sellQty,
           ltp: r.ltp,
           volume: r.volume,
-          dayOpen: r.dayOpen ?? existing.dayOpen ?? null,
+          dayOpen: r.dayOpen ?? null,
           rank: existing.rank ?? null,
           preopenPrice: existing.preopenPrice ?? null,
           preopenAt: existing.preopenAt ?? null,

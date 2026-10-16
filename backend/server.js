@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.4
+   server.js — TradeAlgo Pro backend  |  v5.21
    v5.1: Margin service JWT fallback
    v5.2: BS upsert writes day_high/low/close/prev_close;
    v5.3: prev_close hardening —
@@ -19,6 +19,12 @@
            cap MAX_ENTRIES (default 10)
          - cands me dayOpen jata hai → autoTrader v1.3 SL = DAY OPEN rakhta hai
          - buildChipList gap filter bhi >= 3% exclude (consistency)
+   v5.21 (2026-10-16): STALE DAY-OPEN FIX —
+         - bsFreshDate flag: entry engine sirf tab chalta hai jab aaj ki
+           strategy_bs_snapshot.day_open (Angel q.open) actually write ho chuki ho
+         - scheduleMorningPreload ab bsCache + chipList + bsFreshDate clear karta hai
+           (purani din ki day_open cache se 9:15:00 pe instant entries ruk gayi)
+         - ±20% sanity check: day_open vs prev_close band se bahar = skip
    ============================================================ */
 
 import express from 'express';
@@ -2022,6 +2028,7 @@ async function autoFetchPreopen() {
 let bsIntervalTimer = null;
 let bsRunning = false;
 let prevSyncDate = null;   // v5.3: din me ek baar prev_close cache sync
+let bsFreshDate = null;    // v5.21: date for which strategy_bs_snapshot.day_open is TODAY's (entry engine gate)
 
 async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
   if (bsRunning) { if (!silent) console.log('💹 Auto-BS: previous run in progress — skipping'); return; }
@@ -2150,6 +2157,8 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
              fetched_at=EXCLUDED.fetched_at`,
           [p.date, bTokens, bSyms, bBuy, bSell, bLtp, bVol, bOpen, bHigh, bLow, bClose, bPivot, bPrevClose, bRsi, fetchedAt]
         );
+        // v5.21: today's day_open is now the authoritative source for the entry engine
+        bsFreshDate = p.date;
       } catch (e) { dbErrors.push(`bulk-bs: ${e.message}`); }
     }
 
@@ -2287,6 +2296,10 @@ async function buildChipList(date) {
      - Restart-safe: aaj ke positions DB se loaded hain to un tokens ko
        already-entered maante hain
      - cand me dayOpen bhi jata hai → autoTrader v1.3 SL = DAY OPEN banata hai
+
+   v5.21: HARD GATE — `bsFreshDate !== date` ho to scan skip.
+          Isse 9:15:00–9:15:10 ke beech stale (yesterday) day_open pe entry nahi hoti.
+          Plus ±20% day_open-vs-prev_close sanity check per candidate.
    ============================================================ */
 const MAX_ENTRIES = Number(process.env.MAX_ENTRIES || 10);
 const ENTRY_OPEN_GAIN_PCT = Number(process.env.ENTRY_OPEN_GAIN_PCT || 1.0);   // open se +1% cross = entry
@@ -2314,6 +2327,10 @@ function runEntryScan(date) {
       }
     }
 
+    // v5.21: HARD GATE — do NOT scan until today's real day_open is in bsCache.
+    // Warna 9:15:00 pe yesterday ka day_open use ho jata hai (instant fake entries).
+    if (bsFreshDate !== date) return;
+
     const ist = getIST();
     const dow = ist.getUTCDay();
     if (dow < 1 || dow > 5 || !isTradingDay(ist)) return;
@@ -2330,6 +2347,10 @@ function runEntryScan(date) {
       const dayOpen = bs.dayOpen ?? null;
       const prevClose = prevCloseCache.get(token) || null;
       if (!dayOpen || !prevClose || prevClose <= 0) continue;
+
+      // v5.21: day_open must be within ±20% of prev_close — else it's stale/misaligned
+      if (Math.abs((dayOpen - prevClose) / prevClose) * 100 > 20) continue;
+
       const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
       if (gapPct >= ENTRY_GAP_MAX_PCT) continue;                   // gap-up >= 3% = avoid
       const ltp = getCachedLTP(token);
@@ -2368,7 +2389,7 @@ function startEntryEngine() {
     const p = getScreenerPhase();
     if (p && p.date) runEntryScan(p.date);
   }, ENTRY_SCAN_MS);
-  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | rule: open-gain >= +${ENTRY_OPEN_GAIN_PCT}% & gap < ${ENTRY_GAP_MAX_PCT}% & change% > 0 | cap ${MAX_ENTRIES}`);
+  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | rule: open-gain >= +${ENTRY_OPEN_GAIN_PCT}% & gap < ${ENTRY_GAP_MAX_PCT}% & change% > 0 | cap ${MAX_ENTRIES} | v5.21 fresh-BS gate ON`);
 }
 
 async function loadChipListFromDB(date) {
@@ -2603,6 +2624,14 @@ function scheduleMorningPreload() {
   const ms = msUntil(9, 0);
   console.log(`⏰ Next morning preload in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
+    // v5.21: STALE DAY-OPEN KILL — purge yesterday's bsCache / chipList / freshness flag
+    // Warna entry engine 9:15:00 pe purani day_open pe instant entries le leta hai.
+    bsFreshDate = null;
+    bsCache.clear();
+    chipList.clear();
+    chipDate = null;
+    console.log('🧹 v5.21 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
     await loadTodayClosesFromDB();
@@ -2669,7 +2698,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.13`);
+  console.log(`✅ Server on port ${PORT} — v5.21`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 
@@ -2735,6 +2764,10 @@ app.listen(PORT, async () => {
         if (+rows[0].cnt === 0) {
           console.log('🔔 Late startup — running auto-BS catch-up');
           await autoFetchBS();
+        } else {
+          // v5.21: late-start me bhi bsFreshDate set karo agar aaj ki rows maujood hain
+          bsFreshDate = pB.date;
+          console.log('🔔 Late startup — bsFreshDate set from existing rows');
         }
       } catch (e) { console.error('BS catch-up failed:', e.message); }
     }
@@ -2748,7 +2781,7 @@ app.listen(PORT, async () => {
   scheduleFinalFlush();
   scheduleMorningPreload();
   startMarginRefreshLoop();
-  startEntryEngine();   // v5.20: Top Performing entry trigger (9:15–11:00, 5s scan)
+  startEntryEngine();   // v5.20: Top Performing entry trigger (9:15–11:00, 5s scan) · v5.21: fresh-BS gate
 
   maybeRefreshMargins('angelone', { force: true }).catch(() => {});
 

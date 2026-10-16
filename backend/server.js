@@ -815,6 +815,7 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
   const isFive = Number(prevKey.slice(3)) % 5 === 4;
   const tss = tokens.map(() => prevTs);
   const vols5 = isFive ? tokens.map(t => (minVolRing.get(t) || []).reduce((a, b) => a + b, 0)) : [];
+  const vwaps = tokens.map(t => lastWsAvg.get(t) ?? 0);   // v5.22 fix
   try {
     await db.query(
       `UPDATE strategy_bs_snapshot AS s
@@ -2698,7 +2699,7 @@ registerAdminRoutes(app, {
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.21`);
+  console.log(`✅ Server on port ${PORT} — v5.22`);
   console.log(`📊 Strategies: Momentum + Advance ORB`);
   console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
 

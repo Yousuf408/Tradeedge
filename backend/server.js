@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.22
+   server.js — TradeAlgo Pro backend  |  v5.23 (Live Volume)
    ============================================================ */
 
 import express from 'express';
@@ -611,13 +611,22 @@ function parsePreopen(json) {
    ============================================================ */
 const lastLtpAt = new Map();
 const lastWsVolume = new Map();
+const prevCumVol = new Map();
 const lastWsAvg = new Map();
 const vwapPV = new Map();
 const vwapV = new Map();
 let vwapDate = null;
-const prevCumVol = new Map();
 const minVolRing = new Map();
 let wsMinuteKey = null;
+
+// Helper to get live cumulative volume for entry engine
+function getLiveVol(token) {
+  const tk = String(token);
+  const currentCum = lastWsVolume.get(tk) || 0;
+  const prevMinEnd = prevCumVol.get(tk) || 0;
+  const vol = currentCum - prevMinEnd;
+  return vol > 0 ? vol : 0;
+}
 
 async function flushWSMinuteClose(prevKey, prevTs, date) {
   const tokens = [], closes = [], minVols = [];
@@ -1809,7 +1818,7 @@ registerAdminRoutes(app, { db, SECRET, auth, adminOnly, log, loadHolidaysFromDB 
    ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.22`);
+  console.log(`✅ Server on port ${PORT} — v5.23`);
   initMarginService(db, getBrokerSession);
 
   try { await loginREST(); } catch {}
@@ -1828,7 +1837,8 @@ app.listen(PORT, async () => {
     symByToken: SYM_BY_TOKEN, getLtp: getCachedLTP, getLeverage: (broker, token) => getLeverage(broker, token),
     perTrade: Number(process.env.AUTO_PER_TRADE || 25000),
     stocks: STOCKS, getBsCache: () => bsCache, getPrevClose: (t) => prevCloseCache.get(String(t)),
-    getWsVols: (t) => wsTodayVols.get(String(t)), getBsFreshDate: () => bsFreshDate,
+    getWsVols: (t) => wsTodayVols.get(String(t)), getLiveVol: getLiveVol, // <--- Passed Live Vol
+    getBsFreshDate: () => bsFreshDate,
     getScreenerPhase: getScreenerPhase, isTradingDay: isTradingDay, getIST: getIST,
     getUserCapital: () => userCapital, CHIP_TEST_MODE: CHIP_TEST_MODE
   });

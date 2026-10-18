@@ -1,5 +1,5 @@
 /* ============================================================
-   autoTrader.js — v1.4 (Clean Architecture + Volume Entry)
+   autoTrader.js — v1.6 (Live Volume + 1s Scan)
    ============================================================ */
 
 const BE_TRIGGER_PCT = Number(process.env.AT_BE_PCT ?? 0.7);
@@ -15,7 +15,7 @@ const ENTRY_MIN_VOL = Number(process.env.ENTRY_MIN_VOL || 100000);              
 const ENTRY_GAP_MAX_PCT = Number(process.env.ENTRY_GAP_MAX_PCT || 3.0);
 const ENTRY_START_MIN = Number(process.env.ENTRY_START_MIN || 9 * 60 + 15);
 const ENTRY_END_MIN = Number(process.env.ENTRY_END_MIN || 11 * 60);
-const ENTRY_SCAN_MS = Number(process.env.ENTRY_SCAN_MS || 5000);
+const ENTRY_SCAN_MS = Number(process.env.ENTRY_SCAN_MS || 1000); // 1 second
 
 let deps = {}; 
 let entryDay = null;
@@ -51,8 +51,8 @@ export function initAutoTrader(dependencies) {
   getLev = deps.getLeverage || null;
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
   
-  console.log(`🤖 AutoTrader v1.4 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | SL=DayOpen · T1=+${T1_PCT}%`);
-  console.log(`🎯 Entry Engine (AutoTrader) ON — Min: +${ENTRY_OPEN_GAIN_PCT}%, Max: +${ENTRY_MAX_OPEN_GAIN_PCT}%, Vol: ${ENTRY_MIN_VOL}`);
+  console.log(`🤖 AutoTrader v1.6 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | SL=DayOpen · T1=+${T1_PCT}%`);
+  console.log(`🎯 Entry Engine ON — Scan: ${ENTRY_SCAN_MS/1000}s | Min: +${ENTRY_OPEN_GAIN_PCT}%, Max: +${ENTRY_MAX_OPEN_GAIN_PCT}%, Live Vol > 1L`);
   
   startSquareOffWatch();
   startEntryEngine();
@@ -73,7 +73,6 @@ function runEntryScan(date) {
       }
     }
 
-    // Gate: Don't trade if today's day_open is not in cache yet
     if (deps.getBsFreshDate() !== date) return;
 
     const ist = deps.getIST();
@@ -113,20 +112,13 @@ function runEntryScan(date) {
       // Max +3% (No chasing)
       if (openGainPct >= ENTRY_MAX_OPEN_GAIN_PCT) continue;        
 
-      // Volume >= 1 Lakh in the last 1-minute candle
-      const volArr = deps.getWsVols(token) || [];
-      const lastMinVol = volArr.length > 0 ? volArr[volArr.length - 1] : 0;
-      if (lastMinVol < ENTRY_MIN_VOL) continue;                    
-
-      const changePct = ((ltp - prevClose) / prevClose) * 100;
-      if (changePct <= 0) continue;
-      
-      const rsi = bs.rsi ?? null;
-      if (!deps.CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;
+      // LIVE Volume Check
+      const liveVol = deps.getLiveVol(token);
+      if (liveVol < ENTRY_MIN_VOL) continue;                    
 
       cands.push({
         token, sym: st.sym, dayOpen: +(+dayOpen).toFixed(2),
-        gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), changePct: +changePct.toFixed(2)
+        gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2)
       });
     }
     
@@ -139,7 +131,7 @@ function runEntryScan(date) {
 
     const hh = String(ist.getUTCHours()).padStart(2, '0');
     const mi = String(ist.getUTCMinutes()).padStart(2, '0');
-    console.log(`🎯 Entry trigger ${hh}:${mi} — ${list.length} BUY: ${list.map(c => `${c.sym}(+${c.openGainPct}%, Vol>1L)`).join(', ')} | today ${entryCount}/${MAX_ENTRIES}`);
+    console.log(`🎯 Entry trigger ${hh}:${mi} — ${list.length} BUY: ${list.map(c => `${c.sym}(+${c.openGainPct}%, LiveVol>1L)`).join(', ')} | today ${entryCount}/${MAX_ENTRIES}`);
 
     const users = [...deps.getUserCapital().entries()].map(([userId, capital]) => ({ userId, capital }));
     if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000) });

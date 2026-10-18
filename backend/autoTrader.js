@@ -1,29 +1,39 @@
 /* ============================================================
-   autoTrader.js — v1.3 (Top Performing entry rules)
+   autoTrader.js — v1.4 (Clean Architecture + Volume Entry)
    ------------------------------------------------------------
    - Capital user ke browser se real-time aata hai (POST /api/auto/capital)
-     → server memory me per-user; DB me capital SAVE NAHI hota
    - Positions per-user: auto_positions me user_id ke saath (DB = record)
-   - Qty = floor(user_capital × leverage / LTP)  ← page ke MAXQTY jaisi
-   - v1.3 TRADE RULES (server v5.20 entry engine ke saath):
-       · Candidate universe = Top Performing chip (gap-up <3% wale stocks)
-       · Entry  = day-open se +1% cross hone pe (9:15–11:00 window, server side)
+   - Qty = floor(user_capital × leverage / LTP)
+   - v1.4 TRADE RULES:
+       · Candidate Universe = Passed from server.js
+       · Entry  = day-open se +1% cross (Max +3% buffer)
+       · Volume = Latest 1-min candle >= 1 Lakh
        · SL     = DAY OPEN price (initial)
-       · +0.7%  = entry se upar → SL = COST (entry price)      [stage 1]
-       · T1 +1% = hit → SL = T1, phir TRAIL ON (peak − 0.2%)   [stage 2]
-       · T2 +1.5% = milestone — trail continue, koi booking nahi [stage 3]
-       · Exit = LTP ≤ SL (SL / BE_SL / TRAIL_SL) ya 15:00 square-off
-   - LIVE mode (AUTO_TRADE=true): broker account EK hai (server wala),
-     isliye broker order har token pe EK BAAR jata hai (pehle position ki qty);
-     baaki users ki positions paper-mirror hoti hain.
-   - PAPER mode (default): koi broker order nahi, sirf per-user book
+       · +0.7%  = entry se upar → SL = COST (entry price)
+       · T1 +1% = hit → SL = T1, phir TRAIL ON (peak − 0.2%)
+       · T2 +1.5% = milestone — trail continue
+       · Exit = LTP ≤ SL ya 15:00 square-off
    ============================================================ */
 
-/* v1.3: trade rule constants (env se override possible) */
-const BE_TRIGGER_PCT = Number(process.env.AT_BE_PCT ?? 0.7);    // entry +0.7% → SL = cost
-const T1_PCT         = Number(process.env.AT_T1_PCT ?? 1.0);    // T1 = entry +1%
-const T2_PCT         = Number(process.env.AT_T2_PCT ?? 1.5);    // T2 = entry +1.5% (milestone)
-const TRAIL_PCT      = Number(process.env.AT_TRAIL_PCT ?? 0.2); // T1 ke baad peak se trail %
+const BE_TRIGGER_PCT = Number(process.env.AT_BE_PCT ?? 0.7);
+const T1_PCT         = Number(process.env.AT_T1_PCT ?? 1.0);
+const T2_PCT         = Number(process.env.AT_T2_PCT ?? 1.5);
+const TRAIL_PCT      = Number(process.env.AT_TRAIL_PCT ?? 0.2);
+
+/* Entry Engine Constants */
+const MAX_ENTRIES = Number(process.env.MAX_ENTRIES || 10);
+const ENTRY_OPEN_GAIN_PCT = Number(process.env.ENTRY_OPEN_GAIN_PCT || 1.0);       // Min +1%
+const ENTRY_MAX_OPEN_GAIN_PCT = Number(process.env.ENTRY_MAX_OPEN_GAIN_PCT || 3.0); // Max +3%
+const ENTRY_MIN_VOL = Number(process.env.ENTRY_MIN_VOL || 100000);                // Min 1 Lakh
+const ENTRY_GAP_MAX_PCT = Number(process.env.ENTRY_GAP_MAX_PCT || 3.0);
+const ENTRY_START_MIN = Number(process.env.ENTRY_START_MIN || 9 * 60 + 15);
+const ENTRY_END_MIN = Number(process.env.ENTRY_END_MIN || 11 * 60);
+const ENTRY_SCAN_MS = Number(process.env.ENTRY_SCAN_MS || 5000);
+
+let deps = {}; 
+let entryDay = null;
+const entryTriggered = new Set();
+let entryCount = 0;
 
 let db = null;
 let getJwt = null;
@@ -34,8 +44,8 @@ let getLtp = () => null;
 let getLev = null;
 let live = false;
 
-const positions = new Map();   // `${userId}|${token}` -> pos
-const liveOrdered = new Set(); // token → broker order ja chuka (LIVE mode)
+const positions = new Map();
+const liveOrdered = new Set();
 let posDate = null;
 let sqDoneDate = null;
 
@@ -43,7 +53,9 @@ const getIST = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 const todayIST = () => getIST().toISOString().split('T')[0];
 const pkey = (userId, token) => `${userId}|${token}`;
 
-export function initAutoTrader(deps) {
+export function initAutoTrader(dependencies) {
+  deps = dependencies;
+  
   db = deps.db;
   getJwt = deps.getJwt;
   apiKey = deps.apiKey;
@@ -52,40 +64,128 @@ export function initAutoTrader(deps) {
   getLtp = deps.getLtp || (() => null);
   getLev = deps.getLeverage || null;
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
-  console.log(`🤖 AutoTrader v1.3 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | rules: SL=DayOpen · +${BE_TRIGGER_PCT}%→Cost · T1=+${T1_PCT}%→SL@T1+trail${TRAIL_PCT}% · T2=+${T2_PCT}% milestone`);
+  
+  console.log(`🤖 AutoTrader v1.4 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | SL=DayOpen · T1=+${T1_PCT}%`);
+  console.log(`🎯 Entry Engine (AutoTrader) ON — Min: +${ENTRY_OPEN_GAIN_PCT}%, Max: +${ENTRY_MAX_OPEN_GAIN_PCT}%, Vol: ${ENTRY_MIN_VOL}`);
+  
   startSquareOffWatch();
+  startEntryEngine();
 }
 
-/* ---------- Angel placeOrder (MARKET, INTRADAY) ---------- */
+/* ---------- ENTRY ENGINE ---------- */
+function runEntryScan(date) {
+  try {
+    if (!date) return;
+    if (entryDay !== date) {
+      entryDay = date;
+      entryTriggered.clear();
+      entryCount = 0;
+      if (getPositionDate() === date) {
+        for (const p of getPositions()) entryTriggered.add(String(p.token));
+        entryCount = entryTriggered.size;
+        if (entryCount) console.log(`🎯 Entry engine: ${entryCount} tokens aaj already-entered (DB positions se seed)`);
+      }
+    }
+
+    // Gate: Don't trade if today's day_open is not in cache yet
+    if (deps.getBsFreshDate() !== date) return;
+
+    const ist = deps.getIST();
+    const dow = ist.getUTCDay();
+    if (dow < 1 || dow > 5 || !deps.isTradingDay(ist)) return;
+    
+    const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+    if (mins < ENTRY_START_MIN || mins >= ENTRY_END_MIN) return;
+    if (entryCount >= MAX_ENTRIES) return;
+
+    const cands = [];
+    for (const st of deps.stocks) {
+      const token = String(st.token);
+      if (entryTriggered.has(token)) continue;
+      
+      const bs = deps.getBsCache().get(token);
+      if (!bs) continue;
+      
+      const dayOpen = bs.dayOpen ?? null;
+      const prevClose = deps.getPrevClose(token) || null;
+      if (!dayOpen || !prevClose || prevClose <= 0) continue;
+
+      // Sanity guard (±20%)
+      if (Math.abs((dayOpen - prevClose) / prevClose) * 100 > 20) continue;
+
+      const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
+      if (gapPct >= ENTRY_GAP_MAX_PCT) continue;
+
+      const ltp = deps.getLtp(token);
+      if (!ltp) continue;
+      
+      const openGainPct = ((ltp - dayOpen) / dayOpen) * 100;
+      
+      // NEW: Min +1%
+      if (openGainPct < ENTRY_OPEN_GAIN_PCT) continue;             
+      
+      // NEW: Max +3% (No chasing)
+      if (openGainPct >= ENTRY_MAX_OPEN_GAIN_PCT) continue;        
+
+      // NEW: Volume >= 1 Lakh in the last 1-minute candle
+      const volArr = deps.getWsVols(token) || [];
+      const lastMinVol = volArr.length > 0 ? volArr[volArr.length - 1] : 0;
+      if (lastMinVol < ENTRY_MIN_VOL) continue;                    
+
+      const changePct = ((ltp - prevClose) / prevClose) * 100;
+      if (changePct <= 0) continue;
+      
+      const rsi = bs.rsi ?? null;
+      if (!deps.CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;
+
+      cands.push({
+        token, sym: st.sym, dayOpen: +(+dayOpen).toFixed(2),
+        gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), changePct: +changePct.toFixed(2)
+      });
+    }
+    
+    if (!cands.length) return;
+
+    cands.sort((a, b) => b.openGainPct - a.openGainPct);
+    const list = cands.slice(0, MAX_ENTRIES - entryCount);
+    for (const c of list) entryTriggered.add(c.token);
+    entryCount += list.length;
+
+    const hh = String(ist.getUTCHours()).padStart(2, '0');
+    const mi = String(ist.getUTCMinutes()).padStart(2, '0');
+    console.log(`🎯 Entry trigger ${hh}:${mi} — ${list.length} BUY: ${list.map(c => `${c.sym}(+${c.openGainPct}%)`).join(', ')} | today ${entryCount}/${MAX_ENTRIES}`);
+
+    const users = [...deps.getUserCapital().entries()].map(([userId, capital]) => ({ userId, capital }));
+    if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000) });
+    
+    onEntryScan(list, date, users).catch(e => console.error('🤖 Entry error:', e.message));
+  } catch (e) { console.error('Entry scan failed:', e.message); }
+}
+
+function startEntryEngine() {
+  setInterval(() => {
+    const p = deps.getScreenerPhase();
+    if (p && p.date) runEntryScan(p.date);
+  }, ENTRY_SCAN_MS);
+}
+
+/* ---------- ANGEL PLACE ORDER ---------- */
 async function placeOrder({ token, sym, side, qty }) {
   const jwt = getJwt ? getJwt() : null;
   if (!jwt) throw new Error('No Angel JWT');
   const r = await fetch('https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/placeOrder', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      'X-UserType': 'USER',
-      'X-SourceID': 'WEB',
-      'X-ClientLocalIP': '127.0.0.1',
-      'X-ClientPublicIP': '127.0.0.1',
-      'X-MACAddress': '00:00:00:00:00:00',
-      'X-PrivateKey': apiKey,
+      'Content-Type': 'application/json', 'Accept': 'application/json',
+      'X-UserType': 'USER', 'X-SourceID': 'WEB',
+      'X-ClientLocalIP': '127.0.0.1', 'X-ClientPublicIP': '127.0.0.1',
+      'X-MACAddress': '00:00:00:00:00:00', 'X-PrivateKey': apiKey,
       'Authorization': 'Bearer ' + jwt
     },
     body: JSON.stringify({
-      variety: 'NORMAL',
-      exchange: 'NSE',
-      symboltoken: String(token),
-      transactiontype: side,
-      quantity: qty,
-      ordertype: 'MARKET',
-      producttype: 'INTRADAY',
-      duration: 'DAY',
-      price: 0,
-      squareoff: 0,
-      stoploss: 0,
-      tradingsymbol: sym
+      variety: 'NORMAL', exchange: 'NSE', symboltoken: String(token),
+      transactiontype: side, quantity: qty, ordertype: 'MARKET',
+      producttype: 'INTRADAY', duration: 'DAY', price: 0, squareoff: 0, stoploss: 0, tradingsymbol: sym
     })
   });
   const j = await r.json();
@@ -93,7 +193,7 @@ async function placeOrder({ token, sym, side, qty }) {
   return j.data?.orderid || null;
 }
 
-/* ---------- ENTRY: scan ke baad, per-user positions ---------- */
+/* ---------- ENTRY EXECUTION ---------- */
 export async function onEntryScan(cands, date, users) {
   if (posDate !== date) {
     positions.clear();
@@ -104,16 +204,14 @@ export async function onEntryScan(cands, date, users) {
     for (const c of cands) {
       const token = String(c.token);
       const key = pkey(u.userId, token);
-      if (positions.has(key)) continue;                    // no re-entry (per user)
+      if (positions.has(key)) continue; 
+      
       const ltp = getLtp(token);
       if (!ltp || ltp <= 0) continue;
       const lev = getLev ? getLev('angelone', token) : null;
-      const qty = (lev && lev > 0)
-        ? Math.floor((u.capital * lev) / ltp)              // page MAXQTY jaisi qty
-        : Math.floor(u.capital / (ltp * 0.01));
+      const qty = (lev && lev > 0) ? Math.floor((u.capital * lev) / ltp) : Math.floor(u.capital / (ltp * 0.01));
       if (qty < 1) continue;
 
-      // v1.3: SL = DAY OPEN (entry engine cand.dayOpen bhejta hai); fallback = 1% below entry
       const dayOpen = (c.dayOpen != null && +c.dayOpen > 0) ? +c.dayOpen : null;
       const pos = {
         userId: u.userId, token, sym: c.sym || symByToken[token] || '?', qty,
@@ -128,26 +226,21 @@ export async function onEntryScan(cands, date, users) {
       positions.set(key, pos);
       if (dayOpen == null) console.warn(`🤖 ⚠️ ${pos.sym}: dayOpen missing → SL fallback 1% below entry`);
 
-      // LIVE: broker order token-pe-ek-baar (single account), qty = pehli position
       if (live && !liveOrdered.has(token)) {
         liveOrdered.add(token);
         try {
           const oid = await placeOrder({ token, sym: pos.sym, side: 'BUY', qty: pos.qty });
-          console.log(`🤖 BUY ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl}${dayOpen != null ? '(dayOpen)' : '(fallback)'} T1=${pos.t1} T2=${pos.t2} user=${u.userId} order=${oid}`);
-        } catch (e) {
-          console.error(`🤖 BUY failed ${pos.sym}: ${e.message}`);
-        }
+          console.log(`🤖 BUY ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} order=${oid}`);
+        } catch (e) { console.error(`🤖 BUY failed ${pos.sym}: ${e.message}`); }
       } else if (!live) {
-        console.log(`🤖 [PAPER] BUY ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl}${dayOpen != null ? '(dayOpen)' : '(fallback)'} T1=${pos.t1} T2=${pos.t2} user=${u.userId} (capital ₹${u.capital})`);
+        console.log(`🤖 [PAPER] BUY ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} user=${u.userId}`);
       }
       savePos(pos, date).catch(() => {});
     }
   }
 }
 
-/* ---------- TICK MONITOR: SL / BE / T1 / T2 / trail (sab users) ----------
-   v1.3 stages: 0=fresh (SL@dayOpen) → 1=BE (+0.7% → SL@cost)
-                → 2=T1 hit (SL@T1, trail peak−0.2% ON) → 3=T2 milestone (trail continue) */
+/* ---------- TICK MONITOR ---------- */
 export function onTickPos(token, ltp) {
   const tk = String(token);
   for (const [key, pos] of positions) {
@@ -155,28 +248,21 @@ export function onTickPos(token, ltp) {
     let changed = false;
     const beTrigger = pos.entry * (1 + BE_TRIGGER_PCT / 100);
 
-    // +0.7% entry se upar → SL = COST (entry price)
     if (pos.stage === 0 && ltp >= beTrigger) {
       pos.stage = 1;
       if (pos.entry > pos.sl) pos.sl = pos.entry;
       changed = true;
-      console.log(`🤖 ${pos.sym} +${BE_TRIGGER_PCT}% cross (${ltp}) → SL = COST ${pos.sl} [${pos.userId}]`);
     }
-    // T1 (+1%) hit → SL = T1, trail ON (stage 0 se direct jump bhi possible)
     if ((pos.stage === 0 || pos.stage === 1) && ltp >= pos.t1) {
       pos.stage = 2;
       if (pos.t1 > pos.sl) pos.sl = pos.t1;
       if (ltp > pos.peak) pos.peak = ltp;
       changed = true;
-      console.log(`🤖 ${pos.sym} T1 hit (${ltp}) → SL = T1 ${pos.sl}, trail ${TRAIL_PCT}% ON [${pos.userId}]`);
     }
-    // T2 (+1.5%) = milestone only — trail continue, koi exit nahi
     if (pos.stage === 2 && ltp >= pos.t2) {
       pos.stage = 3;
       changed = true;
-      console.log(`🤖 ${pos.sym} T2 hit (${ltp}) → milestone, trail ${TRAIL_PCT}% continues [${pos.userId}]`);
     }
-    // T1 ke baad trail: peak − 0.2%
     if (pos.stage >= 2) {
       if (ltp > pos.peak) pos.peak = ltp;
       const trail = +(pos.peak * (1 - TRAIL_PCT / 100)).toFixed(2);
@@ -200,11 +286,8 @@ async function exitPosition(pos, price, reason) {
   if (live && !liveOrdered.has('EXIT:' + pos.token)) {
     liveOrdered.add('EXIT:' + pos.token);
     try {
-      const oid = await placeOrder({ token: pos.token, sym: pos.sym, side: 'SELL', qty: pos.qty });
-      console.log(`🤖 SELL ${pos.sym} qty=${pos.qty} @~${price} (${reason}) order=${oid}`);
-    } catch (e) {
-      console.error(`🤖 SELL FAILED ${pos.sym} (${reason}): ${e.message} — MANUAL EXIT NEEDED`);
-    }
+      await placeOrder({ token: pos.token, sym: pos.sym, side: 'SELL', qty: pos.qty });
+    } catch (e) { console.error(`🤖 SELL FAILED ${pos.sym} (${reason}): ${e.message}`); }
   } else if (!live) {
     console.log(`🤖 [PAPER] SELL ${pos.sym} qty=${pos.qty} @${price} (${reason}) [${pos.userId}]`);
   }
@@ -233,7 +316,7 @@ export function squareOffAll(reason) {
   }
 }
 
-/* ---------- DB PERSIST (per-user, restart-safe) ---------- */
+/* ---------- DB PERSIST ---------- */
 async function savePos(p, date) {
   if (!db) return;
   await db.query(
@@ -270,9 +353,7 @@ export async function loadOpenPositions(date, userId) {
     posDate = date;
     const open = rows.filter(r => r.status === 'open').length;
     console.log(`🤖 Positions loaded: ${rows.length} total, ${open} open${userId ? ` (user=${userId})` : ''}`);
-  } catch (e) {
-    console.error('🤖 Positions load failed:', e.message);
-  }
+  } catch (e) { console.error('🤖 Positions load failed:', e.message); }
 }
 
 export function getPositions(userId) {
@@ -283,5 +364,4 @@ export function getPositions(userId) {
   return out;
 }
 
-/* v1.3: server entry-engine restart-safe seeding ke liye — positions kis date ke hain */
 export function getPositionDate() { return posDate; }

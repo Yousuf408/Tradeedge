@@ -1,10 +1,5 @@
 /* ============================================================
    server.js — TradeAlgo Pro backend  |  v5.22
-   v5.21: Stale day-open fix (bsFreshDate) + ±20% sanity
-   v5.22: Architecture Cleanup
-          - Moved Entry Logic to autoTrader.js
-          - Fixed vwaps undefined bug in flushWSMinuteClose()
-          - dayOpen fallback strictly null (no stale cache)
    ============================================================ */
 
 import express from 'express';
@@ -1066,6 +1061,10 @@ app.get('/api/screener/chips', auth, (req, res) => {
   res.json({ ok: true, date: chipDate, locked: chipDate != null, chips });
 });
 
+app.get('/api/screener/buyers', auth, (req, res) => {
+  res.json({ ok: true, buyers: Object.fromEntries(buyersInfo) });
+});
+
 const userCapital = new Map();
 
 app.post('/api/auto/capital', auth, (req, res) => {
@@ -1672,6 +1671,96 @@ function msToNextMinute01() {
   return (60 - ist.getUTCSeconds()) * 1000 - ist.getUTCMilliseconds() + 1000;
 }
 
+const bsMinBuy = new Map();
+const bsMinSell = new Map();
+const buyersInfo = new Map();
+
+async function loadBSMinuteArrays(date) {
+  try {
+    const activeTokens = STOCKS.map(s => String(s.token));
+    const { rows } = await db.query(
+      `SELECT token, bs_1min_buy, bs_1min_sell FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND bs_1min_buy IS NOT NULL AND token = ANY($2)`,
+      [date, activeTokens]
+    );
+    bsMinBuy.clear(); bsMinSell.clear();
+    for (const r of rows) {
+      bsMinBuy.set(String(r.token), (r.bs_1min_buy || []).map(x => +x));
+      bsMinSell.set(String(r.token), (r.bs_1min_sell || []).map(x => +x));
+    }
+    if (rows.length) console.log(`⚖️ BS minute arrays loaded: ${rows.length} tokens`);
+  } catch (e) { console.error('BS minute arrays load failed:', e.message); }
+}
+
+function computeBuyersGroups() {
+  buyersInfo.clear();
+  for (const [token, buys] of bsMinBuy) {
+    const sells = bsMinSell.get(token) || [];
+    const n = Math.min(buys.length, sells.length);
+    if (n < 1) continue;
+    let strongMin = 0;
+    let latest = 0;
+    for (let i = 0; i < n; i++) {
+      const tot = buys[i] + sells[i];
+      if (tot <= 0) continue;
+      const r = buys[i] / tot;
+      if (i === n - 1) latest = r;
+      if (r >= 0.55) strongMin++;
+    }
+    if (latest < 0.55) continue;
+    const cont = strongMin >= Math.max(1, Math.ceil(n * 0.6));
+    buyersInfo.set(token, { ratio: +latest.toFixed(3), cont, n });
+  }
+  for (const [token, arr] of depthSec) {
+    if (!arr.length) continue;
+    const latest = arr[arr.length - 1].r;
+    if (latest < 0.55) continue;
+    const strong = arr.filter(x => x.r >= 0.55).length;
+    const cont = strong >= Math.max(1, Math.ceil(arr.length * 0.6));
+    buyersInfo.set(token, { ratio: +latest.toFixed(3), cont, n: arr.length, src: 'depth' });
+  }
+  return buyersInfo;
+}
+
+function broadcastBuyers() {
+  if (!sseClients.size) return;
+  sseSend(`data: ${JSON.stringify({
+    type: 'buyers',
+    buyers: Object.fromEntries([...buyersInfo.entries()].map(([t, v]) => [t, v]))
+  })}\n\n`);
+}
+
+async function appendBSMinuteSnapshot(prevKey, prevTs, date) {
+  const tokens = [], buys = [], sells = [], tss = [];
+  for (const st of STOCKS) {
+    const tk = String(st.token);
+    const dc = depthCache.get(tk);
+    const fresh = dc && (Date.now() - dc.ts) < 5000;
+    const bs = bsCache.get(tk);
+    const bq = fresh ? dc.buyQty : bs?.buyQty;
+    const sq = fresh ? dc.sellQty : bs?.sellQty;
+    if (bq == null || sq == null) continue;
+    tokens.push(tk); buys.push(bq); sells.push(sq); tss.push(prevTs);
+  }
+  if (!tokens.length) return;
+  for (let i = 0; i < tokens.length; i++) {
+    const ab = bsMinBuy.get(tokens[i]) || []; ab.push(buys[i]); bsMinBuy.set(tokens[i], ab);
+    const as_ = bsMinSell.get(tokens[i]) || []; as_.push(sells[i]); bsMinSell.set(tokens[i], as_);
+  }
+  await db.query(
+    `UPDATE strategy_bs_snapshot AS s
+     SET bs_1min_buy  = COALESCE(s.bs_1min_buy,  ARRAY[]::numeric[]) || v.b,
+         bs_1min_sell = COALESCE(s.bs_1min_sell, ARRAY[]::numeric[]) || v.s,
+         bs_1min_ts   = COALESCE(s.bs_1min_ts,   ARRAY[]::timestamptz[]) || v.t
+     FROM unnest($1::text[], $2::numeric[], $3::numeric[], $4::timestamptz[]) AS v(token, b, s, t)
+     WHERE s.date = $5 AND s.token = v.token AND s.strategy_id = 'momentum'`,
+    [tokens, buys, sells, tss, date]
+  );
+  computeBuyersGroups();
+  broadcastBuyers();
+  if (prevKey === '09:20') backfillRsiFirst(date).catch(() => {});
+}
+
 function startBSInterval() {
   if (bsIntervalTimer) return;
   const loop = () => {
@@ -1686,6 +1775,7 @@ function startBSInterval() {
       const prevKey = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
       const date = ist.toISOString().split('T')[0];
       try { await autoFetchBS({ silent: true }); } catch {}
+      try { await appendBSMinuteSnapshot(prevKey, date); } catch {}
       loop();
     }, msToNextMinute01());
   };
@@ -1730,13 +1820,13 @@ app.listen(PORT, async () => {
 
   await loadHolidaysFromDB(); await loadScreenerCacheFromDB(); await loadPrevCloseFromDB(); await loadBSCacheFromDB();
   await loadPrevClosesFromDB(); await loadTodayClosesFromDB(); await loadChipListFromDB(getIST().toISOString().split('T')[0]);
+  await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
   computeBuyersGroups();
 
   initAutoTrader({
     db, getJwt: getJwtREST, apiKey: process.env.ANGEL_API_KEY, clientCode: process.env.ANGEL_CLIENT_ID,
     symByToken: SYM_BY_TOKEN, getLtp: getCachedLTP, getLeverage: (broker, token) => getLeverage(broker, token),
     perTrade: Number(process.env.AUTO_PER_TRADE || 25000),
-    // New dependencies for AutoTrader:
     stocks: STOCKS, getBsCache: () => bsCache, getPrevClose: (t) => prevCloseCache.get(String(t)),
     getWsVols: (t) => wsTodayVols.get(String(t)), getBsFreshDate: () => bsFreshDate,
     getScreenerPhase: getScreenerPhase, isTradingDay: isTradingDay, getIST: getIST,

@@ -1,18 +1,5 @@
 /* ============================================================
    autoTrader.js — v1.4 (Clean Architecture + Volume Entry)
-   ------------------------------------------------------------
-   - Capital user ke browser se real-time aata hai (POST /api/auto/capital)
-   - Positions per-user: auto_positions me user_id ke saath (DB = record)
-   - Qty = floor(user_capital × leverage / LTP)
-   - v1.4 TRADE RULES:
-       · Candidate Universe = Passed from server.js
-       · Entry  = day-open se +1% cross (Max +3% buffer)
-       · Volume = Latest 1-min candle >= 1 Lakh
-       · SL     = DAY OPEN price (initial)
-       · +0.7%  = entry se upar → SL = COST (entry price)
-       · T1 +1% = hit → SL = T1, phir TRAIL ON (peak − 0.2%)
-       · T2 +1.5% = milestone — trail continue
-       · Exit = LTP ≤ SL ya 15:00 square-off
    ============================================================ */
 
 const BE_TRIGGER_PCT = Number(process.env.AT_BE_PCT ?? 0.7);
@@ -55,7 +42,6 @@ const pkey = (userId, token) => `${userId}|${token}`;
 
 export function initAutoTrader(dependencies) {
   deps = dependencies;
-  
   db = deps.db;
   getJwt = deps.getJwt;
   apiKey = deps.apiKey;
@@ -121,13 +107,13 @@ function runEntryScan(date) {
       
       const openGainPct = ((ltp - dayOpen) / dayOpen) * 100;
       
-      // NEW: Min +1%
+      // Min +1%
       if (openGainPct < ENTRY_OPEN_GAIN_PCT) continue;             
       
-      // NEW: Max +3% (No chasing)
+      // Max +3% (No chasing)
       if (openGainPct >= ENTRY_MAX_OPEN_GAIN_PCT) continue;        
 
-      // NEW: Volume >= 1 Lakh in the last 1-minute candle
+      // Volume >= 1 Lakh in the last 1-minute candle
       const volArr = deps.getWsVols(token) || [];
       const lastMinVol = volArr.length > 0 ? volArr[volArr.length - 1] : 0;
       if (lastMinVol < ENTRY_MIN_VOL) continue;                    
@@ -153,7 +139,7 @@ function runEntryScan(date) {
 
     const hh = String(ist.getUTCHours()).padStart(2, '0');
     const mi = String(ist.getUTCMinutes()).padStart(2, '0');
-    console.log(`🎯 Entry trigger ${hh}:${mi} — ${list.length} BUY: ${list.map(c => `${c.sym}(+${c.openGainPct}%)`).join(', ')} | today ${entryCount}/${MAX_ENTRIES}`);
+    console.log(`🎯 Entry trigger ${hh}:${mi} — ${list.length} BUY: ${list.map(c => `${c.sym}(+${c.openGainPct}%, Vol>1L)`).join(', ')} | today ${entryCount}/${MAX_ENTRIES}`);
 
     const users = [...deps.getUserCapital().entries()].map(([userId, capital]) => ({ userId, capital }));
     if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000) });

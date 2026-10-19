@@ -2085,7 +2085,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
           rank: existing.rank ?? null,
           preopenPrice: existing.preopenPrice ?? null,
           preopenAt: existing.preopenAt ?? null,
-          rsi
+          rsi,
           rsiFirst: existing.rsiFirst ?? null // <--- YEH LINE ADD KAREIN
 
         });

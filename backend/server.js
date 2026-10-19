@@ -2304,10 +2304,11 @@ async function buildChipList(date) {
    ============================================================ */
 const MAX_ENTRIES = Number(process.env.MAX_ENTRIES || 10);
 const ENTRY_OPEN_GAIN_PCT = Number(process.env.ENTRY_OPEN_GAIN_PCT || 1.0);   // open se +1% cross = entry
+const ENTRY_MAX_GAIN_PCT = Number(process.env.ENTRY_MAX_GAIN_PCT || 3.0);     // NEW: open se +3% cross = no entry
 const ENTRY_GAP_MAX_PCT = Number(process.env.ENTRY_GAP_MAX_PCT || 3.0);       // gap >= 3% exclude
 const ENTRY_START_MIN = Number(process.env.ENTRY_START_MIN || 9 * 60 + 15);   // 9:15 IST
 const ENTRY_END_MIN = Number(process.env.ENTRY_END_MIN || 11 * 60);           // 11:00 IST
-const ENTRY_SCAN_MS = Number(process.env.ENTRY_SCAN_MS || 5000);
+const ENTRY_SCAN_MS = Number(process.env.ENTRY_SCAN_MS || 1000);              // NEW: 1 second
 
 let entryDay = null;
 const entryTriggered = new Set();   // tokens jinpe aaj entry ja chuki (ya DB me position hai)
@@ -2358,10 +2359,21 @@ function runEntryScan(date) {
       if (!ltp) continue;
       const openGainPct = ((ltp - dayOpen) / dayOpen) * 100;
       if (openGainPct < ENTRY_OPEN_GAIN_PCT) continue;             // open se +1% cross nahi hua
+      
+      // NEW: Max 3% Buffer Check
+      if (openGainPct >= ENTRY_MAX_GAIN_PCT) continue;
+
+      // NEW: Live Volume >= 1 Lakh
+      const currentCum = lastWsVolume.get(token) || 0;
+      const prevMinEnd = prevCumVol.get(token) || 0;
+      const liveVol = currentCum - prevMinEnd;
+      if (liveVol < 100000) continue;                              
+
       const changePct = ((ltp - prevClose) / prevClose) * 100;
       if (changePct <= 0) continue;                                // din me negative → skip
       const rsi = bs.rsi ?? null;
       if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;  // RSI >= 70 (test mode me OFF)
+      
       cands.push({
         token, sym: st.sym, dayOpen: +(+dayOpen).toFixed(2),
         gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), changePct: +changePct.toFixed(2)
@@ -2376,7 +2388,7 @@ function runEntryScan(date) {
 
     const hh = String(ist.getUTCHours()).padStart(2, '0');
     const mi = String(ist.getUTCMinutes()).padStart(2, '0');
-    console.log(`🎯 Entry trigger ${hh}:${mi} — ${list.length} BUY: ${list.map(c => `${c.sym}(open+${c.openGainPct}%,gap+${c.gapPct}%,chg+${c.changePct}%)`).join(', ')} | today ${entryCount}/${MAX_ENTRIES}`);
+    console.log(`🎯 Entry trigger ${hh}:${mi} — ${list.length} BUY: ${list.map(c => `${c.sym}(+${c.openGainPct}%)`).join(', ')} | today ${entryCount}/${MAX_ENTRIES}`);
 
     // v5.7: per-user capital se qty — jo users ka capital real-time aaya hai unke liye
     const users = [...userCapital.entries()].map(([userId, capital]) => ({ userId, capital }));
@@ -2390,7 +2402,7 @@ function startEntryEngine() {
     const p = getScreenerPhase();
     if (p && p.date) runEntryScan(p.date);
   }, ENTRY_SCAN_MS);
-  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | rule: open-gain >= +${ENTRY_OPEN_GAIN_PCT}% & gap < ${ENTRY_GAP_MAX_PCT}% & change% > 0 | cap ${MAX_ENTRIES} | v5.21 fresh-BS gate ON`);
+  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | rule: open-gain >= +${ENTRY_OPEN_GAIN_PCT}% & < ${ENTRY_MAX_GAIN_PCT}% & LiveVol>1L | cap ${MAX_ENTRIES} | v5.21 fresh-BS gate ON`);
 }
 
 async function loadChipListFromDB(date) {
@@ -2782,9 +2794,9 @@ app.listen(PORT, async () => {
   scheduleFinalFlush();
   scheduleMorningPreload();
   startMarginRefreshLoop();
-  startEntryEngine();   // v5.20: Top Performing entry trigger (9:15–11:00, 5s scan) · v5.21: fresh-BS gate
+  startEntryEngine();   // v5.20: Top Performing entry trigger (9:15–11:00, 1s scan) · v5.21: fresh-BS gate
 
   maybeRefreshMargins('angelone', { force: true }).catch(() => {});
 
-  console.log('ℹ️  Schedule: WS@9:14:55 | Preopen@9:13:30 | BS@9:15 (30s) | Quote@9:30 | EntryScan@9:15-11:00 (5s) | HLC@15:31 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');
+  console.log('ℹ️  Schedule: WS@9:14:55 | Preopen@9:13:30 | BS@9:15 (30s) | Quote@9:30 | EntryScan@9:15-11:00 (1s) | HLC@15:31 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');
 });

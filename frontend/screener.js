@@ -1,31 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.6.1  (TOP PERFORMING BUILD)
-   + Default strategy = Momentum (single strategy)
-   + `#` column = TOP PERFORMING index (open-gain% desc) — sirf usi tab me
-   + Gap % = BS table (day_open vs prev_close)
-   + Volume column (same BS fetch)
-   + SSE only (WS → LTP, 30s BS → Buy/Sell/Vol)
-   + PRE-OPEN / DAY OPEN / RSI columns (Momentum)
-   + RSI CHIP BAR nahi — "🔒 RSI Chips" filter button (click → table)
-   + Pivot / Target-SL columns REMOVED (momentum se)
-   + "Buy / Sell" header → "B/S Volume"; compact controls (Capital same row)
-   + 📥 Fetch Historical button (Angel REST 1m+5m, 2 days)
-   v4.4: gap% BS columns pe; orb.serverTime crash fix; safety stubs
-   v4.5: SCOPE FIX — unclosed if + orphan tail removed (runtime-verified:
-         saari global functions scope-clean hain)
-   v4.6: 🏆 TOP PERFORMING tab (DEFAULT) — sirf woh stocks jo DAY OPEN se
-         +0.90% ya usse zyada upar hain. Index numbering (#) = open-gain%
-         descending (sabse zyada gain = #1).
-         Purana change%-wala `#` rank column (server rank_no) UI se HATA DIYA —
-         ab `#` column sirf Top Performing tab me dikhta hai.
-         Server ka rank_no logic untouched (chip-lock usi pe depend karta hai).
-         Live re-rank: SSE ltp ticks pe 2s throttle se table re-render.
-   v4.6.1: negative-change guard — open-gain >= +0.90% KE SAATH change% (vs prev
-           close) bhi > 0 hona zaroori; gap-down recoveries Top Performing me nahi.
-   v4.7: Top Performing rule UPDATE —
-         - open-gain threshold 0.90% → +0.95% (DAY OPEN se)
-         - gap-up >= 3% wale stocks EXCLUDE (fake morning spikes / unsafe entry)
-         Backend entry engine (server v5.20) bhi isi universe se entries leta hai.
+   SCREENER.JS  — v4.7.1 (Prev Close SSE Fix)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -39,39 +13,33 @@ let SCREENER_RSI = {};
 let SCREENER_LEVERAGE = {};
 let SCREENER_MARGIN_PS = {};
 let SCREENER_CHIPS = [];
-let SCREENER_LASTUPD = {};        // v4.4: per-token last BS update time
-let SCREENER_VWAP = {};           // v4.6: live VWAP (ws_1min close+volume se)
-let SCREENER_RSI_FIRST = {};      // v4.6: 9:15 candle ka RSI — poore din FIXED
+let SCREENER_LASTUPD = {};
+let SCREENER_VWAP = {};
+let SCREENER_RSI_FIRST = {};
 let SCREENER_INIT_DONE = false;
 let SCREENER_SSE = null;
 let FETCHING = false;
 let QUOTE_FETCHING = false;
 let DAYHLC_FETCHING = false;
 let EOD_FETCHING = false;
-let HISTORICAL_FETCHING = false;   // v4.1
+let HISTORICAL_FETCHING = false;
 
-let SCREENER_MOMENTUM_FILTER = 'open_gain';   // v4.6: Top Performing = default tab
+let SCREENER_MOMENTUM_FILTER = 'open_gain';
 let SCREENER_SORT_BY = 'open_gain';
 let SCREENER_SORT_DIR = 'desc';
 
-/* v4.7: Top Performing tab ka rule — DAY OPEN se minimum gain % */
 const OPEN_GAIN_MIN_PCT = 0.95;
-/* v4.7: gap-up (day_open vs prev_close) >= itna % ho to stock EXCLUDE —
-   3%+ gap-up = fake move ka risk, safe entry nahi. */
 const OPEN_GAIN_MAX_GAP_PCT = 3.0;
-/* v4.6.1: "negative" stocks rokne ke liye — change% (vs PREV CLOSE) bhi > 0 hona chahiye.
-   Gap-down stocks jo open se recover karke +0.9% dikhte hain par din me abhi bhi
-   negative hain, wo Top Performing me NAHI aayenge. False = purana behaviour. */
 const OPEN_GAIN_REQUIRE_POSITIVE_CHANGE = true;
-let OPEN_GAIN_RANK = {};              // token -> 1..N (open-gain desc, sirf Top Performing tab)
-let OPEN_GAIN_RERENDER_TIMER = null;  // 2s throttle timer
+let OPEN_GAIN_RANK = {};
+let OPEN_GAIN_RERENDER_TIMER = null;
 
 let SCREENER_ACTIVE_STRATEGY = 'momentum';
 
 const NIFTY50_TOKEN = '99926000';
 const CURRENT_STRATEGY = 'momentum';
 
-let PER_TRADE = Number(localStorage.getItem('ta_capital') || 25000);   // v4.6: per-user capital (localStorage)
+let PER_TRADE = Number(localStorage.getItem('ta_capital') || 25000);
 const BATCH_SIZE = 20;
 const BATCH_DELAY = 150;
 
@@ -85,7 +53,7 @@ async function initScreener() {
     return;
   }
   setupControls();
-  postCapital();          // v5.7: page load pe capital sync (server restart ke baad bhi)
+  postCapital();
   await loadStockList();
   await loadLTP();
   await loadChips();
@@ -113,7 +81,6 @@ function renderStrategyControls() {
   const controls = document.querySelector('.screener-controls');
   if (!controls) return;
 
-  // v4.2: compact + wrap — Capital input same row me fit ho
   controls.style.display = 'flex';
   controls.style.flexWrap = 'wrap';
   controls.style.gap = '6px';
@@ -122,11 +89,11 @@ function renderStrategyControls() {
   const btnStyle = 'style="padding:6px 10px;font-size:12px;white-space:nowrap"';
 
   let strategyButtons = '';
-    strategyButtons = `
-      <button id="fetchBSBtn" class="btn btn-primary" ${btnStyle} onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
-      <button id="fetchPreopenBtn" class="btn btn-outline" ${btnStyle} onclick="startPreopenFetch()">📡 Fetch Pre-Open</button>
-      <button id="fetchHistoricalBtn" class="btn btn-outline" ${btnStyle} onclick="startHistoricalFetch()">📥 Fetch Historical</button>
-      <button id="fetchEODBtn" class="btn btn-outline" ${btnStyle} onclick="startEODClosesFetch()">⚙️ Fetch EOD Closes</button>`;
+  strategyButtons = `
+    <button id="fetchBSBtn" class="btn btn-primary" ${btnStyle} onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
+    <button id="fetchPreopenBtn" class="btn btn-outline" ${btnStyle} onclick="startPreopenFetch()">📡 Fetch Pre-Open</button>
+    <button id="fetchHistoricalBtn" class="btn btn-outline" ${btnStyle} onclick="startHistoricalFetch()">📥 Fetch Historical</button>
+    <button id="fetchEODBtn" class="btn btn-outline" ${btnStyle} onclick="startEODClosesFetch()">⚙️ Fetch EOD Closes</button>`;
 
   controls.innerHTML = `
     ${strategyButtons}
@@ -142,7 +109,6 @@ function renderStrategyControls() {
       <div id="progressText" style="font-size:11px;color:var(--text-muted);margin-top:4px;text-align:center">0 / 0</div>
     </div>`;
 
-
   const panelGlass = controls.closest('.panel-glass');
   if (panelGlass && !document.getElementById('stageChips')) {
     const chips = document.createElement('div');
@@ -156,11 +122,10 @@ function renderStrategyControls() {
 function onPerTradeChange() {
   PER_TRADE = +document.getElementById('perTradeInput').value || 25000;
   localStorage.setItem('ta_capital', String(PER_TRADE));
-  postCapital();          // v5.7: server ko real-time batao (per-user qty ke liye)
+  postCapital();
   renderScreenerTable();
 }
 
-/* v5.7: capital server ko bhejo (debounced) — server memory me per-user rakhta hai */
 let CAPITAL_POST_TIMER = null;
 function postCapital() {
   clearTimeout(CAPITAL_POST_TIMER);
@@ -175,10 +140,6 @@ function postCapital() {
   }, 600);
 }
 
-
-/* ============================================================
-   SECTION 2.0 — RSI CHIP BAR
-   ============================================================ */
 async function loadChips() {
   try {
     const r = await fetch(API + '/api/screener/chips', {
@@ -195,14 +156,11 @@ async function loadChips() {
 
 function setMomentumFilter(key) {
   SCREENER_MOMENTUM_FILTER = key;
-  // v4.6: Top Performing tab apne open-gain order me; baaki tabs change% me
   SCREENER_SORT_BY = (key === 'open_gain') ? 'open_gain' : 'change';
   SCREENER_SORT_DIR = 'desc';
   renderScreenerTable();
 }
 
-/* v4.6: Top Performing tab active ho to SSE ticks pe 2s me ek baar re-render
-   (warna naye qualify/drop hone wale stocks + ranking update nahi honge) */
 function scheduleOpenGainRerender() {
   if (SCREENER_MOMENTUM_FILTER !== 'open_gain') return;
   if (OPEN_GAIN_RERENDER_TIMER) return;
@@ -212,7 +170,6 @@ function scheduleOpenGainRerender() {
   }, 2000);
 }
 
-/* v4.7: kitne stocks abhi +0.95% open-gain (gap <3%, change% >0) rule pass kar rahe hain (chip count badge) */
 function countOpenGainStocks() {
   let n = 0;
   for (const s of SCREENER_ALL_STOCKS) if (passesOpenGain(s.token)) n++;
@@ -267,7 +224,7 @@ function getSortValue(stock, field) {
     const v = computeChangePct(stock.token);
     return v === null ? -Infinity : v;
   }
-  if (field === 'open_gain') {                       // v4.6: Top Performing sort
+  if (field === 'open_gain') {
     const og = computeOpenGainPct(stock.token);
     return og === null ? -Infinity : og;
   }
@@ -287,10 +244,6 @@ function sortStocks(stocks) {
 }
 
 /* ============================================================
-   SECTION 3 — FILTER
-   ============================================================ */
-
-/* ============================================================
    SECTION 3.1 — HELPERS
    ============================================================ */
 function computeChangePct(token) {
@@ -301,14 +254,12 @@ function computeChangePct(token) {
 }
 
 function computeGapPct(token) {
-  // v4.4: gap% = BS table ke day_open vs prev_close (q15 candle se nahi)
   const dayOpen = SCREENER_DAY_OPEN[token];
   const prev = SCREENER_PREV_CLOSE[token];
   if (!dayOpen || !prev || prev <= 0) return null;
   return ((dayOpen - prev) / prev) * 100;
 }
 
-/* v4.6: DAY OPEN se gain % = (LTP - dayOpen) / dayOpen * 100 */
 function computeOpenGainPct(token) {
   const ltp = SCREENER_LTP[token];
   const dayOpen = SCREENER_DAY_OPEN[token];
@@ -317,8 +268,6 @@ function computeOpenGainPct(token) {
   return ((+ltp - o) / o) * 100;
 }
 
-/* v4.7: Top Performing ka single gate — filter + count dono yahi use karte hain
-   Rule: open-gain >= +0.95%  AND  change% > 0  AND  gap-up < 3% */
 function passesOpenGain(token) {
   const og = computeOpenGainPct(token);
   if (og === null || og < OPEN_GAIN_MIN_PCT) return false;
@@ -326,12 +275,11 @@ function passesOpenGain(token) {
     const chg = computeChangePct(token);
     if (chg === null || chg <= 0) return false;
   }
-  const gap = computeGapPct(token);                       // v4.7: gap-up >= 3% exclude
+  const gap = computeGapPct(token);
   if (gap !== null && gap >= OPEN_GAIN_MAX_GAP_PCT) return false;
   return true;
 }
 
-/* v4.6: DAY OPEN cell ke neeche chhota open-gain% badge */
 function renderOpenGainSub(token) {
   const og = computeOpenGainPct(token);
   if (og === null) return '';
@@ -447,8 +395,6 @@ function updateLTPCells(ticks, vwaps, rsis) {
       }
     }
 
-
-    // v4.6: open-gain% badge live update (Top Performing ranking 2s throttle se)
     const ogEl = row.querySelector('.ogain-cell');
     if (ogEl) ogEl.innerHTML = renderOpenGainSub(token);
 
@@ -457,14 +403,12 @@ function updateLTPCells(ticks, vwaps, rsis) {
       mqEl.textContent = computeMaxQty(token, +price);
     }
 
-    // v4.7: tick-by-tick VWAP (exchange avg price, SSE ltp event ke saath)
     if (vwaps && vwaps[token] != null) {
       SCREENER_VWAP[token] = vwaps[token];
       const vwEl = row.querySelector('.vwap-cell');
       if (vwEl) vwEl.textContent = '₹' + (+vwaps[token]).toFixed(2);
     }
 
-    // v4.8: tick-by-tick live RSI (SSE ltp event ke saath)
     if (rsis && rsis[token] != null) {
       SCREENER_RSI[token] = rsis[token];
       const rsiEl = row.querySelector('.rsi-cell');
@@ -518,10 +462,6 @@ function renderRSICell(token) {
 }
 
 /* ============================================================
-   SECTION 3.6 — ORB ROW FAST UPDATE
-   ============================================================ */
-
-/* ============================================================
    SECTION 4 — LOAD STOCK LIST + CACHED DATA
    ============================================================ */
 async function loadStockList() {
@@ -531,9 +471,8 @@ async function loadStockList() {
   } catch (e) { console.error('Stock list failed:', e); }
 }
 
-
 /* ============================================================
-   SECTION 5.3 — MANUAL BUY/SELL  [Momentum]
+   SECTION 5.3 — MANUAL BUY/SELL
    ============================================================ */
 async function startBSFetch() {
   const btn = document.getElementById('fetchBSBtn');
@@ -568,7 +507,7 @@ async function startBSFetch() {
 }
 
 /* ============================================================
-   SECTION 5.4 — MANUAL PRE-OPEN FETCH  [Momentum]
+   SECTION 5.4 — MANUAL PRE-OPEN FETCH
    ============================================================ */
 async function startPreopenFetch() {
   const btn = document.getElementById('fetchPreopenBtn');
@@ -603,7 +542,7 @@ async function startPreopenFetch() {
 }
 
 /* ============================================================
-   SECTION 5.5 — MANUAL EOD CLOSES FETCH  [Momentum]
+   SECTION 5.5 — MANUAL EOD CLOSES FETCH
    ============================================================ */
 async function startEODClosesFetch() {
   const btn = document.getElementById('fetchEODBtn');
@@ -640,8 +579,7 @@ async function startEODClosesFetch() {
 }
 
 /* ============================================================
-   SECTION 5.6 — FETCH HISTORICAL (v4.1)
-   Angel REST 1-min + 5-min candles → overwrite WS columns (last 2 days: yesterday + today)
+   SECTION 5.6 — FETCH HISTORICAL
    ============================================================ */
 async function startHistoricalFetch() {
   const btn = document.getElementById('fetchHistoricalBtn');
@@ -768,7 +706,7 @@ function startSSE() {
           updateNiftyHeader();
         }
         updateLTPCells(msg.ticks, msg.vwaps, msg.rsis);
-        scheduleOpenGainRerender();      // v4.6: Top Performing live re-rank (2s)
+        scheduleOpenGainRerender();
       }
       else if (msg.type === 'bs' && msg.bs) {
         for (const [token, v] of Object.entries(msg.bs)) {
@@ -780,6 +718,9 @@ function startSSE() {
           if (v.marginPerShare != null) SCREENER_MARGIN_PS[token] = v.marginPerShare;
           if (v.vwap != null) SCREENER_VWAP[token] = v.vwap;
           if (v.rsiFirst != null) SCREENER_RSI_FIRST[token] = v.rsiFirst;
+          
+          // YEH LINE FIX HAI (Frontend me Prev Close ko update karne ke liye)
+          if (v.prevClose != null) SCREENER_PREV_CLOSE[token] = v.prevClose;
         }
         renderScreenerTable();
       }
@@ -802,7 +743,6 @@ function stopSSE() {
   }
 }
 
-
 /* ============================================================
    SECTION 8 — RENDER
    ============================================================ */
@@ -812,12 +752,7 @@ function renderScreenerTable() {
   const count = document.getElementById('screenerCount');
   if (!head || !body) return;
 
-  /* ============================================================
-     MOMENTUM strategy branch (default)
-     v4.2: Pivot + Target/SL columns removed; Buy/Sell → B/S Volume
-     ============================================================ */
   if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
-    // v4.6: `#` = Top Performing index (open-gain% desc). Baaki tabs me column hi nahi.
     const isOpenGainTab = SCREENER_MOMENTUM_FILTER === 'open_gain';
     const COLSPAN = isOpenGainTab ? 14 : 13;
     head.innerHTML = `<tr>
@@ -842,7 +777,6 @@ function renderScreenerTable() {
     let filtered = [...SCREENER_ALL_STOCKS];
 
     if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
-      // v4.7: 🏆 Top Performing — DAY OPEN se +0.95% upar, gap-up <3%, change% positive
       filtered = filtered.filter(s => passesOpenGain(s.token));
     } else if (SCREENER_MOMENTUM_FILTER === 'top_gainers') {
       filtered = filtered
@@ -874,8 +808,6 @@ function renderScreenerTable() {
       filtered.sort((a, b) => (rankBy[String(a.token)] ?? 999) - (rankBy[String(b.token)] ?? 999));
     }
 
-    // v4.6: Top Performing index number — hamesha open-gain% desc se
-    //        (user dusre column pe sort kare to bhi #1 = best performer rahega)
     OPEN_GAIN_RANK = {};
     if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
       [...filtered]
@@ -957,7 +889,6 @@ function renderScreenerTable() {
     renderChips();
     return;
   }
-
 }
 
 /* ============================================================
@@ -968,17 +899,15 @@ function placeOrder(sym) {
 }
 
 /* ============================================================
-   SECTION 10.1 — SAFETY STUBS (v4.4)
-   ORB removal ke baad koi purana caller (admin.js / cached HTML /
-   purana onclick) in functions ko call kare to page crash na ho.
+   SECTION 10.1 — SAFETY STUBS
    ============================================================ */
 function loadCachedData() { return Promise.resolve(); }
 function startFetch() { if (typeof showToast === 'function') showToast('⚠️ Removed', 'Advance ORB fetch hata diya gaya'); }
 function startQuoteFetch() { if (typeof showToast === 'function') showToast('⚠️ Removed', 'Advance ORB fetch hata diya gaya'); }
 function startDayHLCFetch() { if (typeof showToast === 'function') showToast('⚠️ Removed', 'Advance ORB fetch hata diya gaya'); }
-function onStrategyChange() { /* strategy switch removed — momentum only */ }
-function setStageFilter() { /* ORB filter removed */ }
-function renderChipBar() { /* chip bar removed — RSI Chips filter use karo */ }
+function onStrategyChange() { }
+function setStageFilter() { }
+function renderChipBar() { }
 
 /* ============================================================
    SECTION 10 — HELPERS

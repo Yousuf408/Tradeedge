@@ -1,21 +1,15 @@
 /* ============================================================
-   ADMIN.JS  —  v1.1
+   ADMIN.JS  —  v1.2
    Config, API, TOTP, Auth, Admin panel, Profile, WhatsApp, Modals
 
-   CHANGELOG v1.1 (2026-10-05):
-    - Section 1: API URL auto-detects localhost vs production
-    - Section 12: Login flow now uses pendingToken + server-side
-      TOTP verification. Client no longer trusts its own TOTP check.
-      Compatible with server.js v1.1.
+   CHANGELOG v1.2 (2026-10-21):
+    - Date format in Users table changed to DD-MMM-YYYY
+    - Added 2FA Toggle in Settings (Requires TOTP to disable)
    ============================================================ */
 
 /* ============================================================
    SECTION 1 — CONFIG
    ============================================================ */
-/* API URL auto-detects environment:
-   - localhost / 127.0.0.1 / *.local → http://localhost:3000
-   - everything else                 → production (Render)
-   To override, set window.TRADEALGO_API before this script loads. */
 const API = window.TRADEALGO_API || (() => {
   const h = window.location.hostname;
   if (h === 'localhost' || h === '127.0.0.1' || h.endsWith('.local')) {
@@ -38,7 +32,6 @@ const DURATIONS = {
   '1y':  { label: '1 year',   days: 365 }
 };
 
-
 /* ============================================================
    SECTION 2 — STATE
    ============================================================ */
@@ -58,7 +51,6 @@ const DOM = {
   toastTitle: document.getElementById('toastTitle'),
   toastMessage: document.getElementById('toastMessage')
 };
-
 
 /* ============================================================
    SECTION 3 — API CLIENT
@@ -85,11 +77,8 @@ async function api(path, opts = {}) {
   return data;
 }
 
-
 /* ============================================================
    SECTION 4 — TOTP
-   (local helpers kept for QR generation; verification is now
-    done on the server. Do not rely on these for auth.)
    ============================================================ */
 const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
@@ -118,7 +107,6 @@ async function totpAt(secret, counter) {
   return String(code % 1000000).padStart(6, '0');
 }
 
-/* Kept for optional client-side pre-check. NOT used for auth decisions. */
 async function verifyTotp(secret, input) {
   const step = Math.floor(Date.now() / 1000 / 30);
   for (const c of [step - 1, step, step + 1]) {
@@ -135,7 +123,6 @@ function generateSecret() {
   for (let i = 0; i + 5 <= bits.length; i += 5) out += B32[parseInt(bits.slice(i, i + 5), 2)];
   return out;
 }
-
 
 /* ============================================================
    SECTION 5 — CREDENTIALS CACHE (24h, for WhatsApp sharing)
@@ -156,25 +143,25 @@ function getCachedCredentials(username) {
   } catch { return null; }
 }
 
-
 /* ============================================================
    SECTION 6 — TOAST
    ============================================================ */
 let toastTimeout = null;
 
 function showToast(title, message) {
-  DOM.toastTitle.textContent = title || '✅ Success';
-  DOM.toastMessage.textContent = message || 'Action completed';
-  DOM.toast.classList.add('show');
-  clearTimeout(toastTimeout);
-  toastTimeout = setTimeout(() => DOM.toast.classList.remove('show'), 5000);
+  if (DOM.toastTitle) DOM.toastTitle.textContent = title || '✅ Success';
+  if (DOM.toastMessage) DOM.toastMessage.textContent = message || 'Action completed';
+  if (DOM.toast) {
+    DOM.toast.classList.add('show');
+    clearTimeout(toastTimeout);
+    toastTimeout = setTimeout(() => DOM.toast.classList.remove('show'), 5000);
+  }
 }
 
 function hideToast() {
-  DOM.toast.classList.remove('show');
+  if (DOM.toast) DOM.toast.classList.remove('show');
   clearTimeout(toastTimeout);
 }
-
 
 /* ============================================================
    SECTION 7 — MODAL HELPERS
@@ -193,7 +180,6 @@ document.querySelectorAll('.modal-overlay').forEach(overlay => {
     if (e.target === overlay) closeAllModals();
   });
 });
-
 
 /* ============================================================
    SECTION 8 — NAVIGATION
@@ -218,7 +204,6 @@ DOM.navLinks.forEach(link => link.addEventListener('click', e => {
   if (p) navigateTo(p);
 }));
 
-
 /* ============================================================
    SECTION 9 — AVATAR MENU
    ============================================================ */
@@ -229,7 +214,6 @@ function toggleAvatarMenu(e) {
 document.addEventListener('click', () =>
   document.getElementById('avatarMenu')?.classList.remove('open')
 );
-
 
 /* ============================================================
    SECTION 10 — CHANGE PASSWORD
@@ -273,9 +257,8 @@ async function savePassword() {
   }
 }
 
-
 /* ============================================================
-   SECTION 11 — MY PROFILE
+   SECTION 11 — MY PROFILE & 2FA TOGGLE
    ============================================================ */
 function openMyProfile() {
   closeAllModals();
@@ -289,6 +272,74 @@ function loadProfileForm() {
   document.getElementById('profileMobile').value = currentUser.mobile || '';
   document.getElementById('profileUsername').value = currentUser.username || '';
   document.getElementById('profileRole').value = (currentUser.role || '').toUpperCase();
+
+  // 2FA Toggle UI Inject
+  const panelGlass = document.querySelector('#page-settings .panel-glass');
+  if (panelGlass && !document.getElementById('2fa-toggle-container')) {
+    const toggleContainer = document.createElement('div');
+    toggleContainer.id = '2fa-toggle-container';
+    toggleContainer.style = 'margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--border-soft); display: flex; align-items: center; justify-content: space-between;';
+    toggleContainer.innerHTML = `
+      <div>
+        <div style="font-weight: 700; font-size: 15px; color: var(--text-primary); margin-bottom: 4px;">Two-Factor Authentication (2FA)</div>
+        <div style="font-size: 12px; color: var(--text-muted);">Secure your account with an authenticator app.</div>
+      </div>
+      <label class="switch" style="position:relative; display:inline-block; width:48px; height:24px;">
+        <input type="checkbox" id="totpToggleSwitch" onchange="handle2FAToggle(this)" style="opacity:0; width:0; height:0;">
+        <span class="slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:#555; transition:.4s; border-radius:24px;"></span>
+      </label>
+      <style>
+        input:checked + .slider { background-color: var(--success) !important; }
+        input:checked + .slider:before { transform: translateX(24px); }
+        .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
+      </style>
+    `;
+    panelGlass.appendChild(toggleContainer);
+  }
+
+  const toggle = document.getElementById('totpToggleSwitch');
+  if (toggle) {
+    toggle.checked = currentUser.totpEnabled !== false;
+  }
+}
+
+async function handle2FAToggle(checkbox) {
+  const enable = checkbox.checked;
+  
+  if (enable) {
+    // Turn ON directly
+    try {
+      await api('/api/user/toggle-2fa', {
+        method: 'POST',
+        body: JSON.stringify({ enable: true })
+      });
+      currentUser.totpEnabled = true;
+      setUser(currentUser);
+      showToast('✅ 2FA Enabled', 'Your account is now more secure.');
+    } catch (e) {
+      checkbox.checked = false;
+      showToast('⚠️ Error', e.message);
+    }
+  } else {
+    // Turn OFF requires TOTP code
+    const code = prompt("To disable 2FA, please enter your 6-digit Authenticator Code:");
+    if (!code) {
+      checkbox.checked = true; // revert
+      return;
+    }
+    try {
+      await api('/api/user/toggle-2fa', {
+        method: 'POST',
+        body: JSON.stringify({ enable: false, totpCode: code })
+      });
+      currentUser.totpEnabled = false;
+      setUser(currentUser);
+      showToast('✅ 2FA Disabled', '2FA has been turned off.');
+    } catch (e) {
+      checkbox.checked = true; // revert
+      showToast('⚠️ Error', e.message);
+    }
+  }
 }
 
 async function saveProfile() {
@@ -324,9 +375,8 @@ function updateUserPill() {
   if (ar) ar.textContent = currentUser?.role || '—';
 }
 
-
 /* ============================================================
-   SECTION 12 — LOGIN FLOW  (v1.1 — pendingToken + server TOTP)
+   SECTION 12 — LOGIN FLOW
    ============================================================ */
 function showLoginStep(step) {
   document.getElementById('loginStep1').style.display = step === 1 ? 'block' : 'none';
@@ -336,8 +386,6 @@ function showLoginStep(step) {
   document.getElementById('forgotStep2').style.display = 'none';
 }
 
-/* Step 1 — password only. Server returns pendingToken (5 min)
-   plus needsSetup flag. No TOTP secret is ever sent to client. */
 async function doLogin() {
   const input = document.getElementById('authUser').value.trim();
   const password = document.getElementById('authPass').value;
@@ -361,12 +409,19 @@ async function doLogin() {
       username: r.username,
       name: r.name,
       needsSetup: r.needsSetup,
+      totpEnabled: r.totpEnabled, // NAYA
       newSecret: null
     };
 
+    if (r.totpEnabled === false) {
+      // 2FA bypassed, direct login
+      await completeLogin({
+        pendingToken: pendingLoginUser.pendingToken
+      });
+      return;
+    }
+
     if (r.needsSetup) {
-      /* First-time 2FA setup — generate secret locally, show QR,
-         but the code is verified by the SERVER on submit. */
       const secret = generateSecret();
       pendingLoginUser.newSecret = secret;
       const uri = `otpauth://totp/TradeAlgo:${r.username}?secret=${secret}&issuer=TradeAlgo`;
@@ -389,8 +444,6 @@ async function doLogin() {
   }
 }
 
-/* Step 2a — existing user enters 6-digit code.
-   Server verifies against stored secret; no local check. */
 async function verifyLoginTotp() {
   const code = document.getElementById('authTotp').value.trim();
   const err = document.getElementById('authTotpError');
@@ -408,8 +461,6 @@ async function verifyLoginTotp() {
   });
 }
 
-/* Step 2b — first-time setup. Send secret + code to server.
-   Server verifies code against newSecret, then stores it. */
 async function confirmSetup() {
   const code = document.getElementById('setupCode').value.trim();
   const err = document.getElementById('setupError');
@@ -428,7 +479,6 @@ async function confirmSetup() {
   });
 }
 
-/* Step 3 — exchange verified pending login for a session JWT. */
 async function completeLogin(payload) {
   try {
     const r = await api('/api/complete-login', {
@@ -449,13 +499,11 @@ async function completeLogin(payload) {
       }
     }
   } catch (e) {
-    /* Route the error back to whichever step is showing */
     if (pendingLoginUser?.needsSetup) {
       document.getElementById('setupError').textContent = e.message;
     } else {
       document.getElementById('authTotpError').textContent = e.message;
       if (e.status === 401 && /expired|session/i.test(e.message)) {
-        /* Pending token expired — send user back to step 1 */
         setTimeout(() => { cancelTotp(); }, 1500);
       }
     }
@@ -469,9 +517,8 @@ function cancelTotp() {
   document.getElementById('authPass').value = '';
 }
 
-
 /* ============================================================
-   SECTION 13 — FORGOT PASSWORD  (unchanged — server verifies)
+   SECTION 13 — FORGOT PASSWORD
    ============================================================ */
 function showForgotStep(step) {
   document.getElementById('loginStep1').style.display = 'none';
@@ -539,7 +586,6 @@ async function forgotReset() {
     err.textContent = e.message;
   }
 }
-
 
 /* ============================================================
    SECTION 14 — LOGOUT & SCREENS
@@ -615,7 +661,6 @@ function showApp() {
   }
 }
 
-
 /* ============================================================
    SECTION 15 — TABS
    ============================================================ */
@@ -628,7 +673,6 @@ function switchTab(name, e) {
   if (name === 'prices') loadPrices();
   if (name === 'holidays') renderHolidays();
 }
-
 
 /* ============================================================
    SECTION 16 — ADMIN: KPIs
@@ -660,10 +704,20 @@ async function renderKPIs() {
   } catch {}
 }
 
-
 /* ============================================================
    SECTION 17 — ADMIN: USERS TABLE
    ============================================================ */
+function formatDateDDMMMYYYY(dateStr) {
+  if (!dateStr) return '—';
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return '—';
+  const day = String(d.getDate()).padStart(2, '0');
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const mon = months[d.getMonth()];
+  const year = d.getFullYear();
+  return `${day}-${mon}-${year}`;
+}
+
 async function renderUsers() {
   const search = (document.getElementById('userSearch')?.value || '').toLowerCase();
   const filter = document.getElementById('userFilter')?.value || 'all';
@@ -710,7 +764,7 @@ async function renderUsers() {
         </td>
         <td>${u.username}</td>
         <td>${u.plan || '—'}</td>
-        <td>${u.expiresAt ? String(u.expiresAt).slice(0, 10) : '—'}</td>
+        <td>${formatDateDDMMMYYYY(u.expiresAt)}</td>
         <td style="color:${color};font-weight:600">${daysText}</td>
         <td class="actions-cell">
           ${isAdmin ? '<span style="color:var(--text-muted);font-size:11px">—</span>' : `
@@ -737,7 +791,6 @@ async function renderUsers() {
     document.getElementById('usersTable').innerHTML = `<div style="color:var(--danger)">${e.message}</div>`;
   }
 }
-
 
 /* ============================================================
    SECTION 18 — ADMIN: CREATE USER
@@ -789,7 +842,6 @@ async function addUser() {
     showToast('⚠️ Error', e.message);
   }
 }
-
 
 /* ============================================================
    SECTION 19 — ADMIN: EDIT USER
@@ -846,7 +898,6 @@ async function saveEditUser() {
   }
 }
 
-
 /* ============================================================
    SECTION 20 — ADMIN: RENEW MODAL
    ============================================================ */
@@ -859,8 +910,7 @@ async function openRenew(username) {
     renewingUsername = username;
     renewDelta = 0;
     document.getElementById('renewSub').textContent = `Adjusting ${u.name} (${u.username})`;
-    document.getElementById('renewCurrent').textContent =
-      u.expiresAt ? String(u.expiresAt).slice(0, 10) : 'No expiry';
+    document.getElementById('renewCurrent').textContent = formatDateDDMMMYYYY(u.expiresAt);
 
     document.querySelectorAll('#renewAddChips .chip, #renewSubChips .chip').forEach(c => c.classList.remove('active'));
     document.getElementById('renewCustomDate').value = '';
@@ -912,7 +962,7 @@ function updateRenewPreview() {
   const preview = document.getElementById('renewPreview');
 
   if (custom) {
-    preview.textContent = custom;
+    preview.textContent = formatDateDDMMMYYYY(custom);
     return;
   }
   if (!renewDelta) {
@@ -921,7 +971,7 @@ function updateRenewPreview() {
   }
   const base = new Date(window._renewBase);
   base.setDate(base.getDate() + renewDelta);
-  preview.textContent = base.toISOString().split('T')[0];
+  preview.textContent = formatDateDDMMMYYYY(base.toISOString().split('T')[0]);
 }
 
 async function saveRenew() {
@@ -941,7 +991,7 @@ async function saveRenew() {
         method: 'POST',
         body: JSON.stringify({ expiresAt: custom })
       });
-      showToast('✅ Updated', `Expiry set to ${custom}`);
+      showToast('✅ Updated', `Expiry set to ${formatDateDDMMMYYYY(custom)}`);
     } else {
       await api(`/api/users/${renewingUsername}/renew`, {
         method: 'POST',
@@ -956,7 +1006,6 @@ async function saveRenew() {
     err.textContent = e.message;
   }
 }
-
 
 /* ============================================================
    SECTION 21 — ADMIN: DELETE / DISABLE / RESET
@@ -988,7 +1037,6 @@ async function resetPassword(username) {
     showToast('🔑 New Password', `${username}: ${r.temp}`);
   } catch (e) { showToast('⚠️ Error', e.message); }
 }
-
 
 /* ============================================================
    SECTION 22 — WHATSAPP SHARING
@@ -1027,7 +1075,6 @@ Please change your password after your first login.`;
   window.open(`https://wa.me/91${mobile}?text=${encodeURIComponent(msg)}`, '_blank');
 }
 
-
 /* ============================================================
    SECTION 23 — ADMIN: IMPERSONATE
    ============================================================ */
@@ -1051,7 +1098,6 @@ function exitImpersonate() {
   showApp();
   showToast('✅ Exited', 'Back to admin');
 }
-
 
 /* ============================================================
    SECTION 24 — ADMIN: BULK IMPORT USERS
@@ -1129,7 +1175,6 @@ function downloadCredentials() {
   showToast('📥 Downloaded', `${creds.length} credentials`);
 }
 
-
 /* ============================================================
    SECTION 25 — ADMIN: AUDIT LOG
    ============================================================ */
@@ -1165,7 +1210,6 @@ async function clearAudit() {
   } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
-
 /* ============================================================
    SECTION 26 — ADMIN: PRICING
    ============================================================ */
@@ -1189,7 +1233,6 @@ async function savePrices() {
   } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
-
 /* ============================================================
    SECTION 27 — ADMIN: EXPORT USERS CSV
    ============================================================ */
@@ -1201,7 +1244,7 @@ async function exportUsersCSV() {
       const status = u.disabled ? 'Disabled'
         : (u.expiresAt && new Date(u.expiresAt) < new Date() ? 'Expired' : 'Active');
       return [u.name, u.username, u.mobile || '-', u.role, u.plan || '-',
-        u.expiresAt ? String(u.expiresAt).slice(0, 10) : '-', status].join(',');
+        formatDateDDMMMYYYY(u.expiresAt), status].join(',');
     }).join('\n');
     const blob = new Blob([header + rows], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
@@ -1213,7 +1256,6 @@ async function exportUsersCSV() {
     showToast('📥 Exported', `${users.length} users`);
   } catch (e) { showToast('⚠️ Error', e.message); }
 }
-
 
 /* ============================================================
    SECTION 28 — ADMIN: TRADING HOLIDAYS (bulk management)
@@ -1240,7 +1282,7 @@ async function renderHolidays() {
           const day = new Date(h.date + 'T00:00:00Z').toLocaleDateString('en-IN', { weekday: 'long' });
           return `<tr>
             <td><input type="checkbox" class="holiday-check" value="${h.date}" /></td>
-            <td><strong>${h.date}</strong></td>
+            <td><strong>${formatDateDDMMMYYYY(h.date)}</strong></td>
             <td>${day}</td>
             <td>${h.reason || '—'}</td>
             <td><button class="btn btn-danger btn-sm" onclick="deleteHoliday('${h.date}')">🗑️</button></td>
@@ -1328,11 +1370,11 @@ function loadSampleHolidays() {
 }
 
 async function deleteHoliday(date) {
-  if (!confirm(`Remove holiday ${date}?`)) return;
+  if (!confirm(`Remove holiday ${formatDateDDMMMYYYY(date)}?`)) return;
   try {
     await api(`/api/admin/holidays/${date}`, { method: 'DELETE' });
     renderHolidays();
-    showToast('🗑️ Removed', date);
+    showToast('🗑️ Removed', formatDateDDMMMYYYY(date));
   } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
@@ -1364,7 +1406,6 @@ async function deleteAllHolidays() {
   } catch (e) { showToast('⚠️ Error', e.message); }
 }
 
-
 /* ============================================================
    SECTION 29 — BOOTSTRAP
    ============================================================ */
@@ -1373,15 +1414,15 @@ async function deleteAllHolidays() {
   const u = getUser();
   if (token && u) {
     try {
-      await api('/api/session-check');
-      currentUser = u;
+      const r = await api('/api/session-check');
+      currentUser = { ...u, totpEnabled: r.totpEnabled }; // Sync latest 2FA state
+      setUser(currentUser);
       showApp();
       return;
     } catch { clearSession(); }
   }
   showLogin();
 })();
-
 
 /* ============================================================
    SECTION 30 — PASSWORD TOGGLE HELPER

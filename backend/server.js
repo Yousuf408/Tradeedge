@@ -1886,6 +1886,12 @@ async function fetchDayHLC() {
       const close = q.ltp || q.close;
       const pivot = (+q.high + +q.low + +close) / 3;
 
+      // NAYA: Cache update fix for frontend
+      setCachedLTP(token, close);
+      if (q.close && q.close > 0) prevCloseCache.set(token, +q.close);
+      const bsCached = bsCache.get(token);
+      if (bsCached) bsCached.ltp = close;
+
       try {
         await db.query(
           `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, updated_at)
@@ -1916,6 +1922,11 @@ async function fetchDayHLC() {
         const close = q.ltp || q.close;
         const pivot = (+q.high + +q.low + +close) / 3;
 
+        setCachedLTP(token, close);
+        if (q.close && q.close > 0) prevCloseCache.set(token, +q.close);
+        const bsCached = bsCache.get(token);
+        if (bsCached) bsCached.ltp = close;
+
         try {
           await db.query(
             `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, updated_at)
@@ -1935,6 +1946,7 @@ async function fetchDayHLC() {
 
     if (dbErrors.length) console.log(`❌ [HLC] DB errors (first 5):`, dbErrors.slice(0, 5));
     await flushLtpWrites();
+    broadcastBS(new Date()); // NAYA: Frontend ko update bhejne ke liye
     console.log(`✅ Day H/L/C: ${savedTokens.size}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
   } catch (e) { console.error('❌ Day H/L/C fetch failed:', e); }
 }

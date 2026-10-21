@@ -701,6 +701,13 @@ function startSSE() {
       const msg = JSON.parse(e.data);
 
       if (msg.type === 'ltp' && msg.ticks) {
+        // NAYA: prevCloses update karein
+        if (msg.prevCloses) {
+          for (const [t, pc] of Object.entries(msg.prevCloses)) {
+            SCREENER_PREV_CLOSE[t] = pc;
+          }
+        }
+        
         if (msg.ticks[NIFTY50_TOKEN] !== undefined) {
           SCREENER_LTP[NIFTY50_TOKEN] = msg.ticks[NIFTY50_TOKEN];
           updateNiftyHeader();
@@ -718,8 +725,6 @@ function startSSE() {
           if (v.marginPerShare != null) SCREENER_MARGIN_PS[token] = v.marginPerShare;
           if (v.vwap != null) SCREENER_VWAP[token] = v.vwap;
           if (v.rsiFirst != null) SCREENER_RSI_FIRST[token] = v.rsiFirst;
-          
-          // YEH LINE FIX HAI (Frontend me Prev Close ko update karne ke liye)
           if (v.prevClose != null) SCREENER_PREV_CLOSE[token] = v.prevClose;
         }
         renderScreenerTable();

@@ -557,7 +557,7 @@ async function startEODClosesFetch() {
   btn.textContent = '⏳ Fetching EOD... (~3-5 min)';
 
   try {
-    const r = await fetch(API + '/api/admin/force-eod-closes', {
+    const r = await fetch(API + '/api/admin/force-day-hlc', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
     });

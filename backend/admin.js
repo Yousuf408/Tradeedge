@@ -79,6 +79,17 @@ export function registerAdminRoutes(app, deps) {
      ============================================================ */
   async function syncHolidaysFromNSE() {
     try {
+      // 1. Check karo ki aaj sync ho chuka hai kya? (Taaki restart pe baar-baar fetch na ho)
+      const todayStr = new Date().toISOString().split('T')[0];
+      const { rows: markerRows } = await db.query(
+        `SELECT value FROM kv_store WHERE key = 'last_holiday_sync'`
+      );
+
+      if (markerRows.length > 0 && markerRows[0].value === todayStr) {
+        console.log('⏭️ NSE Holiday Sync skipped (already synced today)');
+        return;
+      }
+
       console.log('🔄 Fetching official holiday list from NSE...');
       const res = await fetch('https://www.nseindia.com/api/holiday-master?type=trading', {
         headers: {
@@ -89,26 +100,48 @@ export function registerAdminRoutes(app, deps) {
 
       if (!res.ok) throw new Error(`NSE API HTTP ${res.status}`);
       const data = await res.json();
+      
+      // NSE CM (Cash Market) key use karta hai
       const nseHolidays = data['CM'] || data['NSE'] || [];
       if (!nseHolidays.length) return console.log('⚠️ NSE API returned 0 holidays.');
 
-      let inserted = 0;
       const monthMap = { Jan:'01', Feb:'02', Mar:'03', Apr:'04', May:'05', Jun:'06', Jul:'07', Aug:'08', Sep:'09', Oct:'10', Nov:'11', Dec:'12' };
+      
+      const yearSet = new Set();
+      const parsedHolidays = [];
 
       for (const h of nseHolidays) {
-        const [day, mon, year] = h.tradingDate.split('-'); // DD-MMM-YYYY
+        const [day, mon, year] = h.tradingDate.split('-'); // Format: DD-MMM-YYYY
+        yearSet.add(year);
         const isoDate = `${year}-${monthMap[mon]}-${day.padStart(2, '0')}`;
+        parsedHolidays.push({ date: isoDate, reason: h.description });
+      }
 
+      // 2. DELETE: Jitne saal NSE se aaye hain, DB se un saalo ke purane (galat) holidays delete karo
+      for (const year of yearSet) {
+        await db.query(`DELETE FROM trading_holidays WHERE EXTRACT(YEAR FROM date) = $1`, [year]);
+      }
+
+      // 3. INSERT: Ab fresh NSE data insert karo
+      let inserted = 0;
+      for (const h of parsedHolidays) {
         await db.query(
           `INSERT INTO trading_holidays (date, reason) VALUES ($1, $2) 
            ON CONFLICT (date) DO UPDATE SET reason = EXCLUDED.reason`,
-          [isoDate, h.description]
+          [h.date, h.reason]
         );
         inserted++;
       }
 
-      await loadHolidaysFromDB(); // Refresh in-memory holidaySet
-      console.log(`✅ Synced ${inserted} holidays from NSE.`);
+      // 4. Marker save karo ki aaj sync ho gaya hai
+      await db.query(
+        `INSERT INTO kv_store (key, value) VALUES ('last_holiday_sync', $1)
+         ON CONFLICT (key) DO UPDATE SET value = $1`,
+        [todayStr]
+      );
+
+      await loadHolidaysFromDB(); // In-memory holidaySet refresh
+      console.log(`✅ Synced and cleaned ${inserted} holidays from NSE.`);
     } catch (err) {
       console.error('❌ NSE Holiday Sync failed:', err.message);
     }
@@ -136,7 +169,6 @@ export function registerAdminRoutes(app, deps) {
 
   // Start the scheduler and run once on boot
   syncHolidaysFromNSE().then(() => scheduleHolidaySync());
-
 
   /* ============================================================
      ROOT

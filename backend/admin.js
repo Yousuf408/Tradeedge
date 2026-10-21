@@ -89,7 +89,7 @@ export function registerAdminRoutes(app, deps) {
 
       if (!res.ok) throw new Error(`NSE API HTTP ${res.status}`);
       const data = await res.json();
-      const nseHolidays = data['NSE'] || [];
+      const nseHolidays = data['CM'] || data['NSE'] || [];
       if (!nseHolidays.length) return console.log('⚠️ NSE API returned 0 holidays.');
 
       let inserted = 0;

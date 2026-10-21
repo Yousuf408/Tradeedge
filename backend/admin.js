@@ -75,12 +75,76 @@ export function registerAdminRoutes(app, deps) {
   };
 
   /* ============================================================
+     NSE HOLIDAY SYNC (Auto-fetch)
+     ============================================================ */
+  async function syncHolidaysFromNSE() {
+    try {
+      console.log('🔄 Fetching official holiday list from NSE...');
+      const res = await fetch('https://www.nseindia.com/api/holiday-master?type=trading', {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json'
+        }
+      });
+
+      if (!res.ok) throw new Error(`NSE API HTTP ${res.status}`);
+      const data = await res.json();
+      const nseHolidays = data['NSE'] || [];
+      if (!nseHolidays.length) return console.log('⚠️ NSE API returned 0 holidays.');
+
+      let inserted = 0;
+      const monthMap = { Jan:'01', Feb:'02', Mar:'03', Apr:'04', May:'05', Jun:'06', Jul:'07', Aug:'08', Sep:'09', Oct:'10', Nov:'11', Dec:'12' };
+
+      for (const h of nseHolidays) {
+        const [day, mon, year] = h.tradingDate.split('-'); // DD-MMM-YYYY
+        const isoDate = `${year}-${monthMap[mon]}-${day.padStart(2, '0')}`;
+
+        await db.query(
+          `INSERT INTO trading_holidays (date, reason) VALUES ($1, $2) 
+           ON CONFLICT (date) DO UPDATE SET reason = EXCLUDED.reason`,
+          [isoDate, h.description]
+        );
+        inserted++;
+      }
+
+      await loadHolidaysFromDB(); // Refresh in-memory holidaySet
+      console.log(`✅ Synced ${inserted} holidays from NSE.`);
+    } catch (err) {
+      console.error('❌ NSE Holiday Sync failed:', err.message);
+    }
+  }
+
+  // Scheduler: Run once daily at 8:00 AM IST
+  function scheduleHolidaySync() {
+    const scheduleNext = () => {
+      const now = new Date();
+      const istOffset = 5.5 * 60 * 60 * 1000;
+      const istNow = new Date(now.getTime() + istOffset);
+      const target = new Date(istNow);
+      target.setUTCHours(8, 0, 0, 0); // 8 AM IST
+      if (target <= istNow) target.setUTCDate(target.getUTCDate() + 1);
+      
+      const msUntil = target.getTime() - istNow.getTime();
+      setTimeout(async () => {
+        await syncHolidaysFromNSE();
+        scheduleNext();
+      }, msUntil);
+    };
+    scheduleNext();
+    console.log('⏰ NSE Holiday Sync scheduled (Daily at 8:00 AM IST)');
+  }
+
+  // Start the scheduler and run once on boot
+  syncHolidaysFromNSE().then(() => scheduleHolidaySync());
+
+
+  /* ============================================================
      ROOT
      ============================================================ */
   app.get('/', (req, res) => res.json({ ok: true, service: 'tradealgo-backend', mode: 'dual-rest-quote-bs' }));
 
   /* ============================================================
-     AUTH
+     AUTH & LOGIN
      ============================================================ */
   app.post('/api/login', async (req, res) => {
     const { input, password } = req.body;
@@ -122,7 +186,9 @@ export function registerAdminRoutes(app, deps) {
     const pendingToken = jwt.sign({ username: user.username, purpose: 'login-pending' }, SECRET, { expiresIn: '5m' });
     res.json({
       ok: true, pendingToken, username: user.username, name: user.name,
-      needsSetup: !user.totp_secret, hasTotp: !!user.totp_secret
+      needsSetup: !user.totp_secret,
+      hasTotp: !!user.totp_secret,
+      totpEnabled: user.totp_enabled !== false // If null/false, treat as disabled
     });
   });
 
@@ -143,6 +209,20 @@ export function registerAdminRoutes(app, deps) {
       return res.status(403).json({ error: 'Subscription expired', expired: true, expiresAt: user.expires_at });
     }
 
+    // --- 2FA BYPASS IF DISABLED ---
+    if (user.totp_enabled === false) {
+      const sessionId = crypto.randomUUID();
+      await db.query('UPDATE users SET session_id=$1, last_active=NOW() WHERE username=$2', [sessionId, user.username]);
+      const token = jwt.sign({ username: user.username, role: user.role, sessionId }, SECRET, { expiresIn: '7h' });
+      await log(user.username, 'LOGIN_SUCCESS_2FA_OFF', `User: ${user.username}`, 'info');
+
+      return res.json({
+        ok: true, token,
+        user: { name: user.name, username: user.username, role: user.role, plan: user.plan, expiresAt: user.expires_at, mobile: user.mobile, sessionId, totpEnabled: false }
+      });
+    }
+
+    // --- NORMAL 2FA FLOW ---
     const code = String(totpCode || '').trim();
     if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter a 6-digit code' });
 
@@ -152,7 +232,7 @@ export function registerAdminRoutes(app, deps) {
         await log(user.username, 'TOTP_SETUP_FAILED', 'Bad code during setup', 'danger');
         return res.status(401).json({ error: 'Code did not match. Check your authenticator app.' });
       }
-      await db.query('UPDATE users SET totp_secret=$1 WHERE username=$2', [totpSecret, user.username]);
+      await db.query('UPDATE users SET totp_secret=$1, totp_enabled=TRUE WHERE username=$2', [totpSecret, user.username]);
       await log(user.username, 'TOTP_ENABLED', `User: ${user.username}`, 'success');
     } else {
       if (!verifyTotpServer(user.totp_secret, code)) {
@@ -168,18 +248,43 @@ export function registerAdminRoutes(app, deps) {
 
     res.json({
       ok: true, token,
-      user: { name: user.name, username: user.username, role: user.role, plan: user.plan, expiresAt: user.expires_at, mobile: user.mobile, sessionId }
+      user: { name: user.name, username: user.username, role: user.role, plan: user.plan, expiresAt: user.expires_at, mobile: user.mobile, sessionId, totpEnabled: true }
     });
   });
 
+  /* ============================================================
+     TOGGLE 2FA
+     ============================================================ */
+  app.post('/api/user/toggle-2fa', auth, async (req, res) => {
+    const { enable, totpCode } = req.body;
+    const { rows } = await db.query('SELECT * FROM users WHERE username=$1', [req.user.username]);
+    const user = rows[0];
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (!enable) {
+      // Disabling 2FA requires a valid TOTP code
+      if (!user.totp_secret) return res.status(400).json({ error: '2FA is not currently set up.' });
+      if (!totpCode || !verifyTotpServer(user.totp_secret, String(totpCode).trim())) {
+        await log(user.username, '2FA_DISABLE_FAILED', 'Bad TOTP', 'danger');
+        return res.status(401).json({ error: 'Invalid 2FA code. Cannot disable.' });
+      }
+    }
+
+    await db.query('UPDATE users SET totp_enabled=$1 WHERE username=$2', [enable, user.username]);
+    await log(user.username, enable ? '2FA_ENABLED' : '2FA_DISABLED', `User: ${user.username}`, enable ? 'success' : 'warn');
+    
+    res.json({ ok: true, totpEnabled: enable });
+  });
+
   app.get('/api/session-check', auth, async (req, res) => {
-    const { rows } = await db.query('SELECT session_id, disabled, role, expires_at FROM users WHERE username=$1', [req.user.username]);
+    const { rows } = await db.query('SELECT session_id, disabled, role, expires_at, totp_enabled FROM users WHERE username=$1', [req.user.username]);
     const user = rows[0];
     if (!user) return res.status(401).json({ error: 'User gone' });
     if (user.disabled) return res.status(401).json({ error: 'Disabled' });
     if (user.session_id !== req.user.sessionId) return res.status(401).json({ error: 'Logged in elsewhere' });
     if (user.role !== 'admin' && user.expires_at && new Date(user.expires_at) < new Date()) return res.status(401).json({ error: 'Expired' });
-    res.json({ ok: true });
+    
+    res.json({ ok: true, totpEnabled: user.totp_enabled !== false });
   });
 
   app.post('/api/logout', auth, async (req, res) => {
@@ -279,7 +384,7 @@ export function registerAdminRoutes(app, deps) {
   app.get('/api/users', auth, adminOnly, async (req, res) => {
     const { rows } = await db.query(
       `SELECT id, name, username, mobile, role, plan, expires_at AS "expiresAt",
-              disabled, last_active AS "lastActive", created_at AS "createdAt"
+              disabled, last_active AS "lastActive", created_at AS "createdAt", totp_enabled AS "totpEnabled"
        FROM users ORDER BY created_at DESC`
     );
     res.json(rows);
@@ -394,7 +499,7 @@ export function registerAdminRoutes(app, deps) {
   });
 
   /* ============================================================
-     TRADING HOLIDAYS
+     TRADING HOLIDAYS (Read/Manual API)
      ============================================================ */
   app.get('/api/admin/holidays', auth, adminOnly, async (req, res) => {
     const { rows } = await db.query('SELECT date::text AS date, reason FROM trading_holidays ORDER BY date ASC');

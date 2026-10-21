@@ -1033,7 +1033,8 @@ function broadcastBS(fetchedAt) {
         rsi: v.rsi ?? null,
         leverage: lev ?? null,
         marginPerShare: lev && v.ltp ? +(v.ltp / lev).toFixed(4) : null,
-        rsiFirst: v.rsiFirst ?? null
+        rsiFirst: v.rsiFirst ?? null,
+        prevClose: prevCloseCache.get(t) ?? null // <--- YEH LINE FIX HAI (PREV CLOSE BHEJNE KE LIYE)
       }];
     }))
   })}\n\n`);
@@ -2266,14 +2267,7 @@ function runEntryScan(date) {
       const openGainPct = ((ltp - dayOpen) / dayOpen) * 100;
       if (openGainPct < ENTRY_OPEN_GAIN_PCT) continue;
       
-      // NEW: Max 3% Buffer Check
       if (openGainPct >= ENTRY_MAX_GAIN_PCT) continue;
-
-      // NEW: Live Volume >= 1 Lakh (Temporarily commented out for testing)
-      // const currentCum = lastWsVolume.get(token) || 0;
-      // const prevMinEnd = prevCumVol.get(token) || 0;
-      // const liveVol = currentCum - prevMinEnd;
-      // if (liveVol < 100000) continue;
 
       const changePct = ((ltp - prevClose) / prevClose) * 100;
       if (changePct <= 0) continue;

@@ -1,37 +1,30 @@
 """
 python-rsi — TradingView RSI microservice
-Step 5: Session token auth (TvDatafeed token param)
-
-Endpoints:
-  GET /health                 — health check
-  GET /rsi?symbol=BSOFT       — compute TradingView RSI for one symbol
-  GET /rsi?symbols=BSOFT,TCS  — batch (comma-separated)
+Step 6: Freshness Check & Session Fix
 """
+
 import os
 import time
+import datetime
 from flask import Flask, jsonify, request
 from tvDatafeed import TvDatafeed, Interval
 
 app = Flask(__name__)
 
-# ── TradingView connection (lazy, reused) ─────────────────────
+# ── TradingView connection ─────────────────────
 _tv = None
 
 def get_tv():
     global _tv
-    if _tv is not None:
-        return _tv
-
+    # Fresh session banayenge taaki cached/stale data na aaye
     sessionid = os.environ.get('TV_SESSIONID')
 
     if sessionid:
         print('🔌 Creating TvDatafeed with session token')
         try:
             _tv = TvDatafeed(token=sessionid)
-            print('🔑 Token-based session created')
         except Exception as e:
             print(f'⚠️ Token method failed: {e}')
-            print('🔌 Falling back to anonymous')
             _tv = TvDatafeed()
     else:
         print('🔌 Anonymous mode (no TV_SESSIONID)')
@@ -39,39 +32,26 @@ def get_tv():
 
     return _tv
 
-
 # ── Wilder's RMA RSI (TradingView-exact) ──────────────────────
 def compute_rsi_wilder(closes, period=14):
-    """
-    Wilder's RSI with RMA smoothing — exactly as TradingView computes.
-    Input: list of closes (oldest -> newest)
-    Returns: RSI value (float) or None
-    """
     if len(closes) < period + 1:
         return None
 
-    # 1. price changes
     changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-
-    # 2. gains / losses
     gains = [c if c > 0 else 0 for c in changes]
     losses = [-c if c < 0 else 0 for c in changes]
 
-    # 3. seed: simple average of first `period`
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    # 4. Wilder's RMA smoothing
     for i in range(period, len(changes)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
 
-    # 5. RSI
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
-
 
 # ── Fetch candles from TradingView + compute RSI ──────────────
 def fetch_rsi(symbol, exchange='NSE', interval=Interval.in_1_minute, bars=100):
@@ -83,11 +63,33 @@ def fetch_rsi(symbol, exchange='NSE', interval=Interval.in_1_minute, bars=100):
             interval=interval,
             n_bars=bars
         )
+        
         if df is None or df.empty:
             return {'ok': False, 'symbol': symbol, 'error': 'no_data'}
 
+        # ✅ STALE DATA CHECK (Sabse important fix)
+        last_candle_time = df.index[-1]
+        
+        # Timezone handle karna (NSE ke liye IST aata hai, par safe side check lagayenge)
+        if last_candle_time.tzinfo is None:
+            # Agar timezone nahi hai, toh IST (UTC+5:30) maan lenge
+            now = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
+        else:
+            now = datetime.datetime.now(last_candle_time.tzinfo)
+
+        # Agar aakhri candle 15 minute se purani hai, toh matlab session expire hai
+        time_diff = (now - last_candle_time).total_seconds()
+        if time_diff > 900: # 15 mins * 60 secs
+            return {
+                'ok': False, 
+                'symbol': symbol, 
+                'error': 'stale_data_session_expired', 
+                'last_candle_time': str(last_candle_time)
+            }
+
         closes = df['close'].tolist()
         rsi = compute_rsi_wilder(closes, period=14)
+        
         if rsi is None:
             return {'ok': False, 'symbol': symbol, 'error': 'insufficient_candles'}
 
@@ -97,7 +99,7 @@ def fetch_rsi(symbol, exchange='NSE', interval=Interval.in_1_minute, bars=100):
             'rsi': round(rsi, 2),
             'candles': len(closes),
             'last_close': round(closes[-1], 2),
-            'last_candle_time': str(df.index[-1])
+            'last_candle_time': str(last_candle_time)
         }
     except Exception as e:
         return {'ok': False, 'symbol': symbol, 'error': str(e)}
@@ -109,8 +111,8 @@ def health():
     return jsonify({
         'ok': True,
         'service': 'python-rsi',
-        'version': '1.0',
-        'step': 5
+        'version': '1.1',
+        'step': 6
     })
 
 @app.route('/', methods=['GET'])
@@ -129,7 +131,7 @@ def rsi_endpoint():
         results = []
         for s in sym_list:
             results.append(fetch_rsi(s, exchange=exchange, bars=bars))
-            time.sleep(0.3)   # gentle pacing — TradingView rate limits
+            time.sleep(0.5)   # Rate limit safe
         return jsonify({'ok': True, 'results': results})
 
     if not symbol:

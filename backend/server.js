@@ -994,6 +994,7 @@ function sseSend(payload) {
 
 const ssePendingVwap = new Map();
 const ssePendingRsi = new Map();
+const ssePendingPrevClose = new Map(); // NEW: Nifty 50 prevClose ke liye
 
 function broadcastLTP(token, ltp) {
   if (!sseClients.size) return;
@@ -1002,6 +1003,11 @@ function broadcastLTP(token, ltp) {
   if (vw != null) ssePendingVwap.set(String(token), vw);
   const rs = bsCache.get(String(token))?.rsi;
   if (rs != null) ssePendingRsi.set(String(token), rs);
+  
+  // NEW: Har tick ke saath prevClose bhejenge
+  const pc = prevCloseCache.get(String(token));
+  if (pc != null) ssePendingPrevClose.set(String(token), pc);
+
   if (sseFlushTimer) return;
   sseFlushTimer = setTimeout(() => {
     sseFlushTimer = null;
@@ -1010,11 +1016,13 @@ function broadcastLTP(token, ltp) {
       type: 'ltp',
       ticks: Object.fromEntries(ssePending),
       vwaps: Object.fromEntries(ssePendingVwap),
-      rsis: Object.fromEntries(ssePendingRsi)
+      rsis: Object.fromEntries(ssePendingRsi),
+      prevCloses: Object.fromEntries(ssePendingPrevClose) // NEW
     })}\n\n`;
     ssePending.clear();
     ssePendingVwap.clear();
     ssePendingRsi.clear();
+    ssePendingPrevClose.clear(); // NEW
     sseSend(payload);
   }, 100);
 }
@@ -1034,7 +1042,7 @@ function broadcastBS(fetchedAt) {
         leverage: lev ?? null,
         marginPerShare: lev && v.ltp ? +(v.ltp / lev).toFixed(4) : null,
         rsiFirst: v.rsiFirst ?? null,
-        prevClose: prevCloseCache.get(t) ?? null // <--- YEH LINE FIX HAI (PREV CLOSE BHEJNE KE LIYE)
+        prevClose: prevCloseCache.get(t) ?? null
       }];
     }))
   })}\n\n`);
@@ -1064,6 +1072,10 @@ function handleTick(token, ltp, tickMs, extra) {
 
   if (token === NIFTY50_TOKEN) {
     setCachedLTP(token, ltp);
+    // NAYA: Nifty 50 ka prevClose update karein
+    if (extra && Number.isFinite(extra.close) && extra.close > 0) {
+      prevCloseCache.set(token, +extra.close.toFixed(2));
+    }
     broadcastLTP(token, ltp);
     return;
   }

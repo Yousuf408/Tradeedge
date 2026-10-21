@@ -942,6 +942,16 @@ let depthPktCount = 0;
 let depthRestarts = 0;
 let depthWatchdog = null;
 
+// NAYA: Depth Validation ke liye active tokens track karne ka Set
+const activeDepthTokens = new Set();
+setInterval(() => {
+  if (activeDepthTokens.size > 0) {
+    const total = getDepthStatus().tokenCount || 300;
+    console.log(`🧿 Depth Active: ${activeDepthTokens.size} / ${total} tokens`);
+    activeDepthTokens.clear(); // Next 10s ke liye reset
+  }
+}, 10000);
+
 const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000);
 const ltpWriteQueue = new Map();
 let ltpWriteTimer = null;
@@ -1004,7 +1014,6 @@ function broadcastLTP(token, ltp) {
   const rs = bsCache.get(String(token))?.rsi;
   if (rs != null) ssePendingRsi.set(String(token), rs);
   
-  // NEW: Har tick ke saath prevClose bhejenge
   const pc = prevCloseCache.get(String(token));
   if (pc != null) ssePendingPrevClose.set(String(token), pc);
 
@@ -1017,12 +1026,12 @@ function broadcastLTP(token, ltp) {
       ticks: Object.fromEntries(ssePending),
       vwaps: Object.fromEntries(ssePendingVwap),
       rsis: Object.fromEntries(ssePendingRsi),
-      prevCloses: Object.fromEntries(ssePendingPrevClose) // NEW
+      prevCloses: Object.fromEntries(ssePendingPrevClose)
     })}\n\n`;
     ssePending.clear();
     ssePendingVwap.clear();
     ssePendingRsi.clear();
-    ssePendingPrevClose.clear(); // NEW
+    ssePendingPrevClose.clear();
     sseSend(payload);
   }, 100);
 }
@@ -1072,7 +1081,6 @@ function handleTick(token, ltp, tickMs, extra) {
 
   if (token === NIFTY50_TOKEN) {
     setCachedLTP(token, ltp);
-    // NAYA: Nifty 50 ka prevClose update karein
     if (extra && Number.isFinite(extra.close) && extra.close > 0) {
       prevCloseCache.set(token, +extra.close.toFixed(2));
     }
@@ -1157,9 +1165,9 @@ function onDepthPacket(d) {
   depthPktCount++;
   depthCache.set(d.token, d);
 
+  // NAYA: Validation log flood hataya, ab active count 10s me print hoga
   if (d.shouldValidate) {
-    const bs = bsCache.get(d.token);
-    console.log(`🧿 VALIDATE ${d.token}: depth buy/sell=${d.buyQty}/${d.sellQty} alt=${d.altBuy}/${d.altSell} | REST=${bs?.buyQty ?? '-'}/${bs?.sellQty ?? '-'}`);
+    activeDepthTokens.add(d.token);
   }
 
   const tot = (d.buyQty || 0) + (d.sellQty || 0);
@@ -1330,15 +1338,12 @@ app.get('/api/screener/chips', auth, (req, res) => {
   res.json({ ok: true, date: chipDate, locked: chipDate != null, chips });
 });
 
-/* TRADINGVIEW RSI MICROSERVICE ROUTE */
 app.get('/api/tv-rsi/:sym', auth, async (req, res) => {
   const symbol = req.params.sym;
   const rsiData = await fetchTvRsiFromPython(symbol);
-  
   if (!rsiData || !rsiData.ok) {
     return res.status(500).json({ error: 'Failed to fetch from Python', detail: rsiData });
   }
-  
   res.json(rsiData);
 });
 

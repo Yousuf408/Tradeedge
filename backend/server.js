@@ -1,30 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.21
-   v5.1: Margin service JWT fallback
-   v5.2: BS upsert writes day_high/low/close/prev_close;
-   v5.3: prev_close hardening —
-         - BS-first read sirf TODAY ki row se (purani `date <=` query 9:15 se pehle
-           yesterday-wala prev_close utha leti thi = galat change%)
-         - 9:15 ke pehle BS upsert ke baad prevCloseCache sync (din me ek baar)
-         - Momentum change% / rank / chips sab ka source = BS table prev_close
-         prevCloseCache from Angel q.close;
-         Momentum 15m-independent; pivot load removed
-   v5.4: NEW admin route — Angel REST 1-min + 5-min candle backfill
-         Overwrites ws_1min_close, ws_5min_close (and ts/volume)
-         + RSI recompute. Guarded against concurrent runs.
-   v5.20: ENTRY TRIGGER ENGINE (purana one-shot buildEntryList HATAYA) —
-         - Candidates = 🏆 Top Performing rules: gap-up < 3% (>=3% exclude) +
-           change% > 0 + day-open se +1% (ENTRY_OPEN_GAIN_PCT) cross
-         - Window 9:15–11:00 IST, har 5s scan, per-token din me EK entry,
-           cap MAX_ENTRIES (default 10)
-         - cands me dayOpen jata hai → autoTrader v1.3 SL = DAY OPEN rakhta hai
-         - buildChipList gap filter bhi >= 3% exclude (consistency)
-   v5.21 (2026-10-16): STALE DAY-OPEN FIX —
-         - bsFreshDate flag: entry engine sirf tab chalta hai jab aaj ki
-           strategy_bs_snapshot.day_open (Angel q.open) actually write ho chuki ho
-         - scheduleMorningPreload ab bsCache + chipList + bsFreshDate clear karta hai
-           (purani din ki day_open cache se 9:15:00 pe instant entries ruk gayi)
-         - ±20% sanity check: day_open vs prev_close band se bahar = skip
+   server.js — TradeAlgo Pro backend  |  v5.22
    ============================================================ */
 
 import express from 'express';
@@ -65,11 +40,11 @@ import {
 } from './brokers/angelone/Angel_BS.js';
 
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
-import { startDepthWS, resubscribeDepth, getDepthStatus } from './brokers/angelone/Angel_Depth.js';   // v5.12: mode-3 depth LIVE engine
+import { startDepthWS, resubscribeDepth, getDepthStatus } from './brokers/angelone/Angel_Depth.js';
 
 import {
   initAutoTrader, onEntryScan, onTickPos, loadOpenPositions, getPositions, getPositionDate
-} from './autoTrader.js';   // v5.7: auto buy/SL/target module (per-user capital) · v5.20: +getPositionDate
+} from './autoTrader.js';
 
 import { registerAdminRoutes } from './admin.js';
 
@@ -85,7 +60,6 @@ import {
 } from './brokers/margin.js';
 
 dotenv.config();
-
 
 /* ============================================================
    SECTION 2 — CONFIG
@@ -130,8 +104,6 @@ const STRATEGIES = {
 };
 
 const getStrategy = id => STRATEGIES[id] || STRATEGIES.momentum;
-
-
 
 /* ============================================================
    SECTION 3 — TIME / PHASES / HOLIDAYS
@@ -187,9 +159,6 @@ function countFilled(date) {
   return cached.filter(c => c.candle && !c.candle.error && Array.isArray(c.candle)).length;
 }
 
-
-
-
 /* ============================================================
    SECTION 4.1 — PREV CLOSE (BS-first)
    ============================================================ */
@@ -230,9 +199,6 @@ async function loadPrevCloseFromDB() {
   } catch (e) { console.error('prevClose load failed:', e.message); }
 }
 
-
-
-
 /* ============================================================
    SECTION 4.4 — BUY/SELL CACHE + RSI + MINUTE SELF-COLLECT
    ============================================================ */
@@ -244,10 +210,8 @@ const minuteBuffer = new Map();
 const RSI_SOURCE = process.env.RSI_SOURCE || 'ws';
 const wsPrevCloses = new Map();
 const wsTodayCloses = new Map();
-const wsTodayVols = new Map();     // v5.5: aaj ke ws_1min_volume (VWAP ke liye)
+const wsTodayVols = new Map();
 
-// v5.5: TESTING MODE — true = chip filter me RSI>=70 skip (sirf gap<=3% + top-10)
-// Testing khatam hone ke baad Render env me CHIP_TEST_MODE=false karna = RSI filter wapas
 const CHIP_TEST_MODE = String(process.env.CHIP_TEST_MODE || 'true') === 'true';
 const rsiState = new Map();
 
@@ -637,8 +601,7 @@ async function updateRSIFromWS(date, prevKey) {
           bsCache.set(toks[i], c);
         }
         console.log(`🥇 RSI-first (9:15 candle) locked: ${toks.length} tokens`);
-        broadcastBS(new Date()); // <--- YEH LINE ADD KAREIN (Frontend ko turant bhejne ke liye)
-
+        broadcastBS(new Date()); // Frontend ko turant update karne ke liye
       } catch (e) { console.error('rsi_first write failed:', e.message); }
     }
   } catch (e) { console.error('WS RSI update failed:', e.message); }
@@ -694,6 +657,26 @@ async function recomputeRSIFromWS(date) {
   } catch (e) { console.error('recomputeRSIFromWS failed:', e.message); }
 }
 
+/* ============================================================
+   TRADINGVIEW EXACT RSI VIA PYTHON (MICROSERVICE)
+   ============================================================ */
+async function fetchTvRsiFromPython(symbols) {
+  const baseUrl = process.env.PYTHON_RSI_URL;
+  if (!baseUrl) {
+    console.error('❌ PYTHON_RSI_URL missing in .env');
+    return null;
+  }
+
+  try {
+    const query = Array.isArray(symbols) ? `symbols=${symbols.join(',')}` : `symbol=${symbols}`;
+    const res = await fetch(`${baseUrl}/rsi?${query}`);
+    const data = await res.json();
+    return data;
+  } catch (err) {
+    console.error('❌ Python RSI fetch failed:', err.message);
+    return null;
+  }
+}
 
 /* ============================================================
    SECTION 4.5 — NSE PRE-OPEN FETCHER
@@ -773,16 +756,15 @@ function parsePreopen(json) {
   return { matched, unmatchedSyms: missingSyms, nseTotal: items.length };
 }
 
-
 /* ============================================================
    SECTION 4.6 — WS MINUTE-CLOSE SHADOW SAMPLER
    ============================================================ */
 const lastLtpAt = new Map();
 const lastWsVolume = new Map();
-const lastWsAvg = new Map();      // v5.8: live VWAP (ab per-trade computed, v5.9)
-const vwapPV = new Map();         // v5.9: Σ(price × Δvol)
-const vwapV = new Map();          // v5.9: Σ(Δvol)
-let vwapDate = null;              // v5.9: din badle pe sums reset
+const lastWsAvg = new Map();
+const vwapPV = new Map();
+const vwapV = new Map();
+let vwapDate = null;
 const prevCumVol = new Map();
 const minVolRing = new Map();
 let wsMinuteKey = null;
@@ -797,7 +779,7 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     if (!Number.isFinite(close) || close <= 0) continue;
 
     const cumRaw = lastWsVolume.get(token) ?? bsCache.get(token)?.volume ?? null;
-    const cum = (cumRaw != null && cumRaw > 0) ? cumRaw : null;   // v5.7: 0/negative = invalid
+    const cum = (cumRaw != null && cumRaw > 0) ? cumRaw : null;
     const prev = prevCumVol.get(token) ?? null;
     let mv = 0;
     if (cum != null && prev != null && cum >= prev) mv = cum - prev;
@@ -817,7 +799,7 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
   const isFive = Number(prevKey.slice(3)) % 5 === 4;
   const tss = tokens.map(() => prevTs);
   const vols5 = isFive ? tokens.map(t => (minVolRing.get(t) || []).reduce((a, b) => a + b, 0)) : [];
-  const vwaps = tokens.map(t => lastWsAvg.get(t) ?? 0);   // v5.22 fix
+  const vwaps = tokens.map(t => lastWsAvg.get(t) ?? 0);
   try {
     await db.query(
       `UPDATE strategy_bs_snapshot AS s
@@ -879,7 +861,6 @@ setInterval(() => {
   flushWSMinuteClose(prevKey, prevTs, date).catch(() => {});
 }, 1000);
 
-
 /* ============================================================
    SECTION 4.7 — MARGIN SERVICE INTEGRATION
    ============================================================ */
@@ -912,7 +893,6 @@ function buildLtpMap() {
 }
 
 async function maybeRefreshMargins(broker = 'angelone', { force = false } = {}) {
-  // v5.13: WEEKLY gate — refresh SIRF jab (a) cache khali ho, ya (b) marker 7 din purana ho, ya (c) force
   let markerAge = null;
   try {
     const { rows } = await db.query(`SELECT value FROM kv_store WHERE key = $1`, ['margin_refresh_' + broker]);
@@ -924,7 +904,6 @@ async function maybeRefreshMargins(broker = 'angelone', { force = false } = {}) 
   }
   if (!force) {
     if (cacheOk && markerAge === null) {
-      // cache DB se loaded hai, marker nahi — baseline marker likho, refresh NAHI karo (403 bachat)
       await db.query(
         `INSERT INTO kv_store (key, value) VALUES ($1, NOW())
          ON CONFLICT (key) DO UPDATE SET value = kv_store.value`,
@@ -949,19 +928,18 @@ async function maybeRefreshMargins(broker = 'angelone', { force = false } = {}) 
   console.log(`📊 Margin refreshed [${broker}] — agla auto refresh 7 din baad`);
 }
 
-
 /* ============================================================
    SECTION 5 — WEBSOCKET + SSE + BATCHED LTP
    ============================================================ */
 let wsStarted = false;
-let depthStarted = false;       // v5.12
-const depthCache = new Map();   // token -> latest depth packet
-const depthSec = new Map();     // token -> per-second ratio samples (last 60)
+let depthStarted = false;
+const depthCache = new Map();
+const depthSec = new Map();
 let depthPend = new Map();
 let depthTimer = null;
-let lastDepthPacket = 0;        // v5.14: watchdog ke liye
-let depthPktCount = 0;          // v5.14: per-minute rate log
-let depthRestarts = 0;          // v5.14: adaptive quota cap ke liye
+let lastDepthPacket = 0;
+let depthPktCount = 0;
+let depthRestarts = 0;
 let depthWatchdog = null;
 
 const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000);
@@ -1014,8 +992,8 @@ function sseSend(payload) {
   }
 }
 
-const ssePendingVwap = new Map();   // v5.9: tick-by-tick VWAP SSE ke saath
-const ssePendingRsi = new Map();    // v5.10: tick-by-tick live RSI SSE ke saath
+const ssePendingVwap = new Map();
+const ssePendingRsi = new Map();
 
 function broadcastLTP(token, ltp) {
   if (!sseClients.size) return;
@@ -1040,8 +1018,6 @@ function broadcastLTP(token, ltp) {
     sseSend(payload);
   }, 100);
 }
-
-
 
 function broadcastBS(fetchedAt) {
   if (!sseClients.size) return;
@@ -1071,7 +1047,6 @@ function broadcastChip() {
 function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
   if (extra && Number.isFinite(extra.volume) && extra.volume > 0) {
-    // v5.9: PER-TRADE TRUE VWAP = Σ(price×Δvol)/Σ(Δvol) — exchange wala hi math, tick-by-tick
     const tk = String(token);
     const today = getIST().toISOString().split('T')[0];
     if (vwapDate !== today) { vwapPV.clear(); vwapV.clear(); vwapDate = today; }
@@ -1095,7 +1070,7 @@ function handleTick(token, ltp, tickMs, extra) {
   setCachedLTP(token, ltp);
   broadcastLTP(token, ltp);
   lastLtpAt.set(String(token), Date.now());
-  onTickPos(token, ltp);                      // v4.9.3: autoTrader SL/T1/T2/trail monitor
+  onTickPos(token, ltp);
 
   if (RSI_SOURCE === 'ws') {
     const st = rsiState.get(String(token));
@@ -1137,10 +1112,9 @@ function startWebSocketForReadyPhase() {
     wsStarted = true;
     console.log(`🔌 WS started for ${tokens.length} tokens`);
 
-    // v5.12: DEPTH LIVE engine — top-300 change% + chips + positions (alag connection)
     if (String(process.env.DEPTH_LIVE || 'true') === 'true' && !depthStarted) {
-      depthStarted = true;   // flag turant (double-start rokne ke liye)
-      setTimeout(() => startDepthLive(feedToken), 45000);   // v5.13: main WS ke 45s baad (429 se bachat)
+      depthStarted = true;
+      setTimeout(() => startDepthLive(feedToken), 45000);
       console.log('🧿 Depth engine scheduled (45s delay)');
     }
   } catch (e) { console.error('WS start failed:', e.message); }
@@ -1161,12 +1135,8 @@ setInterval(() => {
   else stopWebSocketIfNeeded();
 }, 5 * 1000);
 
-
 /* ============================================================
-   SECTION 5.9 — DEPTH ENGINE (v5.12): tick-by-tick buyers vs sellers
-   - top-300 live change% + chips + open positions = depth list (10-min refresh)
-   - depthCache = latest book; depthSec = per-second ratio samples (continuity)
-   - SSE 'depth' event (500ms batch) + minute snapshot me depth-preferred
+   SECTION 5.9 — DEPTH ENGINE
    ============================================================ */
 function onDepthPacket(d) {
   if (d.buyQty == null || d.sellQty == null) return;
@@ -1215,11 +1185,11 @@ function computeDepthList() {
     return { t, chg };
   }).sort((a, b) => b.chg - a.chg);
   const set = new Set(scored.slice(0, 300).map(x => x.t));
-  for (const t of chipList.keys()) set.add(String(t));          // chips hamesha
-  for (const p of getPositions()) {                              // open positions hamesha
+  for (const t of chipList.keys()) set.add(String(t));
+  for (const p of getPositions()) {
     if (p.status === 'open') set.add(String(p.token));
   }
-  const cap = depthRestarts >= 3 ? 150 : (depthRestarts >= 1 ? 250 : 330);   // v5.14: 429 se bache to quota khud ghire
+  const cap = depthRestarts >= 3 ? 150 : (depthRestarts >= 1 ? 250 : 330);
   return [...set].slice(0, cap);
 }
 
@@ -1234,10 +1204,9 @@ function startDepthLive(feedToken) {
   });
   setInterval(() => {
     if (!shouldStartWS() || !depthStarted) return;
-    resubscribeDepth(computeDepthList());   // 10-min me list refresh (top-300 change%)
+    resubscribeDepth(computeDepthList());
   }, 10 * 60 * 1000);
 
-  // v5.14: WATCHDOG — depth mari ho ya packets ruk gaye ho to 60-90s me zinda karo
   if (!depthWatchdog) {
     depthWatchdog = setInterval(() => {
       if (!shouldStartWS()) return;
@@ -1257,7 +1226,6 @@ function startDepthLive(feedToken) {
   }
 }
 
-/* feedToken dobara chahiye watchdog restart ke liye */
 function getLastFeedToken() {
   const restSession = getSessionStatusREST();
   return restSession.loggedIn ? getFeedTokenREST() : getFeedTokenQuote();
@@ -1284,7 +1252,6 @@ async function log(actor, action, details = '', level = 'info') {
       [actor, action, details, level]);
   } catch {}
 }
-
 
 /* ============================================================
    SECTION 7 — SCREENER ROUTES (public)
@@ -1326,8 +1293,6 @@ app.get('/api/screener/data', auth, (req, res) => {
     .filter(c => Array.isArray(c.candle) && c.candle.length >= 5)
     .map(c => String(c.token));
 
-
-
   const allCached = allCandles.filter(c => Array.isArray(c.candle) && c.candle.length >= 5);
 
   res.json({
@@ -1352,8 +1317,19 @@ app.get('/api/screener/chips', auth, (req, res) => {
   res.json({ ok: true, date: chipDate, locked: chipDate != null, chips });
 });
 
-/* v5.7: PER-USER CAPITAL (real-time, memory-only — DB me save nahi) */
-const userCapital = new Map();   // userId -> capital
+/* TRADINGVIEW RSI MICROSERVICE ROUTE */
+app.get('/api/tv-rsi/:sym', auth, async (req, res) => {
+  const symbol = req.params.sym;
+  const rsiData = await fetchTvRsiFromPython(symbol);
+  
+  if (!rsiData || !rsiData.ok) {
+    return res.status(500).json({ error: 'Failed to fetch from Python', detail: rsiData });
+  }
+  
+  res.json(rsiData);
+});
+
+const userCapital = new Map();
 
 app.post('/api/auto/capital', auth, (req, res) => {
   const uid = req.user?.id || req.user?.username || 'admin';
@@ -1368,12 +1344,10 @@ app.get('/api/auto/capital', auth, (req, res) => {
   res.json({ ok: true, capital: userCapital.get(uid) ?? Number(process.env.AUTO_PER_TRADE || 25000) });
 });
 
-/* v5.10: STRONG BUYERS endpoint — page load pe current group */
 app.get('/api/screener/buyers', auth, (req, res) => {
   res.json({ ok: true, buyers: Object.fromEntries(buyersInfo) });
 });
 
-/* v4.9.4: ORDERS page endpoint — positions + live LTP + Net P&L (per-user) */
 app.get('/api/auto/positions', auth, async (req, res) => {
   try {
     const date = req.query.date || getIST().toISOString().split('T')[0];
@@ -1436,8 +1410,6 @@ app.get('/api/screener/stream', (req, res) => {
   });
 });
 
-
-
 app.post('/api/screener/ltp', auth, async (req, res) => {
   const { tokens } = req.body;
   if (!Array.isArray(tokens) || !tokens.length) return res.status(400).json({ error: 'tokens array required' });
@@ -1447,7 +1419,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
   const serverTime = new Date().toISOString();
   const enriched = tokens.map(t => {
     const token = String(t);
-    const ltp = getCachedLTP(token) ?? bsCache.get(token)?.ltp ?? null;   // v4.9.4: market band/restart ke baad BS table ka LTP
+    const ltp = getCachedLTP(token) ?? bsCache.get(token)?.ltp ?? null;
     const prevClose = prevCloseCache.get(token) || null;
     const bs = bsCache.get(token) || null;
     const lev = getLeverage('angelone', token);
@@ -1462,7 +1434,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       rsi: bs?.rsi ?? null,
       leverage: lev ?? null,
       marginPerShare: lev && ltp ? +(ltp / lev).toFixed(4) : null,
-      vwap: lastWsAvg.get(token) ?? computeVWAP(token),   // v5.8: exchange VWAP live, fallback computed
+      vwap: lastWsAvg.get(token) ?? computeVWAP(token),
       rsiFirst: bs?.rsiFirst ?? null,
       serverTime
     };
@@ -1488,11 +1460,9 @@ app.post('/api/screener/maxqty', auth, (req, res) => {
   });
 });
 
-
 /* ============================================================
    SECTION 7.1 — ADMIN TRIGGERS
    ============================================================ */
-
 app.post('/api/admin/force-day-hlc', auth, adminOnly, async (req, res) => {
   try {
     await fetchDayHLC();
@@ -1600,15 +1570,13 @@ app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-
 /* ============================================================
-   SECTION 7.2 — HISTORICAL BACKFILL (v5.4)
-   Fetch 1-min + 5-min from Angel REST, overwrite WS columns
+   SECTION 7.2 — HISTORICAL BACKFILL
    ============================================================ */
-const HISTORICAL_DAYS_DEFAULT = 10;  // v5.15: last 10 working days
+const HISTORICAL_DAYS_DEFAULT = 10;
 const ANGEL_HISTORICAL_URL = 'https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData';
 let historicalRunning = false;
-const historicalFailed = new Set();   // v4.9.1: pichle run ke failed tokens → agla click sirf inhe retry karega
+const historicalFailed = new Set();
 
 function getAnyAngelJwt() {
   if (getSessionStatusREST()?.loggedIn && getJwtREST?.())  return getJwtREST();
@@ -1620,7 +1588,7 @@ function getAnyAngelJwt() {
 async function fetchAngelInterval(token, interval, daysBack) {
   const nowIST = getIST();
   const toDate = nowIST.toISOString().split('T')[0];
-  const fromMs = nowIST.getTime() - (daysBack + 6) * 24 * 3600 * 1000;   // v5.15: 10 working days ≈ 14 calendar
+  const fromMs = nowIST.getTime() - (daysBack + 6) * 24 * 3600 * 1000;
   const fromDate = new Date(fromMs).toISOString().split('T')[0];
 
   const doRequest = async (jwt) => {
@@ -1659,7 +1627,6 @@ async function fetchAngelInterval(token, interval, daysBack) {
   if (!jwt) throw new Error('No Angel JWT');
   let out = await doRequest(jwt);
   if (out.authFail) {
-    // v5.16: token mar gaya → AUTO RE-LOGIN → ek retry (Invalid Token avalanche fix)
     console.log(`🔑 Historical auth fail (${out.msg}) — re-login + retry`);
     await loginREST().catch(e => console.error('🔑 re-login failed:', e.message));
     jwt = getAnyAngelJwt();
@@ -1667,7 +1634,7 @@ async function fetchAngelInterval(token, interval, daysBack) {
     out = await doRequest(jwt);
     if (out.authFail) throw new Error(out.msg + ' (after re-login)');
   }
-  return out.data;   // [ [ts, o, h, l, c, v], ... ]
+  return out.data;
 }
 
 function groupCandlesByDate(raw, shiftMin = 0) {
@@ -1678,13 +1645,12 @@ function groupCandlesByDate(raw, shiftMin = 0) {
     else ms = new Date(b[0]).getTime();
     if (!Number.isFinite(ms)) continue;
 
-    const istD = new Date(ms + 5.5 * 3600 * 1000 + shiftMin * 60000);   // v5.15: 5-min label +4 shift
+    const istD = new Date(ms + 5.5 * 3600 * 1000 + shiftMin * 60000);
     const date = istD.toISOString().slice(0, 10);
     const hh = istD.getUTCHours();
     const mm = istD.getUTCMinutes();
     const mins = hh * 60 + mm;
 
-    // Filter 9:15–15:30 IST
     if (mins < 9 * 60 + 15 || mins > 15 * 60 + 30) continue;
 
     if (!byDate[date]) byDate[date] = { closes: [], ts: [], vols: [], minutes: [] };
@@ -1692,22 +1658,19 @@ function groupCandlesByDate(raw, shiftMin = 0) {
     byDate[date].closes.push(+b[4]);
     byDate[date].ts.push(tsStr);
     byDate[date].vols.push(+b[5] || 0);
-    byDate[date].minutes.push(mins);   // v4.9.2: minutes-of-day (555-929) — fillMissingMinutes isi ko match karta hai
+    byDate[date].minutes.push(mins);
   }
   return byDate;
 }
 
 function fillMissingMinutes(by1m, step = 1, first = 555, last = 929) {
-  // Angel sirf traded minutes deta hai → khali minutes bhar do
-  // (carry-forward close, volume 0) taaki har din 375 continuous candles ho
-  // — live WS sampler ki convention se exact match
   for (const date in by1m) {
     const src = by1m[date];
     if (!src.minutes || !src.minutes.length) continue;
     const have = new Map();
     for (let i = 0; i < src.minutes.length; i++) have.set(src.minutes[i], i);
     const closes = [], ts = [], vols = [], minutes = [];
-    let prevClose = src.closes[0];   // leading minutes = pehli candle ka close
+    let prevClose = src.closes[0];
     for (let m = first; m <= last; m += step) {
       const idx = have.get(m);
       let c, v;
@@ -1724,41 +1687,17 @@ function fillMissingMinutes(by1m, step = 1, first = 555, last = 929) {
   return by1m;
 }
 
-function derive5minFrom1min(by1m) {
-  // 5-min candle ends at minutes % 5 === 4  (matches WS sampler convention)
-  // 5-min volume = pichle 5 one-min volumes ka sum (live ws_5min_volume jaisa)
-  const by5m = {};
-  for (const date in by1m) {
-    const src = by1m[date];
-    const dst = { closes: [], ts: [], vols: [] };
-    for (let i = 0; i < src.minutes.length; i++) {
-      if (src.minutes[i] % 5 === 4) {
-        let v = 0;
-        for (let k = Math.max(0, i - 4); k <= i; k++) v += src.vols[k] || 0;
-        dst.closes.push(src.closes[i]);
-        dst.ts.push(src.ts[i]);
-        dst.vols.push(v);
-      }
-    }
-    by5m[date] = dst;
-  }
-  return by5m;
-}
-
 async function backfillOneStock(stock, daysBack) {
   const sym = stock.sym;
   const token = String(stock.token);
 
-  // 1-min from Angel
   const raw1m = await fetchAngelInterval(token, 'ONE_MINUTE', daysBack);
-  const by1m = fillMissingMinutes(groupCandlesByDate(raw1m), 1, 555, 929);   // 375 continuous
+  const by1m = fillMissingMinutes(groupCandlesByDate(raw1m), 1, 555, 929);
 
-  // v5.15: 5-min ALAG API call se (derive nahi) — 400ms gap = rate-limit safe
   await new Promise(r => setTimeout(r, 400));
   const raw5m = await fetchAngelInterval(token, 'FIVE_MINUTE', daysBack);
-  const by5m = fillMissingMinutes(groupCandlesByDate(raw5m, 4), 5, 559, 929);   // 75 continuous, ts live-convention match
+  const by5m = fillMissingMinutes(groupCandlesByDate(raw5m, 4), 5, 559, 929);
 
-  // Keep last N days
   const dates = Object.keys(by1m).sort().slice(-daysBack);
   let saved = 0;
 
@@ -1806,8 +1745,6 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
   }
   historicalRunning = true;
 
-  // v4.9.2: cross-instance DB lock — Render pe 2+ instances ho to bhi sirf EK run chalega
-  // (advisory xact lock: instance mare ya connection toote to lock khud release)
   let lockClient = null;
   try {
     lockClient = await db.connect();
@@ -1832,7 +1769,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
   const summary = { ok: 0, failed: 0, skipped: 0, days_saved: 0, total: STOCKS.length };
   const errors = [];
 
-  const DELAY_MS = 900;   // v4.9.1: ~1.1 req/sec — Angel rate-limit safe
+  const DELAY_MS = 900;
   const retryOnly = req.body?.all !== true && historicalFailed.size > 0;
   const queue = retryOnly
     ? STOCKS.filter(s => historicalFailed.has(String(s.token)))
@@ -1852,9 +1789,8 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
         } else {
           summary.skipped++;
         }
-        historicalFailed.delete(String(stock.token));   // ✅ success = retry list se hatao
+        historicalFailed.delete(String(stock.token));
       } catch (e) {
-        // v4.9.1: ek retry, 2s ruk ke (rate-limit safe)
         await new Promise(r => setTimeout(r, 2000));
         try {
           const r2 = await backfillOneStock(stock, days);
@@ -1863,7 +1799,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
           historicalFailed.delete(String(stock.token));
         } catch (e2) {
           summary.failed++;
-          historicalFailed.add(String(stock.token));    // ❌ fail = agla click sirf inhe chalega
+          historicalFailed.add(String(stock.token));
           if (summary.failed === 1) console.error('❌ First error:', stock.sym, e2.message);
           if (errors.length < 20) errors.push(`${stock.sym}: ${e2.message}`);
         }
@@ -1878,11 +1814,9 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
     const elapsed = Math.round((Date.now() - t0) / 1000);
     console.log(`✅ Historical DONE ${elapsed}s | ok=${summary.ok} skip=${summary.skipped} fail=${summary.failed} days=${summary.days_saved} | retry_pending=${historicalFailed.size}`);
 
-    // Rebuild memory after backfill
     try {
       await loadPrevWSClosesFromDB();
       await loadTodayWSClosesFromDB();
-      // v5.9: VWAP sums seed — restart ke baad bhi day-start se accurate
   {
     const t0 = getIST().toISOString().split('T')[0];
     vwapDate = t0;
@@ -1894,7 +1828,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
     }
     if (vwapPV.size) console.log(`🧮 VWAP seeded from stored minutes: ${vwapPV.size} tokens`);
   }
-  await backfillRsiFirst(getIST().toISOString().split('T')[0]);   // v5.5
+  await backfillRsiFirst(getIST().toISOString().split('T')[0]);
   seedRSIStateFromMemory();
       console.log('🔄 WS caches reloaded after backfill');
     } catch (e) { console.error('Post-backfill reload failed:', e.message); }
@@ -1905,13 +1839,12 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
     res.status(500).json({ error: e.message });
   } finally {
     historicalRunning = false;
-    try { if (lockClient) { await lockClient.query('ROLLBACK'); lockClient.release(); } } catch {}   // v4.9.2: lock release
+    try { if (lockClient) { await lockClient.query('ROLLBACK'); lockClient.release(); } } catch {}
   }
 });
 
-
 /* ============================================================
-   SECTION 8 — DAY H/L/C FETCH (15:31 IST)
+   SECTION 8 — DAY H/L/C FETCH
    ============================================================ */
 async function fetchDayHLC() {
   try {
@@ -1988,10 +1921,8 @@ async function fetchDayHLC() {
   } catch (e) { console.error('❌ Day H/L/C fetch failed:', e); }
 }
 
-
-
 /* ============================================================
-   SECTION 10 — AUTO PRE-OPEN @ 9:13:30 IST
+   SECTION 10 — AUTO PRE-OPEN
    ============================================================ */
 async function autoFetchPreopen() {
   try {
@@ -2024,14 +1955,13 @@ async function autoFetchPreopen() {
   } catch (e) { console.error('Auto-preopen failed:', e.message); }
 }
 
-
 /* ============================================================
-   SECTION 11 — BS FETCH (9:15 + 30s interval) + MINUTE SELF-COLLECT
+   SECTION 11 — BS FETCH
    ============================================================ */
 let bsIntervalTimer = null;
 let bsRunning = false;
-let prevSyncDate = null;   // v5.3: din me ek baar prev_close cache sync
-let bsFreshDate = null;    // v5.21: date for which strategy_bs_snapshot.day_open is TODAY's (entry engine gate)
+let prevSyncDate = null;
+let bsFreshDate = null;
 
 async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
   if (bsRunning) { if (!silent) console.log('💹 Auto-BS: previous run in progress — skipping'); return; }
@@ -2086,8 +2016,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
           preopenPrice: existing.preopenPrice ?? null,
           preopenAt: existing.preopenAt ?? null,
           rsi,
-          rsiFirst: existing.rsiFirst ?? null // <--- YEH LINE ADD KAREIN
-
+          rsiFirst: existing.rsiFirst ?? null
         });
 
         if (r.prevClose && r.prevClose > 0) {
@@ -2162,12 +2091,10 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
              fetched_at=EXCLUDED.fetched_at`,
           [p.date, bTokens, bSyms, bBuy, bSell, bLtp, bVol, bOpen, bHigh, bLow, bClose, bPivot, bPrevClose, bRsi, fetchedAt]
         );
-        // v5.21: today's day_open is now the authoritative source for the entry engine
         bsFreshDate = p.date;
       } catch (e) { dbErrors.push(`bulk-bs: ${e.message}`); }
     }
 
-    // v5.3: 9:15 ke pehle BS write ke baad prev_close cache sync (din me ek baar)
     if (!volumeOnly && prevSyncDate !== p.date) {
       await loadPrevCloseFromDB();
       prevSyncDate = p.date;
@@ -2185,7 +2112,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
 
     if (!volumeOnly) await assignDailyRank(p.date);
     if (!volumeOnly) await buildChipList(p.date);
-    // v5.20: entry ab apne 5s interval engine se hota hai (startEntryEngine) — BS fetch pe depend nahi
 
     if (!volumeOnly) {
       maybeRefreshMargins('angelone').catch(e => console.error('margin refresh:', e.message));
@@ -2261,8 +2187,8 @@ async function buildChipList(date) {
       if (!dayOpen || !prevClose || prevClose <= 0) continue;
       const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
       const rsi = bsCache.get(x.token)?.rsi ?? null;
-      if (gapPct >= 3) continue;   // v5.20: gap-up >= 3% exclude (exactly 3% bhi out)
-      if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;   // TEST MODE me RSI filter OFF
+      if (gapPct >= 3) continue;
+      if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;
       chips.push({
         token: x.token,
         sym: SYM_BY_TOKEN[x.token] || '?',
@@ -2282,40 +2208,20 @@ async function buildChipList(date) {
     }
     chipDate = date;
     console.log(`🔒 Chip list LOCKED for ${date}: ${chips.length} stocks → ${chips.map(c => `${c.sym}(#${c.rank},gap+${c.gapPct}%,RSI${c.rsiAtLock})`).join(', ') || 'none'}`);
-    broadcastChip();   // v5.7: chips sirf DISPLAY ke liye — entry v5.20 entry engine se hota hai
+    broadcastChip();
   } catch (e) { console.error('Chip list build failed:', e.message); }
 }
 
-/* ============================================================
-   v5.20: ENTRY TRIGGER ENGINE — 🏆 Top Performing rules se entries
-   ------------------------------------------------------------
-   Purana v5.6 buildEntryList (din me ek baar, change%-top-10 turant buy) HATAYA.
-   Ab entry TAB hoti hai jab stock day-open se +ENTRY_OPEN_GAIN_PCT (default 1%)
-   pehli baar cross kare:
-     - gap-up >= ENTRY_GAP_MAX_PCT (default 3%) → EXCLUDE (fake spike / unsafe)
-     - change% (vs prev_close) > 0 zaroori
-     - CHIP_TEST_MODE=false ho to RSI >= 70 bhi (existing behaviour)
-     - Window: ENTRY_START_MIN..ENTRY_END_MIN (default 9:15–11:00 IST)
-     - Har ENTRY_SCAN_MS (default 5s) scan; per-token din me EK entry;
-       total cap MAX_ENTRIES (default 10)
-     - Restart-safe: aaj ke positions DB se loaded hain to un tokens ko
-       already-entered maante hain
-     - cand me dayOpen bhi jata hai → autoTrader v1.3 SL = DAY OPEN banata hai
-
-   v5.21: HARD GATE — `bsFreshDate !== date` ho to scan skip.
-          Isse 9:15:00–9:15:10 ke beech stale (yesterday) day_open pe entry nahi hoti.
-          Plus ±20% day_open-vs-prev_close sanity check per candidate.
-   ============================================================ */
 const MAX_ENTRIES = Number(process.env.MAX_ENTRIES || 10);
-const ENTRY_OPEN_GAIN_PCT = Number(process.env.ENTRY_OPEN_GAIN_PCT || 1.0);   // open se +1% cross = entry
-const ENTRY_MAX_GAIN_PCT = Number(process.env.ENTRY_MAX_GAIN_PCT || 3.0);     // Max 3% buffer (no chasing)
-const ENTRY_GAP_MAX_PCT = Number(process.env.ENTRY_GAP_MAX_PCT || 3.0);       // gap >= 3% exclude
-const ENTRY_START_MIN = Number(process.env.ENTRY_START_MIN || 9 * 60 + 15);   // 9:15 IST
-const ENTRY_END_MIN = Number(process.env.ENTRY_END_MIN || 11 * 60);           // 11:00 IST
-const ENTRY_SCAN_MS = Number(process.env.ENTRY_SCAN_MS || 1000);              // 1 second scan
+const ENTRY_OPEN_GAIN_PCT = Number(process.env.ENTRY_OPEN_GAIN_PCT || 1.0);
+const ENTRY_MAX_GAIN_PCT = Number(process.env.ENTRY_MAX_GAIN_PCT || 3.0);
+const ENTRY_GAP_MAX_PCT = Number(process.env.ENTRY_GAP_MAX_PCT || 3.0);
+const ENTRY_START_MIN = Number(process.env.ENTRY_START_MIN || 9 * 60 + 15);
+const ENTRY_END_MIN = Number(process.env.ENTRY_END_MIN || 11 * 60);
+const ENTRY_SCAN_MS = Number(process.env.ENTRY_SCAN_MS || 1000); 
 
 let entryDay = null;
-const entryTriggered = new Set();   // tokens jinpe aaj entry ja chuki (ya DB me position hai)
+const entryTriggered = new Set();
 let entryCount = 0;
 
 function runEntryScan(date) {
@@ -2325,7 +2231,6 @@ function runEntryScan(date) {
       entryDay = date;
       entryTriggered.clear();
       entryCount = 0;
-      // restart-safe seeding: autoTrader ke paas is date ke positions pehle se hain?
       if (getPositionDate() === date) {
         for (const p of getPositions()) entryTriggered.add(String(p.token));
         entryCount = entryTriggered.size;
@@ -2333,15 +2238,13 @@ function runEntryScan(date) {
       }
     }
 
-    // v5.21: HARD GATE — do NOT scan until today's real day_open is in bsCache.
-    // Warna 9:15:00 pe yesterday ka day_open use ho jata hai (instant fake entries).
     if (bsFreshDate !== date) return;
 
     const ist = getIST();
     const dow = ist.getUTCDay();
     if (dow < 1 || dow > 5 || !isTradingDay(ist)) return;
     const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-    if (mins < ENTRY_START_MIN || mins >= ENTRY_END_MIN) return;   // 9:15–11:00 window
+    if (mins < ENTRY_START_MIN || mins >= ENTRY_END_MIN) return;
     if (entryCount >= MAX_ENTRIES) return;
 
     const cands = [];
@@ -2354,30 +2257,29 @@ function runEntryScan(date) {
       const prevClose = prevCloseCache.get(token) || null;
       if (!dayOpen || !prevClose || prevClose <= 0) continue;
 
-      // v5.21: day_open must be within ±20% of prev_close — else it's stale/misaligned
       if (Math.abs((dayOpen - prevClose) / prevClose) * 100 > 20) continue;
 
       const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
-      if (gapPct >= ENTRY_GAP_MAX_PCT) continue;                   // gap-up >= 3% = avoid
+      if (gapPct >= ENTRY_GAP_MAX_PCT) continue;
       const ltp = getCachedLTP(token);
       if (!ltp) continue;
-      
       const openGainPct = ((ltp - dayOpen) / dayOpen) * 100;
-      if (openGainPct < ENTRY_OPEN_GAIN_PCT) continue;             // open se +1% cross nahi hua
+      if (openGainPct < ENTRY_OPEN_GAIN_PCT) continue;
       
       // NEW: Max 3% Buffer Check
       if (openGainPct >= ENTRY_MAX_GAIN_PCT) continue;
 
-      // NEW: Live Volume check (Temporarily DISABLED for testing)
+      // NEW: Live Volume >= 1 Lakh (Temporarily commented out for testing)
       // const currentCum = lastWsVolume.get(token) || 0;
       // const prevMinEnd = prevCumVol.get(token) || 0;
       // const liveVol = currentCum - prevMinEnd;
       // if (liveVol < 100000) continue;
 
       const changePct = ((ltp - prevClose) / prevClose) * 100;
-      if (changePct <= 0) continue;                                // din me negative → skip
+      if (changePct <= 0) continue;
+      
       const rsi = bs.rsi ?? null;
-      if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;  // RSI >= 70 (test mode me OFF)
+      if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;
       
       cands.push({
         token, sym: st.sym, dayOpen: +(+dayOpen).toFixed(2),
@@ -2386,7 +2288,7 @@ function runEntryScan(date) {
     }
     if (!cands.length) return;
 
-    cands.sort((a, b) => b.openGainPct - a.openGainPct);           // sabse strong open-gain pehle
+    cands.sort((a, b) => b.openGainPct - a.openGainPct);
     const list = cands.slice(0, MAX_ENTRIES - entryCount);
     for (const c of list) entryTriggered.add(c.token);
     entryCount += list.length;
@@ -2395,7 +2297,6 @@ function runEntryScan(date) {
     const mi = String(ist.getUTCMinutes()).padStart(2, '0');
     console.log(`🎯 Entry trigger ${hh}:${mi} — ${list.length} BUY: ${list.map(c => `${c.sym}(open+${c.openGainPct}%)`).join(', ')} | today ${entryCount}/${MAX_ENTRIES}`);
 
-    // v5.7: per-user capital se qty — jo users ka capital real-time aaya hai unke liye
     const users = [...userCapital.entries()].map(([userId, capital]) => ({ userId, capital }));
     if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000) });
     onEntryScan(list, date, users).catch(e => console.error('🤖 Entry error:', e.message));
@@ -2450,10 +2351,6 @@ async function flushFinalMinuteBuffer() {
   }
 }
 
-
-/* ============================================================
-   SECTION 12 — SCHEDULERS
-   ============================================================ */
 function msUntil(targetHour, targetMin, dayOffsetIfPassed = 1) {
   const ist = getIST();
   const secs = ist.getUTCHours() * 3600 + ist.getUTCMinutes() * 60 + ist.getUTCSeconds();
@@ -2474,7 +2371,6 @@ function scheduleDailyHLC() {
   setTimeout(async () => { await fetchDayHLC(); scheduleDailyHLC(); }, ms);
 }
 
-
 function schedulePreopenFetch() {
   const ms = msUntil(9, 13, 1) + 30000;
   console.log(`⏰ Next auto-preopen in ${Math.round(ms / 60000)} min`);
@@ -2484,21 +2380,17 @@ function schedulePreopenFetch() {
   }, ms);
 }
 
-/* v5.8: BS fetch ab 30s nahi — har minute :01 pe (minute-end aligned)
-   - fetch ke turant baad pichle minute ka buy/sell snapshot arrays me append
-   - EOD 15:30 pe loop band */
 function msToNextMinute01() {
   const ist = getIST();
   const s = ist.getUTCSeconds();
   const ms = ist.getUTCMilliseconds();
-  return (60 - s) * 1000 - ms + 1000;   // agle minute ka ~:01
+  return (60 - s) * 1000 - ms + 1000;
 }
 
-const bsMinBuy = new Map();    // v5.10: token -> per-minute buy qty (memory mirror)
-const bsMinSell = new Map();   // v5.10: token -> per-minute sell qty
-const buyersInfo = new Map();  // v5.10: token -> { ratio, cont, n } (latest minute ka buyers view)
+const bsMinBuy = new Map();
+const bsMinSell = new Map();
+const buyersInfo = new Map();
 
-/* v5.10: startup pe aaj ke bs_1min arrays memory me (restart-safe) */
 async function loadBSMinuteArrays(date) {
   try {
     const activeTokens = STOCKS.map(s => String(s.token));
@@ -2516,9 +2408,6 @@ async function loadBSMinuteArrays(date) {
   } catch (e) { console.error('BS minute arrays load failed:', e.message); }
 }
 
-/* v5.10: buyers continuity compute — har minute snapshot ke baad
-   ratio = buy/(buy+sell) per minute | strong = latest ratio >= 55%
-   cont   = >=60% minutes me ratio >= 55% (continuous) | warna SPIKE */
 function computeBuyersGroups() {
   buyersInfo.clear();
   for (const [token, buys] of bsMinBuy) {
@@ -2538,7 +2427,6 @@ function computeBuyersGroups() {
     const cont = strongMin >= Math.max(1, Math.ceil(n * 0.6));
     buyersInfo.set(token, { ratio: +latest.toFixed(3), cont, n });
   }
-  // v5.12: depth overlay — tick-level continuity (60-sec window)
   for (const [token, arr] of depthSec) {
     if (!arr.length) continue;
     const latest = arr[arr.length - 1].r;
@@ -2563,7 +2451,7 @@ async function appendBSMinuteSnapshot(prevKey, prevTs, date) {
   for (const st of STOCKS) {
     const tk = String(st.token);
     const dc = depthCache.get(tk);
-    const fresh = dc && (Date.now() - dc.ts) < 5000;   // v5.12: depth fresh ho to wahi (tick-exact)
+    const fresh = dc && (Date.now() - dc.ts) < 5000;
     const bs = bsCache.get(tk);
     const bq = fresh ? dc.buyQty : bs?.buyQty;
     const sq = fresh ? dc.sellQty : bs?.sellQty;
@@ -2589,7 +2477,7 @@ async function appendBSMinuteSnapshot(prevKey, prevTs, date) {
   );
   computeBuyersGroups();
   broadcastBuyers();
-  if (prevKey === '09:20') backfillRsiFirst(date).catch(() => {});   // v5.13: 9:16 miss ho gaya ho to safety-net
+  if (prevKey === '09:20') backfillRsiFirst(date).catch(() => {});
   console.log(`⚖️ BS minute snapshot: ${tokens.length} tokens @ ${prevKey} | strong buyers: ${buyersInfo.size}`);
 }
 
@@ -2642,8 +2530,6 @@ function scheduleMorningPreload() {
   const ms = msUntil(9, 0);
   console.log(`⏰ Next morning preload in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
-    // v5.21: STALE DAY-OPEN KILL — purge yesterday's bsCache / chipList / freshness flag
-    // Warna entry engine 9:15:00 pe purani day_open pe instant entries le leta hai.
     bsFreshDate = null;
     bsCache.clear();
     chipList.clear();
@@ -2670,13 +2556,8 @@ function startMarginRefreshLoop() {
     if (secs < 9 * 3600 + 15 * 60 || secs > 15 * 3600 + 30 * 60) return;
     maybeRefreshMargins('angelone').catch(() => {});
   }, 5 * 60 * 1000);
-  console.log('📊 Margin loop: 5-min check, WEEKLY-gated (kv_store marker) — API call sirf 7 din me ek');
 }
 
-
-/* ============================================================
-   SECTION 13 — DB CACHE LOADER
-   ============================================================ */
 async function loadScreenerCacheFromDB() {
   try {
     const p = getScreenerPhase();
@@ -2700,26 +2581,15 @@ async function loadScreenerCacheFromDB() {
   } catch (e) { console.error('DB load failed:', e.message); }
 }
 
-
-/* ============================================================
-   REGISTER ADMIN ROUTES
-   ============================================================ */
 registerAdminRoutes(app, {
   db, SECRET,
   auth, adminOnly, log,
   loadHolidaysFromDB
 });
 
-
-/* ============================================================
-   SECTION 14 — START
-   ============================================================ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server on port ${PORT} — v5.22 (Vol paused)`);
-  console.log(`📊 Strategies: Momentum + Advance ORB`);
-  console.log(`💾 LTP flush: ${LTP_FLUSH_MS / 1000}s`);
-
   initMarginService(db, getBrokerSession);
 
   try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }
@@ -2735,10 +2605,9 @@ app.listen(PORT, async () => {
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();
   await loadChipListFromDB(getIST().toISOString().split('T')[0]);
-  await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);   // v5.10
+  await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
   computeBuyersGroups();
 
-  // v4.9.3: AutoTrader init (PAPER mode jab tak env AUTO_TRADE=true na karo)
   initAutoTrader({
     db,
     getJwt: getJwtREST,
@@ -2783,7 +2652,6 @@ app.listen(PORT, async () => {
           console.log('🔔 Late startup — running auto-BS catch-up');
           await autoFetchBS();
         } else {
-          // v5.21: late-start me bhi bsFreshDate set karo agar aaj ki rows maujood hain
           bsFreshDate = pB.date;
           console.log('🔔 Late startup — bsFreshDate set from existing rows');
         }
@@ -2799,7 +2667,7 @@ app.listen(PORT, async () => {
   scheduleFinalFlush();
   scheduleMorningPreload();
   startMarginRefreshLoop();
-  startEntryEngine();   // v5.20: Top Performing entry trigger (9:15–11:00, 1s scan) · v5.21: fresh-BS gate
+  startEntryEngine();
 
   maybeRefreshMargins('angelone', { force: true }).catch(() => {});
 

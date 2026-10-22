@@ -1,5 +1,5 @@
 /* ============================================================
-   autoTrader.js — v1.6 (Buy/Sell/Mix 50-50 support)
+   autoTrader.js — v1.7 (Buy/Sell/Mix 50-50 + Same-Day Single Side block)
    ============================================================ */
 
 const BE_TRIGGER_PCT = Number(process.env.AT_BE_PCT ?? 0.7);
@@ -35,7 +35,7 @@ export function initAutoTrader(deps) {
   getLtp = deps.getLtp || (() => null);
   getLev = deps.getLeverage || null;
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
-  console.log(`🤖 AutoTrader v1.6 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | rules: Buy & Sell (Short)`);
+  console.log(`🤖 AutoTrader v1.7 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | rules: Buy & Sell (Short)`);
   startSquareOffWatch();
 }
 
@@ -112,6 +112,17 @@ export async function onEntryScan(cands, date, users) {
 
     for (const c of selectedCands) {
       const token = String(c.token);
+      
+      // NEW: Same day same stock pe BUY/SELL dono block karo
+      let alreadyHasToken = false;
+      for (const p of positions.values()) {
+        if (p.userId === u.userId && p.token === token && p.status === 'open') {
+          alreadyHasToken = true;
+          break;
+        }
+      }
+      if (alreadyHasToken) continue; // Skip if already holding this stock
+
       const key = pkey(u.userId, token, c.side);
       if (positions.has(key)) continue; 
       

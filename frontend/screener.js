@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.7.1 (Prev Close SSE Fix)
+   SCREENER.JS  — v4.7.2 (Buy/Sell/Mix dropdown + Top Shorts)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -34,12 +34,21 @@ const OPEN_GAIN_REQUIRE_POSITIVE_CHANGE = true;
 let OPEN_GAIN_RANK = {};
 let OPEN_GAIN_RERENDER_TIMER = null;
 
+/* NEW: Sell-side (short) thresholds — inverted logic */
+const SELL_OPEN_GAIN_MAX_PCT = -1.0;   // dropped 1% below Day Open
+const SELL_GAP_MAX_PCT = 3.0;          // skip stocks that gapped up hard
+const SELL_REQUIRE_NEGATIVE_CHANGE = true;
+let SELL_CANDIDATE_RANK = {};
+
 let SCREENER_ACTIVE_STRATEGY = 'momentum';
 
 const NIFTY50_TOKEN = '99926000';
 const CURRENT_STRATEGY = 'momentum';
 
 let PER_TRADE = Number(localStorage.getItem('ta_capital') || 25000);
+/* NEW: Buy / Sell / Mix mode (persisted) */
+let SIDE_MODE = localStorage.getItem('ta_side_mode') || 'MIX';
+
 const BATCH_SIZE = 20;
 const BATCH_DELAY = 150;
 
@@ -54,6 +63,7 @@ async function initScreener() {
   }
   setupControls();
   postCapital();
+  postSideMode();   // NEW: push saved mode on load
   await loadStockList();
   await loadLTP();
   await loadChips();
@@ -102,6 +112,16 @@ function renderStrategyControls() {
            style="width:86px;padding:6px 8px;border:1.5px solid var(--border-soft);border-radius:8px;
                   font-size:12px;font-family:inherit;background:var(--bg-secondary);color:var(--text-primary)"
            onchange="onPerTradeChange()" />
+    <label style="font-size:11px;font-weight:600;color:var(--text-secondary);margin-left:2px">Mode</label>
+    <select id="sideModeSelect"
+            style="padding:6px 8px;border:1.5px solid var(--border-soft);border-radius:8px;
+                   font-size:12px;font-family:inherit;background:var(--bg-secondary);
+                   color:var(--text-primary);cursor:pointer;font-weight:700"
+            onchange="onSideModeChange()">
+      <option value="MIX"  ${SIDE_MODE === 'MIX'  ? 'selected' : ''}>🔀 Mix (50/50)</option>
+      <option value="BUY"  ${SIDE_MODE === 'BUY'  ? 'selected' : ''}>📈 Buy Only</option>
+      <option value="SELL" ${SIDE_MODE === 'SELL' ? 'selected' : ''}>📉 Sell Only</option>
+    </select>
     <div id="progressBar" style="display:none;width:100%;margin-top:8px">
       <div style="background:rgba(0,0,0,0.06);border-radius:10px;height:6px;overflow:hidden">
         <div id="progressFill" style="background:var(--gradient-brand);height:100%;width:0%;transition:width 0.3s"></div>
@@ -140,6 +160,32 @@ function postCapital() {
   }, 600);
 }
 
+/* NEW: Mode dropdown handler */
+function onSideModeChange() {
+  const sel = document.getElementById('sideModeSelect');
+  if (!sel) return;
+  SIDE_MODE = sel.value;
+  localStorage.setItem('ta_side_mode', SIDE_MODE);
+  postSideMode();
+  if (typeof showToast === 'function') {
+    showToast('🎯 Mode Set', `Auto-trade: ${SIDE_MODE === 'MIX' ? 'Mix (50/50)' : SIDE_MODE + ' only'}`);
+  }
+}
+
+let SIDE_MODE_POST_TIMER = null;
+function postSideMode() {
+  clearTimeout(SIDE_MODE_POST_TIMER);
+  SIDE_MODE_POST_TIMER = setTimeout(async () => {
+    try {
+      await fetch(API + '/api/auto/side-mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
+        body: JSON.stringify({ value: SIDE_MODE })
+      });
+    } catch (e) { console.error('Side mode sync failed:', e); }
+  }, 400);
+}
+
 async function loadChips() {
   try {
     const r = await fetch(API + '/api/screener/chips', {
@@ -156,23 +202,42 @@ async function loadChips() {
 
 function setMomentumFilter(key) {
   SCREENER_MOMENTUM_FILTER = key;
-  SCREENER_SORT_BY = (key === 'open_gain') ? 'open_gain' : 'change';
-  SCREENER_SORT_DIR = 'desc';
+  if (key === 'open_gain') {
+    SCREENER_SORT_BY = 'open_gain';
+    SCREENER_SORT_DIR = 'desc';
+  } else if (key === 'sell_candidates') {
+    SCREENER_SORT_BY = 'open_gain';
+    SCREENER_SORT_DIR = 'asc';   // most negative first
+  } else {
+    SCREENER_SORT_BY = 'change';
+    SCREENER_SORT_DIR = 'desc';
+  }
   renderScreenerTable();
 }
 
 function scheduleOpenGainRerender() {
-  if (SCREENER_MOMENTUM_FILTER !== 'open_gain') return;
+  if (SCREENER_MOMENTUM_FILTER !== 'open_gain' &&
+      SCREENER_MOMENTUM_FILTER !== 'sell_candidates') return;
   if (OPEN_GAIN_RERENDER_TIMER) return;
   OPEN_GAIN_RERENDER_TIMER = setTimeout(() => {
     OPEN_GAIN_RERENDER_TIMER = null;
-    if (SCREENER_MOMENTUM_FILTER === 'open_gain') renderScreenerTable();
+    if (SCREENER_MOMENTUM_FILTER === 'open_gain' ||
+        SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
+      renderScreenerTable();
+    }
   }, 2000);
 }
 
 function countOpenGainStocks() {
   let n = 0;
   for (const s of SCREENER_ALL_STOCKS) if (passesOpenGain(s.token)) n++;
+  return n;
+}
+
+/* NEW: count sell candidates */
+function countSellCandidates() {
+  let n = 0;
+  for (const s of SCREENER_ALL_STOCKS) if (passesSellCandidate(s.token)) n++;
   return n;
 }
 
@@ -186,8 +251,10 @@ function renderChips() {
       return `<button class="filter-chip ${active}" onclick="setMomentumFilter('${key}')">${label}</button>`;
     };
     const ogCount = countOpenGainStocks();
+    const scCount = countSellCandidates();   // NEW
     el.innerHTML =
       chip('open_gain', `🏆 Top Performing (${ogCount})`) +
+      chip('sell_candidates', `📉 Top Shorts (${scCount})`) +   // NEW
       chip('all', 'All') +
       chip('top_gainers', '🚀 Top 15 Gainers') +
       chip('top_losers', '📉 Top 15 Losers') +
@@ -277,6 +344,19 @@ function passesOpenGain(token) {
   }
   const gap = computeGapPct(token);
   if (gap !== null && gap >= OPEN_GAIN_MAX_GAP_PCT) return false;
+  return true;
+}
+
+/* NEW: sell-side candidate filter (inverted) */
+function passesSellCandidate(token) {
+  const og = computeOpenGainPct(token);
+  if (og === null || og > SELL_OPEN_GAIN_MAX_PCT) return false;
+  if (SELL_REQUIRE_NEGATIVE_CHANGE) {
+    const chg = computeChangePct(token);
+    if (chg === null || chg >= 0) return false;
+  }
+  const gap = computeGapPct(token);
+  if (gap !== null && gap > SELL_GAP_MAX_PCT) return false;
   return true;
 }
 
@@ -701,13 +781,12 @@ function startSSE() {
       const msg = JSON.parse(e.data);
 
       if (msg.type === 'ltp' && msg.ticks) {
-        // NAYA: prevCloses update karein
         if (msg.prevCloses) {
           for (const [t, pc] of Object.entries(msg.prevCloses)) {
             SCREENER_PREV_CLOSE[t] = pc;
           }
         }
-        
+
         if (msg.ticks[NIFTY50_TOKEN] !== undefined) {
           SCREENER_LTP[NIFTY50_TOKEN] = msg.ticks[NIFTY50_TOKEN];
           updateNiftyHeader();
@@ -759,10 +838,13 @@ function renderScreenerTable() {
 
   if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
     const isOpenGainTab = SCREENER_MOMENTUM_FILTER === 'open_gain';
-    const COLSPAN = isOpenGainTab ? 14 : 13;
+    const isSellTab = SCREENER_MOMENTUM_FILTER === 'sell_candidates';
+    const showRankCol = isOpenGainTab || isSellTab;
+    const COLSPAN = showRankCol ? 14 : 13;
+
     head.innerHTML = `<tr>
-      ${isOpenGainTab ? `<th class="th-sortable" style="width:46px" onclick="setSort('open_gain')"
-          title="Top Performing rank — DAY OPEN se gain % (click to re-sort)">#${sortIndicator('open_gain')}</th>` : ''}
+      ${showRankCol ? `<th class="th-sortable" style="width:46px" onclick="setSort('open_gain')"
+          title="${isSellTab ? 'Short rank — DAY OPEN se drop %' : 'Top Performing rank — DAY OPEN se gain %'}">#${sortIndicator('open_gain')}</th>` : ''}
       <th>Stock / Company</th>
       <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
           <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
@@ -783,6 +865,8 @@ function renderScreenerTable() {
 
     if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
       filtered = filtered.filter(s => passesOpenGain(s.token));
+    } else if (SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
+      filtered = filtered.filter(s => passesSellCandidate(s.token));
     } else if (SCREENER_MOMENTUM_FILTER === 'top_gainers') {
       filtered = filtered
         .filter(s => {
@@ -814,10 +898,16 @@ function renderScreenerTable() {
     }
 
     OPEN_GAIN_RANK = {};
+    SELL_CANDIDATE_RANK = {};
+
     if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
       [...filtered]
         .sort((a, b) => getSortValue(b, 'open_gain') - getSortValue(a, 'open_gain'))
         .forEach((s, i) => { OPEN_GAIN_RANK[String(s.token)] = i + 1; });
+    } else if (SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
+      [...filtered]
+        .sort((a, b) => getSortValue(a, 'open_gain') - getSortValue(b, 'open_gain'))
+        .forEach((s, i) => { SELL_CANDIDATE_RANK[String(s.token)] = i + 1; });
     }
 
     const sorted = sortStocks(filtered);
@@ -829,6 +919,9 @@ function renderScreenerTable() {
             <span style="font-size:11px">Chips lock at 9:15 (top-10 rank · gap ≤3% · RSI ≥70)</span>`;
       } else if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
         emptyMsg = `🏆 Abhi koi stock DAY OPEN se <b>+${OPEN_GAIN_MIN_PCT.toFixed(2)}%</b> (change% positive, gap-up < ${OPEN_GAIN_MAX_GAP_PCT}%) nahi hai.<br>
+            <span style="font-size:11px">Live ticks pe har 2 second auto-refresh · DAY OPEN data pehle B/S fetch se aata hai</span>`;
+      } else if (SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
+        emptyMsg = `📉 Abhi koi stock DAY OPEN se <b>${SELL_OPEN_GAIN_MAX_PCT.toFixed(2)}%</b> neeche (change% negative, gap-up < ${SELL_GAP_MAX_PCT}%) nahi hai.<br>
             <span style="font-size:11px">Live ticks pe har 2 second auto-refresh · DAY OPEN data pehle B/S fetch se aata hai</span>`;
       } else {
         emptyMsg = `Loading stocks...<br>Please wait a few seconds.`;
@@ -870,8 +963,10 @@ function renderScreenerTable() {
       const lastUpdate = formatTimeIST(SCREENER_LASTUPD[s.token]);
       const rowClass = '';
 
+      const rankNum = (isSellTab ? SELL_CANDIDATE_RANK : OPEN_GAIN_RANK)[String(s.token)];
+
       return `<tr class="${rowClass}" data-token="${s.token}">
-        ${isOpenGainTab ? `<td style="font-weight:800;color:#6C5CE7;font-size:12px;text-align:center">${OPEN_GAIN_RANK[String(s.token)] ?? '—'}</td>` : ''}
+        ${showRankCol ? `<td style="font-weight:800;color:${isSellTab ? 'var(--danger)' : '#6C5CE7'};font-size:12px;text-align:center">${rankNum ?? '—'}</td>` : ''}
         <td><span class="sym">${s.sym}</span><span class="tok">${s.token}</span></td>
         <td style="white-space:nowrap">
           <span class="cell-primary ltp-cell">${ltp ? '₹' + (+ltp).toFixed(2) : '—'}</span>

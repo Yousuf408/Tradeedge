@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.25 (Buy/Sell Mode)
+   server.js — TradeAlgo Pro backend  |  v5.26 (Strict Top 15 + DB Side Mode)
    ============================================================ */
 
 import express from 'express';
@@ -1262,7 +1262,6 @@ app.get('/api/tv-rsi/:sym', auth, async (req, res) => {
 });
 
 const userCapital = new Map();
-const userTradeMode = new Map(); // NEW: Store user's Buy/Sell/Mix preference
 
 app.post('/api/auto/capital', auth, (req, res) => {
   const uid = req.user?.id || req.user?.username || 'admin';
@@ -1277,18 +1276,29 @@ app.get('/api/auto/capital', auth, (req, res) => {
   res.json({ ok: true, capital: userCapital.get(uid) ?? Number(process.env.AUTO_PER_TRADE || 25000) });
 });
 
-// NEW: Route to set Trade Mode
-app.post('/api/auto/trade-mode', auth, (req, res) => {
+// ✅ UPDATED: Save Side Mode to DB
+app.post('/api/auto/side-mode', auth, async (req, res) => {
   const uid = req.user?.id || req.user?.username || 'admin';
-  const mode = String(req.body?.mode || 'MIX').toUpperCase();
+  const mode = String(req.body?.value || 'MIX').toUpperCase();
   if (!['BUY', 'SELL', 'MIX'].includes(mode)) return res.status(400).json({ error: 'Invalid mode' });
-  userTradeMode.set(uid, mode);
-  res.json({ ok: true, userId: uid, mode });
+  
+  try {
+    await db.query(`UPDATE users SET side_mode = $1 WHERE user_id = $2`, [mode, uid]);
+    res.json({ ok: true, userId: uid, mode });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.get('/api/auto/trade-mode', auth, (req, res) => {
+// ✅ UPDATED: Fetch Side Mode from DB
+app.get('/api/auto/side-mode', auth, async (req, res) => {
   const uid = req.user?.id || req.user?.username || 'admin';
-  res.json({ ok: true, mode: userTradeMode.get(uid) || 'MIX' });
+  try {
+    const { rows } = await db.query(`SELECT side_mode FROM users WHERE user_id = $1`, [uid]);
+    res.json({ ok: true, mode: rows[0]?.side_mode || 'MIX' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/api/screener/buyers', auth, (req, res) => {
@@ -2102,7 +2112,8 @@ let entryDay = null;
 const entryTriggered = new Set();
 let entryCount = 0;
 
-function runEntryScan(date) {
+// ✅ UPDATED: Top 15 Sorting Logic + DB Users Fetch
+async function runEntryScan(date) {
   try {
     if (!date) return;
     if (entryDay !== date) {
@@ -2112,7 +2123,7 @@ function runEntryScan(date) {
       if (getPositionDate() === date) {
         for (const p of getPositions()) entryTriggered.add(String(p.token));
         entryCount = entryTriggered.size;
-        if (entryCount) console.log(`🎯 Entry engine: ${entryCount} tokens aaj already-entered (DB positions se seed)`);
+        if (entryCount) console.log(`🎯 Entry engine: ${entryCount} tokens aaj already-entered`);
       }
     }
 
@@ -2123,57 +2134,65 @@ function runEntryScan(date) {
     if (dow < 1 || dow > 5 || !isTradingDay(ist)) return;
     const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
     if (mins < ENTRY_START_MIN || mins >= ENTRY_END_MIN) return;
-    if (entryCount >= MAX_ENTRIES * 2) return; // Increased cap for both sides
+    if (entryCount >= MAX_ENTRIES * 2) return; 
 
-    const cands = [];
+    const validStocks = [];
     for (const st of STOCKS) {
       const token = String(st.token);
       if (entryTriggered.has(token)) continue;
+      
       const bs = bsCache.get(token);
       if (!bs) continue;
+      
       const dayOpen = bs.dayOpen ?? null;
       const prevClose = prevCloseCache.get(token) || null;
       if (!dayOpen || !prevClose || prevClose <= 0) continue;
 
-      if (Math.abs((dayOpen - prevClose) / prevClose) * 100 > 20) continue;
-
+      // Gap Filter (skip if gap > 3%)
       const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
       if (gapPct >= ENTRY_GAP_MAX_PCT) continue;
+      if (Math.abs(gapPct) > 20) continue; 
 
       const ltp = getCachedLTP(token);
       if (!ltp) continue;
       
-      const openGainPct = ((ltp - dayOpen) / dayOpen) * 100;
       const changePct = ((ltp - prevClose) / prevClose) * 100;
-      const rsi = bs.rsi ?? null;
+      const openGainPct = ((ltp - dayOpen) / dayOpen) * 100;
+      
+      validStocks.push({
+        token, sym: st.sym, dayOpen: +dayOpen.toFixed(2),
+        gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), 
+        changePct: +changePct.toFixed(2)
+      });
+    }
 
-      // --- BUY CONDITION ---
-      if (openGainPct >= ENTRY_OPEN_GAIN_PCT && openGainPct < ENTRY_MAX_GAIN_PCT && changePct > 0) {
-        if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;
-        cands.push({
-          token, sym: st.sym, dayOpen: +(+dayOpen).toFixed(2),
-          gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), changePct: +changePct.toFixed(2),
-          side: 'BUY'
-        });
-      }
-      // --- SELL CONDITION (SHORT) ---
-      else if (openGainPct <= -ENTRY_OPEN_GAIN_PCT && openGainPct > -ENTRY_MAX_GAIN_PCT && changePct < 0) {
-        if (!CHIP_TEST_MODE && (rsi == null || rsi > 30)) continue;
-        cands.push({
-          token, sym: st.sym, dayOpen: +(+dayOpen).toFixed(2),
-          gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), changePct: +changePct.toFixed(2),
-          side: 'SELL'
-        });
+    if (!validStocks.length) return;
+
+    // --- STEP 1 & 2: Sort by Change % and Take Top 15 ---
+    const sortedByChange = [...validStocks].sort((a, b) => b.changePct - a.changePct);
+    const top15Stocks = sortedByChange.slice(0, 15);
+
+    // --- STEP 3: Check which of these Top 15 hits the 1% requirement ---
+    const buyCands = [];
+    for (const c of top15Stocks) {
+      if (c.openGainPct >= ENTRY_OPEN_GAIN_PCT && c.openGainPct < ENTRY_MAX_GAIN_PCT) {
+        buyCands.push({ ...c, side: 'BUY' });
       }
     }
-    if (!cands.length) return;
 
-    // Sort and separate
-    const buyCands = cands.filter(c => c.side === 'BUY').sort((a, b) => b.openGainPct - a.openGainPct);
-    const sellCands = cands.filter(c => c.side === 'SELL').sort((a, b) => a.openGainPct - b.openGainPct);
+    // --- SELL Side Logic (Bottom 15) ---
+    const sortedByChangeAsc = [...validStocks].sort((a, b) => a.changePct - b.changePct);
+    const bottom15Stocks = sortedByChangeAsc.slice(0, 15);
+    const sellCands = [];
+    for (const c of bottom15Stocks) {
+      if (c.openGainPct <= -ENTRY_OPEN_GAIN_PCT && c.openGainPct > -ENTRY_MAX_GAIN_PCT) {
+        sellCands.push({ ...c, side: 'SELL' });
+      }
+    }
 
-    // Pass top candidates to autoTrader
-    const list = [...buyCands.slice(0, MAX_ENTRIES), ...sellCands.slice(0, MAX_ENTRIES)];
+    const list = [...buyCands, ...sellCands];
+    
+    // Safety: Filter out already triggered
     const newList = list.filter(c => !entryTriggered.has(c.token));
     if (!newList.length) return;
 
@@ -2182,13 +2201,18 @@ function runEntryScan(date) {
 
     const hh = String(ist.getUTCHours()).padStart(2, '0');
     const mi = String(ist.getUTCMinutes()).padStart(2, '0');
-    console.log(`🎯 Entry trigger ${hh}:${mi} — ${newList.length} CANDIDATES: ${newList.map(c => `${c.sym}(${c.side} ${c.openGainPct}%)`).join(', ')} | today ${entryCount}`);
+    console.log(`🎯 Entry trigger ${hh}:${mi} — ${newList.length} CANDIDATES: ${newList.map(c => `${c.sym}(${c.side} ${c.openGainPct}%)`).join(', ')}`);
 
-    const users = [...userCapital.entries()].map(([userId, capital]) => ({ 
-      userId, 
-      capital,
-      sideMode: userTradeMode.get(userId) || 'MIX'
-    }));
+    // ✅ FETCH SIDE MODE FROM DB INSTEAD OF MEMORY MAP
+    const { rows: dbUsers } = await db.query(`SELECT user_id, side_mode FROM users`);
+    const users = [...userCapital.entries()].map(([userId, capital]) => {
+      const dbU = dbUsers.find(u => u.user_id === userId);
+      return { 
+        userId, 
+        capital, 
+        sideMode: dbU?.side_mode || 'MIX' 
+      };
+    });
     
     if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000), sideMode: 'MIX' });
     
@@ -2201,7 +2225,7 @@ function startEntryEngine() {
     const p = getScreenerPhase();
     if (p && p.date) runEntryScan(p.date);
   }, ENTRY_SCAN_MS);
-  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | rule: BUY >+${ENTRY_OPEN_GAIN_PCT}% / SELL <-${ENTRY_OPEN_GAIN_PCT}% | cap ${MAX_ENTRIES} per side`);
+  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | Strict Top 15 Logic`);
 }
 
 async function loadChipListFromDB(date) {
@@ -2418,7 +2442,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.25 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.26 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2473,7 +2497,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.25`);
+  console.log(`✅ Server on port ${PORT} — v5.26`);
   initMarginService(db, getBrokerSession);
 
   try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }
@@ -2503,8 +2527,29 @@ app.listen(PORT, async () => {
     perTrade: Number(process.env.AUTO_PER_TRADE || 25000)
   });
   await loadOpenPositions(getIST().toISOString().split('T')[0]);
+  
   await loadPrevWSClosesFromDB();
   await loadTodayWSClosesFromDB();
+
+  // ✅ VWAP SEED FROM STORED MINUTES ON STARTUP
+  const todayStrForVwap = getIST().toISOString().split('T')[0];
+  vwapDate = todayStrForVwap;
+  for (const [tk, closes] of wsTodayCloses) {
+    const vols = wsTodayVols.get(tk) || [];
+    let pv = 0, vv = 0;
+    for (let i = 0; i < closes.length; i++) {
+      const v = vols[i] || 0;
+      pv += closes[i] * v;
+      vv += v;
+    }
+    if (vv > 0) {
+      vwapPV.set(tk, pv);
+      vwapV.set(tk, vv);
+      lastWsAvg.set(tk, +(pv / vv).toFixed(2));
+    }
+  }
+  console.log(`🧮 VWAP seeded from stored minutes: ${vwapPV.size} tokens`);
+
   seedRSIStateFromMemory();
 
   await loadCachedMargins('angelone');

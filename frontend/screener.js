@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.7.2 (Buy/Sell/Mix dropdown + Top Shorts)
+   SCREENER.JS  — v4.7.3 (Buy/Sell/Mix + Sorting Fix + Chips Cleanup)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -25,7 +25,7 @@ let EOD_FETCHING = false;
 let HISTORICAL_FETCHING = false;
 
 let SCREENER_MOMENTUM_FILTER = 'open_gain';
-let SCREENER_SORT_BY = 'open_gain';
+let SCREENER_SORT_BY = 'change';
 let SCREENER_SORT_DIR = 'desc';
 
 const OPEN_GAIN_MIN_PCT = 0.95;
@@ -34,7 +34,7 @@ const OPEN_GAIN_REQUIRE_POSITIVE_CHANGE = true;
 let OPEN_GAIN_RANK = {};
 let OPEN_GAIN_RERENDER_TIMER = null;
 
-/* NEW: Sell-side (short) thresholds — inverted logic */
+/* Sell-side (short) thresholds — inverted logic */
 const SELL_OPEN_GAIN_MAX_PCT = -1.0;   // dropped 1% below Day Open
 const SELL_GAP_MAX_PCT = 3.0;          // skip stocks that gapped up hard
 const SELL_REQUIRE_NEGATIVE_CHANGE = true;
@@ -46,7 +46,7 @@ const NIFTY50_TOKEN = '99926000';
 const CURRENT_STRATEGY = 'momentum';
 
 let PER_TRADE = Number(localStorage.getItem('ta_capital') || 25000);
-/* NEW: Buy / Sell / Mix mode (persisted) */
+/* Buy / Sell / Mix mode (persisted) */
 let SIDE_MODE = localStorage.getItem('ta_side_mode') || 'MIX';
 
 const BATCH_SIZE = 20;
@@ -63,7 +63,7 @@ async function initScreener() {
   }
   setupControls();
   postCapital();
-  postSideMode();   // NEW: push saved mode on load
+  postSideMode();
   await loadStockList();
   await loadLTP();
   await loadChips();
@@ -160,7 +160,7 @@ function postCapital() {
   }, 600);
 }
 
-/* NEW: Mode dropdown handler */
+/* Mode dropdown handler */
 function onSideModeChange() {
   const sel = document.getElementById('sideModeSelect');
   if (!sel) return;
@@ -203,11 +203,11 @@ async function loadChips() {
 function setMomentumFilter(key) {
   SCREENER_MOMENTUM_FILTER = key;
   if (key === 'open_gain') {
-    SCREENER_SORT_BY = 'open_gain';
+    SCREENER_SORT_BY = 'change'; // Changed to change % for sorting
     SCREENER_SORT_DIR = 'desc';
   } else if (key === 'sell_candidates') {
-    SCREENER_SORT_BY = 'open_gain';
-    SCREENER_SORT_DIR = 'asc';   // most negative first
+    SCREENER_SORT_BY = 'change'; // Changed to change % for sorting
+    SCREENER_SORT_DIR = 'asc';   
   } else {
     SCREENER_SORT_BY = 'change';
     SCREENER_SORT_DIR = 'desc';
@@ -234,7 +234,6 @@ function countOpenGainStocks() {
   return n;
 }
 
-/* NEW: count sell candidates */
 function countSellCandidates() {
   let n = 0;
   for (const s of SCREENER_ALL_STOCKS) if (passesSellCandidate(s.token)) n++;
@@ -251,14 +250,15 @@ function renderChips() {
       return `<button class="filter-chip ${active}" onclick="setMomentumFilter('${key}')">${label}</button>`;
     };
     const ogCount = countOpenGainStocks();
-    const scCount = countSellCandidates();   // NEW
+    const scCount = countSellCandidates();
+    
+    // REMOVED top_gainers and top_losers chips
     el.innerHTML =
       chip('open_gain', `🏆 Top Performing (${ogCount})`) +
-      chip('sell_candidates', `📉 Top Shorts (${scCount})`) +   // NEW
+      chip('sell_candidates', `📉 Top Shorts (${scCount})`) +
       chip('all', 'All') +
-      chip('top_gainers', '🚀 Top 15 Gainers') +
-      chip('top_losers', '📉 Top 15 Losers') +
       chip('rsi_chips', '🔒 RSI Chips');
+      
     el.style.display = '';
     return;
   }
@@ -347,7 +347,6 @@ function passesOpenGain(token) {
   return true;
 }
 
-/* NEW: sell-side candidate filter (inverted) */
 function passesSellCandidate(token) {
   const og = computeOpenGainPct(token);
   if (og === null || og > SELL_OPEN_GAIN_MAX_PCT) return false;
@@ -843,8 +842,8 @@ function renderScreenerTable() {
     const COLSPAN = showRankCol ? 14 : 13;
 
     head.innerHTML = `<tr>
-      ${showRankCol ? `<th class="th-sortable" style="width:46px" onclick="setSort('open_gain')"
-          title="${isSellTab ? 'Short rank — DAY OPEN se drop %' : 'Top Performing rank — DAY OPEN se gain %'}">#${sortIndicator('open_gain')}</th>` : ''}
+      ${showRankCol ? `<th class="th-sortable" style="width:46px" onclick="setSort('change')"
+          title="${isSellTab ? 'Short rank — Change % (Lowest first)' : 'Top Performing rank — Change % (Highest first)'}">#${sortIndicator('change')}</th>` : ''}
       <th>Stock / Company</th>
       <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
           <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
@@ -867,28 +866,6 @@ function renderScreenerTable() {
       filtered = filtered.filter(s => passesOpenGain(s.token));
     } else if (SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
       filtered = filtered.filter(s => passesSellCandidate(s.token));
-    } else if (SCREENER_MOMENTUM_FILTER === 'top_gainers') {
-      filtered = filtered
-        .filter(s => {
-          const chg = computeChangePct(s.token);
-          const gap = computeGapPct(s.token);
-          if (chg === null || chg <= 0) return false;
-          if (gap !== null && gap >= 2) return false;
-          return true;
-        })
-        .sort((a, b) => computeChangePct(b.token) - computeChangePct(a.token))
-        .slice(0, 15);
-    } else if (SCREENER_MOMENTUM_FILTER === 'top_losers') {
-      filtered = filtered
-        .filter(s => {
-          const chg = computeChangePct(s.token);
-          const gap = computeGapPct(s.token);
-          if (chg === null || chg >= 0) return false;
-          if (gap !== null && gap <= -2) return false;
-          return true;
-        })
-        .sort((a, b) => computeChangePct(a.token) - computeChangePct(b.token))
-        .slice(0, 15);
     } else if (SCREENER_MOMENTUM_FILTER === 'rsi_chips') {
       const chipTokens = new Set(SCREENER_CHIPS.map(c => String(c.token)));
       filtered = filtered.filter(s => chipTokens.has(String(s.token)));
@@ -896,17 +873,19 @@ function renderScreenerTable() {
       SCREENER_CHIPS.forEach(c => { rankBy[String(c.token)] = c.rank; });
       filtered.sort((a, b) => (rankBy[String(a.token)] ?? 999) - (rankBy[String(b.token)] ?? 999));
     }
+    // REMOVED top_gainers and top_losers blocks completely
 
     OPEN_GAIN_RANK = {};
     SELL_CANDIDATE_RANK = {};
 
+    // Sorting rank logic by change % as requested
     if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
       [...filtered]
-        .sort((a, b) => getSortValue(b, 'open_gain') - getSortValue(a, 'open_gain'))
+        .sort((a, b) => getSortValue(b, 'change') - getSortValue(a, 'change')) // highest change %
         .forEach((s, i) => { OPEN_GAIN_RANK[String(s.token)] = i + 1; });
     } else if (SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
       [...filtered]
-        .sort((a, b) => getSortValue(a, 'open_gain') - getSortValue(b, 'open_gain'))
+        .sort((a, b) => getSortValue(a, 'change') - getSortValue(b, 'change')) // lowest change %
         .forEach((s, i) => { SELL_CANDIDATE_RANK[String(s.token)] = i + 1; });
     }
 

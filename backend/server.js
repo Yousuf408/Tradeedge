@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.24 (Buy/Sell Mode)
+   server.js — TradeAlgo Pro backend  |  v5.25 (Buy/Sell Mode)
    ============================================================ */
 
 import express from 'express';
@@ -1300,20 +1300,22 @@ app.get('/api/auto/positions', auth, async (req, res) => {
     const date = req.query.date || getIST().toISOString().split('T')[0];
     const uid = req.user?.id || req.user?.username || 'admin';
     const { rows } = await db.query(
-      `SELECT date::text AS date, token, sym, qty, entry, sl, t1, t2, stage, peak,
+      `SELECT date::text AS date, token, sym, qty, entry, sl, t1, t2, stage, peak, side,
               status, exit_price, exit_reason, entry_at, exit_at
        FROM auto_positions WHERE date=$1 AND user_id=$2 ORDER BY entry_at`,
       [date, uid]
     );
     const live = getPositions(uid);
     const out = rows.map(r => {
-      const lp = live.find(p => p.token === String(r.token));
+      const lp = live.find(p => p.token === String(r.token) && p.side === r.side);
       const ltp = getCachedLTP(String(r.token)) ?? null;
       const ref = r.status === 'open' ? (ltp ?? +r.entry) : (r.exit_price != null ? +r.exit_price : +r.entry);
-      const pnl = +((ref - +r.entry) * r.qty).toFixed(2);
-      const pnlPct = +(((ref - +r.entry) / +r.entry) * 100).toFixed(2);
+      const pnl = r.side === 'SELL' 
+        ? +((+r.entry - ref) * r.qty).toFixed(2)
+        : +((ref - +r.entry) * r.qty).toFixed(2);
+      const pnlPct = +(((pnl / (r.entry * r.qty)) * 100)).toFixed(2);
       return {
-        date: r.date, token: String(r.token), sym: r.sym, qty: +r.qty,
+        date: r.date, token: String(r.token), sym: r.sym, qty: +r.qty, side: r.side || 'BUY',
         entry: +r.entry, sl: +r.sl, t1: +r.t1, t2: +r.t2,
         stage: lp ? lp.stage : +r.stage,
         slLive: lp ? lp.sl : +r.sl,
@@ -2121,7 +2123,7 @@ function runEntryScan(date) {
     if (dow < 1 || dow > 5 || !isTradingDay(ist)) return;
     const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
     if (mins < ENTRY_START_MIN || mins >= ENTRY_END_MIN) return;
-    if (entryCount >= MAX_ENTRIES) return;
+    if (entryCount >= MAX_ENTRIES * 2) return; // Increased cap for both sides
 
     const cands = [];
     for (const st of STOCKS) {
@@ -2156,7 +2158,7 @@ function runEntryScan(date) {
       }
       // --- SELL CONDITION (SHORT) ---
       else if (openGainPct <= -ENTRY_OPEN_GAIN_PCT && openGainPct > -ENTRY_MAX_GAIN_PCT && changePct < 0) {
-        if (!CHIP_TEST_MODE && (rsi == null || rsi > 30)) continue; // For shorts, RSI should be low (oversold)
+        if (!CHIP_TEST_MODE && (rsi == null || rsi > 30)) continue;
         cands.push({
           token, sym: st.sym, dayOpen: +(+dayOpen).toFixed(2),
           gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), changePct: +changePct.toFixed(2),
@@ -2166,15 +2168,21 @@ function runEntryScan(date) {
     }
     if (!cands.length) return;
 
-    cands.sort((a, b) => Math.abs(b.openGainPct) - Math.abs(a.openGainPct));
-    
-    const list = cands.slice(0, MAX_ENTRIES - entryCount);
-    for (const c of list) entryTriggered.add(c.token);
-    entryCount += list.length;
+    // Sort and separate
+    const buyCands = cands.filter(c => c.side === 'BUY').sort((a, b) => b.openGainPct - a.openGainPct);
+    const sellCands = cands.filter(c => c.side === 'SELL').sort((a, b) => a.openGainPct - b.openGainPct);
+
+    // Pass top candidates to autoTrader
+    const list = [...buyCands.slice(0, MAX_ENTRIES), ...sellCands.slice(0, MAX_ENTRIES)];
+    const newList = list.filter(c => !entryTriggered.has(c.token));
+    if (!newList.length) return;
+
+    for (const c of newList) entryTriggered.add(c.token);
+    entryCount += newList.length;
 
     const hh = String(ist.getUTCHours()).padStart(2, '0');
     const mi = String(ist.getUTCMinutes()).padStart(2, '0');
-    console.log(`🎯 Entry trigger ${hh}:${mi} — ${list.length} CANDIDATES: ${list.map(c => `${c.sym}(${c.side} ${c.openGainPct}%)`).join(', ')} | today ${entryCount}/${MAX_ENTRIES}`);
+    console.log(`🎯 Entry trigger ${hh}:${mi} — ${newList.length} CANDIDATES: ${newList.map(c => `${c.sym}(${c.side} ${c.openGainPct}%)`).join(', ')} | today ${entryCount}`);
 
     const users = [...userCapital.entries()].map(([userId, capital]) => ({ 
       userId, 
@@ -2184,7 +2192,7 @@ function runEntryScan(date) {
     
     if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000), sideMode: 'MIX' });
     
-    onEntryScan(list, date, users).catch(e => console.error('🤖 Entry error:', e.message));
+    onEntryScan(newList, date, users).catch(e => console.error('🤖 Entry error:', e.message));
   } catch (e) { console.error('Entry scan failed:', e.message); }
 }
 
@@ -2193,7 +2201,7 @@ function startEntryEngine() {
     const p = getScreenerPhase();
     if (p && p.date) runEntryScan(p.date);
   }, ENTRY_SCAN_MS);
-  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | rule: BUY >+${ENTRY_OPEN_GAIN_PCT}% / SELL <-${ENTRY_OPEN_GAIN_PCT}% | cap ${MAX_ENTRIES}`);
+  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | rule: BUY >+${ENTRY_OPEN_GAIN_PCT}% / SELL <-${ENTRY_OPEN_GAIN_PCT}% | cap ${MAX_ENTRIES} per side`);
 }
 
 async function loadChipListFromDB(date) {
@@ -2410,7 +2418,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.24 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.25 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2465,7 +2473,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.24`);
+  console.log(`✅ Server on port ${PORT} — v5.25`);
   initMarginService(db, getBrokerSession);
 
   try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }

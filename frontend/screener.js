@@ -482,7 +482,7 @@ function updateLTPCells(ticks, vwaps, rsis) {
       mqEl.textContent = computeMaxQty(token, +price);
     }
 
-    if (vwaps && vwaps[token] != null) {
+    if (vwaps && vwaps[token] != null && !isNaN(vwaps[token])) {
       SCREENER_VWAP[token] = vwaps[token];
       const vwEl = row.querySelector('.vwap-cell');
       if (vwEl) vwEl.textContent = '₹' + (+vwaps[token]).toFixed(2);
@@ -801,7 +801,7 @@ function startSSE() {
           if (v.rsi != null) SCREENER_RSI[token] = v.rsi;
           if (v.leverage != null) SCREENER_LEVERAGE[token] = v.leverage;
           if (v.marginPerShare != null) SCREENER_MARGIN_PS[token] = v.marginPerShare;
-          if (v.vwap != null) SCREENER_VWAP[token] = v.vwap;
+         // if (v.vwap != null) SCREENER_VWAP[token] = v.vwap;
           if (v.rsiFirst != null) SCREENER_RSI_FIRST[token] = v.rsiFirst;
           if (v.prevClose != null) SCREENER_PREV_CLOSE[token] = v.prevClose;
         }

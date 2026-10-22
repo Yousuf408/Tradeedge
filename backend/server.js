@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.22
+   server.js — TradeAlgo Pro backend  |  v5.24 (Buy/Sell Mode)
    ============================================================ */
 
 import express from 'express';
@@ -360,7 +360,7 @@ async function loadBSCacheFromDB() {
     if (!p.date) return;
     const activeTokens = STOCKS.map(s => String(s.token));
     const { rows } = await db.query(
-      `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no, preopen_price, preopen_at, day_open, rsi, rsi_first
+      `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no, day_open, rsi, rsi_first
        FROM strategy_bs_snapshot
        WHERE date=$1 AND strategy_id=$2 AND token = ANY($3)`,
       [p.date, 'momentum', activeTokens]
@@ -372,8 +372,6 @@ async function loadBSCacheFromDB() {
         ltp: r.ltp != null ? +r.ltp : null,
         volume: r.volume != null ? +r.volume : null,
         rank: r.rank_no != null ? +r.rank_no : null,
-        preopenPrice: r.preopen_price != null ? +r.preopen_price : null,
-        preopenAt: r.preopen_at,
         dayOpen: r.day_open != null ? +r.day_open : null,
         rsi: r.rsi != null ? +r.rsi : null,
         rsiFirst: r.rsi_first != null ? +r.rsi_first : null
@@ -518,7 +516,6 @@ function seedRSIStateFromMemory() {
   console.log(`🧮 RSI live state seeded: ${n} tokens`);
 }
 
-/* v5.5: VWAP = Σ(close×vol) / Σ(vol) — aaj ke ws_1min closes+volumes se */
 function computeVWAP(token) {
   const c = wsTodayCloses.get(String(token));
   const v = wsTodayVols.get(String(token));
@@ -532,7 +529,6 @@ function computeVWAP(token) {
   return vv > 0 ? +(pv / vv).toFixed(2) : null;
 }
 
-/* v5.5: restart ke baad aaj ka rsi_first backfill (09:15 candle se) */
 async function backfillRsiFirst(date) {
   try {
     const activeTokens = STOCKS.map(s => String(s.token));
@@ -586,7 +582,6 @@ async function updateRSIFromWS(date, prevKey) {
        WHERE s.date=$3 AND s.token=v.token AND s.strategy_id='momentum'`,
       [toks, rsis, date]
     );
-    // v5.5: 9:15 candle ke band hote hi RSI FIRST fix karo (poore din ke liye)
     if (prevKey === '09:15' && toks.length) {
       try {
         await db.query(
@@ -601,7 +596,7 @@ async function updateRSIFromWS(date, prevKey) {
           bsCache.set(toks[i], c);
         }
         console.log(`🥇 RSI-first (9:15 candle) locked: ${toks.length} tokens`);
-        broadcastBS(new Date()); // Frontend ko turant update karne ke liye
+        broadcastBS(new Date());
       } catch (e) { console.error('rsi_first write failed:', e.message); }
     }
   } catch (e) { console.error('WS RSI update failed:', e.message); }
@@ -676,84 +671,6 @@ async function fetchTvRsiFromPython(symbols) {
     console.error('❌ Python RSI fetch failed:', err.message);
     return null;
   }
-}
-
-/* ============================================================
-   SECTION 4.5 — NSE PRE-OPEN FETCHER
-   ============================================================ */
-const NSE_PREOPEN_PAGE = 'https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market';
-const NSE_PREOPEN_API  = 'https://www.nseindia.com/api/market-data-pre-open?key=ALL';
-const NSE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-
-async function fetchPreopenRaw() {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
-  try {
-    const homeRes = await fetch(NSE_PREOPEN_PAGE, {
-      headers: {
-        'User-Agent': NSE_UA,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9'
-      },
-      signal: controller.signal
-    });
-
-    let cookieStr = '';
-    try {
-      const setCookies = homeRes.headers.getSetCookie ? homeRes.headers.getSetCookie() : [];
-      if (setCookies.length) cookieStr = setCookies.map(c => c.split(';')[0]).join('; ');
-      else {
-        const raw = homeRes.headers.get('set-cookie') || '';
-        cookieStr = raw.split(/,(?=[^;]+=[^;]+)/).map(c => c.split(';')[0]).join('; ');
-      }
-    } catch {}
-
-    const apiRes = await fetch(NSE_PREOPEN_API, {
-      headers: {
-        'User-Agent': NSE_UA,
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': NSE_PREOPEN_PAGE,
-        'X-Requested-With': 'XMLHttpRequest',
-        'Cookie': cookieStr
-      },
-      signal: controller.signal
-    });
-
-    if (!apiRes.ok) throw new Error(`NSE API HTTP ${apiRes.status}`);
-    return await apiRes.json();
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function parsePreopen(json) {
-  const items = (json && json.data) || [];
-  const nseMap = new Map();
-
-  for (const item of items) {
-    const meta = item.metadata || {};
-    const detail = (item.detail && item.detail.preOpenMarket) || {};
-    const nseSym = String(meta.symbol || '').toUpperCase().trim();
-    if (!nseSym) continue;
-
-    const price = detail.finalPrice ?? meta.lastPrice ?? detail.IEP ?? null;
-    if (!Number.isFinite(price) || price <= 0) continue;
-
-    const key = nseSym.replace(/-EQ$|-BE$|-BL$|-BZ$/, '');
-    nseMap.set(key, +price);
-  }
-
-  const matched = [];
-  const missingSyms = [];
-  for (const s of STOCKS) {
-    const key = String(s.sym).toUpperCase().trim().replace(/-EQ$|-BE$|-BL$|-BZ$/, '');
-    const price = nseMap.get(key);
-    if (price == null) { missingSyms.push(s.sym); continue; }
-    matched.push({ token: String(s.token), sym: s.sym, price });
-  }
-
-  return { matched, unmatchedSyms: missingSyms, nseTotal: items.length };
 }
 
 /* ============================================================
@@ -942,13 +859,12 @@ let depthPktCount = 0;
 let depthRestarts = 0;
 let depthWatchdog = null;
 
-// NAYA: Depth Validation ke liye active tokens track karne ka Set
 const activeDepthTokens = new Set();
 setInterval(() => {
   if (activeDepthTokens.size > 0) {
     const total = getDepthStatus().tokenCount || 300;
     console.log(`🧿 Depth Active: ${activeDepthTokens.size} / ${total} tokens`);
-    activeDepthTokens.clear(); // Next 10s ke liye reset
+    activeDepthTokens.clear();
   }
 }, 10000);
 
@@ -1004,7 +920,7 @@ function sseSend(payload) {
 
 const ssePendingVwap = new Map();
 const ssePendingRsi = new Map();
-const ssePendingPrevClose = new Map(); // NEW: Nifty 50 prevClose ke liye
+const ssePendingPrevClose = new Map();
 
 function broadcastLTP(token, ltp) {
   if (!sseClients.size) return;
@@ -1045,7 +961,6 @@ function broadcastBS(fetchedAt) {
       return [t, {
         buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
         volume: v.volume, rank: v.rank,
-        preopenPrice: v.preopenPrice ?? null,
         dayOpen: v.dayOpen ?? null,
         rsi: v.rsi ?? null,
         leverage: lev ?? null,
@@ -1165,7 +1080,6 @@ function onDepthPacket(d) {
   depthPktCount++;
   depthCache.set(d.token, d);
 
-  // NAYA: Validation log flood hataya, ab active count 10s me print hoga
   if (d.shouldValidate) {
     activeDepthTokens.add(d.token);
   }
@@ -1348,6 +1262,7 @@ app.get('/api/tv-rsi/:sym', auth, async (req, res) => {
 });
 
 const userCapital = new Map();
+const userTradeMode = new Map(); // NEW: Store user's Buy/Sell/Mix preference
 
 app.post('/api/auto/capital', auth, (req, res) => {
   const uid = req.user?.id || req.user?.username || 'admin';
@@ -1360,6 +1275,20 @@ app.post('/api/auto/capital', auth, (req, res) => {
 app.get('/api/auto/capital', auth, (req, res) => {
   const uid = req.user?.id || req.user?.username || 'admin';
   res.json({ ok: true, capital: userCapital.get(uid) ?? Number(process.env.AUTO_PER_TRADE || 25000) });
+});
+
+// NEW: Route to set Trade Mode
+app.post('/api/auto/trade-mode', auth, (req, res) => {
+  const uid = req.user?.id || req.user?.username || 'admin';
+  const mode = String(req.body?.mode || 'MIX').toUpperCase();
+  if (!['BUY', 'SELL', 'MIX'].includes(mode)) return res.status(400).json({ error: 'Invalid mode' });
+  userTradeMode.set(uid, mode);
+  res.json({ ok: true, userId: uid, mode });
+});
+
+app.get('/api/auto/trade-mode', auth, (req, res) => {
+  const uid = req.user?.id || req.user?.username || 'admin';
+  res.json({ ok: true, mode: userTradeMode.get(uid) || 'MIX' });
 });
 
 app.get('/api/screener/buyers', auth, (req, res) => {
@@ -1447,7 +1376,6 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       sellQty: bs?.sellQty ?? null,
       bsVolume: bs?.volume ?? null,
       rank: bs?.rank ?? null,
-      preopenPrice: bs?.preopenPrice ?? null,
       dayOpen: bs?.dayOpen ?? null,
       rsi: bs?.rsi ?? null,
       leverage: lev ?? null,
@@ -1504,51 +1432,6 @@ app.post('/api/admin/force-bs', auth, adminOnly, async (req, res) => {
     );
     res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
   } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/admin/fetch-preopen', auth, adminOnly, async (req, res) => {
-  try {
-    const json = await fetchPreopenRaw();
-    const { matched, unmatchedSyms, nseTotal } = parsePreopen(json);
-    const fetchedAt = new Date();
-    const p = getScreenerPhase();
-    const dbErrors = [];
-
-    for (const m of matched) {
-      const existing = bsCache.get(m.token) || {};
-      bsCache.set(m.token, {
-        ...existing,
-        preopenPrice: m.price,
-        preopenAt: fetchedAt
-      });
-
-      if (p.date) {
-        try {
-          await db.query(
-            `UPDATE strategy_bs_snapshot SET preopen_price=$1, preopen_at=$2
-             WHERE date=$3 AND token=$4 AND strategy_id='momentum'`,
-            [m.price, fetchedAt, p.date, m.token]
-          );
-        } catch (e) { dbErrors.push(`${m.sym}: ${e.message}`); }
-      }
-    }
-
-    console.log(`🌅 Preopen fetch: NSE=${nseTotal}, matched=${matched.length}, unmatched=${unmatchedSyms.length}`);
-    if (unmatchedSyms.length) console.log(`🌅 Unmatched (first 20): ${unmatchedSyms.slice(0, 20).join(', ')}`);
-    if (dbErrors.length) console.log(`❌ Preopen DB errors (first 5):`, dbErrors.slice(0, 5));
-
-    res.json({
-      ok: true, date: p.date, nseTotal,
-      matched: matched.length,
-      unmatchedCount: unmatchedSyms.length,
-      unmatchedSample: unmatchedSyms.slice(0, 30),
-      dbErrors: dbErrors.slice(0, 5),
-      fetchedAt
-    });
-  } catch (e) {
-    console.error('Preopen fetch failed:', e);
-    res.status(500).json({ error: e.message });
-  }
 });
 
 app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
@@ -1886,7 +1769,6 @@ async function fetchDayHLC() {
       const close = q.ltp || q.close;
       const pivot = (+q.high + +q.low + +close) / 3;
 
-      // NAYA: Cache update fix for frontend
       setCachedLTP(token, close);
       if (q.close && q.close > 0) prevCloseCache.set(token, +q.close);
       const bsCached = bsCache.get(token);
@@ -1946,43 +1828,9 @@ async function fetchDayHLC() {
 
     if (dbErrors.length) console.log(`❌ [HLC] DB errors (first 5):`, dbErrors.slice(0, 5));
     await flushLtpWrites();
-    broadcastBS(new Date()); // NAYA: Frontend ko update bhejne ke liye
+    broadcastBS(new Date());
     console.log(`✅ Day H/L/C: ${savedTokens.size}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
   } catch (e) { console.error('❌ Day H/L/C fetch failed:', e); }
-}
-
-/* ============================================================
-   SECTION 10 — AUTO PRE-OPEN
-   ============================================================ */
-async function autoFetchPreopen() {
-  try {
-    if (!isTradingDay(getIST())) return;
-    console.log('🌅 Auto-preopen @9:13:30 starting...');
-    const json = await fetchPreopenRaw();
-    const { matched, unmatchedSyms, nseTotal } = parsePreopen(json);
-    const fetchedAt = new Date();
-    const today = getIST().toISOString().split('T')[0];
-
-    let saved = 0;
-    for (const m of matched) {
-      const existing = bsCache.get(m.token) || {};
-      bsCache.set(m.token, { ...existing, preopenPrice: m.price, preopenAt: fetchedAt });
-
-      try {
-        await db.query(
-          `INSERT INTO strategy_bs_snapshot
-             (date, sym, token, strategy_id, preopen_price, preopen_at, fetched_at)
-           VALUES ($1, $2, $3, 'momentum', $4, $5, NOW())
-           ON CONFLICT (date, token, strategy_id) DO UPDATE SET
-             preopen_price = EXCLUDED.preopen_price,
-             preopen_at = EXCLUDED.preopen_at`,
-          [today, m.sym, m.token, m.price, fetchedAt]
-        );
-        saved++;
-      } catch {}
-    }
-    console.log(`✅ Auto-preopen: NSE=${nseTotal}, matched=${matched.length}, saved=${saved}, unmatched=${unmatchedSyms.length}`);
-  } catch (e) { console.error('Auto-preopen failed:', e.message); }
 }
 
 /* ============================================================
@@ -2043,8 +1891,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
           volume: r.volume,
           dayOpen: r.dayOpen ?? null,
           rank: existing.rank ?? null,
-          preopenPrice: existing.preopenPrice ?? null,
-          preopenAt: existing.preopenAt ?? null,
           rsi,
           rsiFirst: existing.rsiFirst ?? null
         });
@@ -2291,37 +2137,53 @@ function runEntryScan(date) {
 
       const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
       if (gapPct >= ENTRY_GAP_MAX_PCT) continue;
+
       const ltp = getCachedLTP(token);
       if (!ltp) continue;
+      
       const openGainPct = ((ltp - dayOpen) / dayOpen) * 100;
-      if (openGainPct < ENTRY_OPEN_GAIN_PCT) continue;
-      
-      if (openGainPct >= ENTRY_MAX_GAIN_PCT) continue;
-
       const changePct = ((ltp - prevClose) / prevClose) * 100;
-      if (changePct <= 0) continue;
-      
       const rsi = bs.rsi ?? null;
-      if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;
-      
-      cands.push({
-        token, sym: st.sym, dayOpen: +(+dayOpen).toFixed(2),
-        gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), changePct: +changePct.toFixed(2)
-      });
+
+      // --- BUY CONDITION ---
+      if (openGainPct >= ENTRY_OPEN_GAIN_PCT && openGainPct < ENTRY_MAX_GAIN_PCT && changePct > 0) {
+        if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;
+        cands.push({
+          token, sym: st.sym, dayOpen: +(+dayOpen).toFixed(2),
+          gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), changePct: +changePct.toFixed(2),
+          side: 'BUY'
+        });
+      }
+      // --- SELL CONDITION (SHORT) ---
+      else if (openGainPct <= -ENTRY_OPEN_GAIN_PCT && openGainPct > -ENTRY_MAX_GAIN_PCT && changePct < 0) {
+        if (!CHIP_TEST_MODE && (rsi == null || rsi > 30)) continue; // For shorts, RSI should be low (oversold)
+        cands.push({
+          token, sym: st.sym, dayOpen: +(+dayOpen).toFixed(2),
+          gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), changePct: +changePct.toFixed(2),
+          side: 'SELL'
+        });
+      }
     }
     if (!cands.length) return;
 
-    cands.sort((a, b) => b.openGainPct - a.openGainPct);
+    cands.sort((a, b) => Math.abs(b.openGainPct) - Math.abs(a.openGainPct));
+    
     const list = cands.slice(0, MAX_ENTRIES - entryCount);
     for (const c of list) entryTriggered.add(c.token);
     entryCount += list.length;
 
     const hh = String(ist.getUTCHours()).padStart(2, '0');
     const mi = String(ist.getUTCMinutes()).padStart(2, '0');
-    console.log(`🎯 Entry trigger ${hh}:${mi} — ${list.length} BUY: ${list.map(c => `${c.sym}(open+${c.openGainPct}%)`).join(', ')} | today ${entryCount}/${MAX_ENTRIES}`);
+    console.log(`🎯 Entry trigger ${hh}:${mi} — ${list.length} CANDIDATES: ${list.map(c => `${c.sym}(${c.side} ${c.openGainPct}%)`).join(', ')} | today ${entryCount}/${MAX_ENTRIES}`);
 
-    const users = [...userCapital.entries()].map(([userId, capital]) => ({ userId, capital }));
-    if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000) });
+    const users = [...userCapital.entries()].map(([userId, capital]) => ({ 
+      userId, 
+      capital,
+      sideMode: userTradeMode.get(userId) || 'MIX'
+    }));
+    
+    if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000), sideMode: 'MIX' });
+    
     onEntryScan(list, date, users).catch(e => console.error('🤖 Entry error:', e.message));
   } catch (e) { console.error('Entry scan failed:', e.message); }
 }
@@ -2331,7 +2193,7 @@ function startEntryEngine() {
     const p = getScreenerPhase();
     if (p && p.date) runEntryScan(p.date);
   }, ENTRY_SCAN_MS);
-  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | rule: open-gain >= +${ENTRY_OPEN_GAIN_PCT}% & < ${ENTRY_MAX_GAIN_PCT}% (Vol paused) | cap ${MAX_ENTRIES}`);
+  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | rule: BUY >+${ENTRY_OPEN_GAIN_PCT}% / SELL <-${ENTRY_OPEN_GAIN_PCT}% | cap ${MAX_ENTRIES}`);
 }
 
 async function loadChipListFromDB(date) {
@@ -2392,15 +2254,6 @@ function scheduleDailyHLC() {
   const ms = msUntil(15, 31);
   console.log(`⏰ Next HLC fetch in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => { await fetchDayHLC(); scheduleDailyHLC(); }, ms);
-}
-
-function schedulePreopenFetch() {
-  const ms = msUntil(9, 13, 1) + 30000;
-  console.log(`⏰ Next auto-preopen in ${Math.round(ms / 60000)} min`);
-  setTimeout(async () => {
-    await autoFetchPreopen();
-    schedulePreopenFetch();
-  }, ms);
 }
 
 function msToNextMinute01() {
@@ -2557,7 +2410,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.21 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.24 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2612,7 +2465,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.22 (Vol paused)`);
+  console.log(`✅ Server on port ${PORT} — v5.24`);
   initMarginService(db, getBrokerSession);
 
   try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }
@@ -2685,7 +2538,6 @@ app.listen(PORT, async () => {
   }
 
   scheduleDailyHLC();
-  schedulePreopenFetch();
   scheduleBSAutoFetch();
   scheduleFinalFlush();
   scheduleMorningPreload();
@@ -2694,5 +2546,5 @@ app.listen(PORT, async () => {
 
   maybeRefreshMargins('angelone', { force: true }).catch(() => {});
 
-  console.log('ℹ️  Schedule: WS@9:14:55 | Preopen@9:13:30 | BS@9:15 (30s) | Quote@9:30 | EntryScan@9:15-11:00 (1s) | HLC@15:31 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');
+  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15 (30s) | Quote@9:30 | EntryScan@9:15-11:00 (1s) | HLC@15:31 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');
 });

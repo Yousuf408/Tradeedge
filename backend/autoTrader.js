@@ -1,5 +1,5 @@
 /* ============================================================
-   autoTrader.js — v1.7 (Buy/Sell/Mix 50-50 + Same-Day Single Side block)
+   autoTrader.js — v1.8 (Strict Entry Ranking + Single Side block)
    ============================================================ */
 
 const BE_TRIGGER_PCT = Number(process.env.AT_BE_PCT ?? 0.7);
@@ -35,7 +35,7 @@ export function initAutoTrader(deps) {
   getLtp = deps.getLtp || (() => null);
   getLev = deps.getLeverage || null;
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
-  console.log(`🤖 AutoTrader v1.7 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | rules: Buy & Sell (Short)`);
+  console.log(`🤖 AutoTrader v1.8 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | rules: Strict Ranking`);
   startSquareOffWatch();
 }
 
@@ -70,6 +70,7 @@ export async function onEntryScan(cands, date, users) {
     liveOrdered.clear();
     posDate = date;
   }
+  
   for (const u of users) {
     const userMode = u.sideMode || 'MIX';
 
@@ -80,17 +81,23 @@ export async function onEntryScan(cands, date, users) {
     }
     if (userEntryCount >= MAX_ENTRIES_PER_USER) continue;
 
-    // Filter candidates by user preference
-    let userCands = cands.filter(c => userMode === 'MIX' || c.side === userMode);
-    userCands.sort((a, b) => Math.abs(b.openGainPct) - Math.abs(a.openGainPct));
+    // NEW FIX: Filter and sort BUY and SELL independently so top gainers are always at the top
+    let buys = cands.filter(c => c.side === 'BUY').sort((a, b) => {
+       const valA = a.changePct !== undefined ? a.changePct : a.openGainPct;
+       const valB = b.changePct !== undefined ? b.changePct : b.openGainPct;
+       return valB - valA; // Highest positive change first
+    });
+
+    let sells = cands.filter(c => c.side === 'SELL').sort((a, b) => {
+       const valA = a.changePct !== undefined ? a.changePct : a.openGainPct;
+       const valB = b.changePct !== undefined ? b.changePct : b.openGainPct;
+       return valA - valB; // Most negative change first (biggest losers)
+    });
 
     let selectedCands = [];
     
     if (userMode === 'MIX') {
-      const buys = userCands.filter(c => c.side === 'BUY');
-      const sells = userCands.filter(c => c.side === 'SELL');
       const half = Math.floor(MAX_ENTRIES_PER_USER / 2);
-
       let pickedBuys = buys.slice(0, half);
       let pickedSells = sells.slice(0, half);
 
@@ -100,10 +107,11 @@ export async function onEntryScan(cands, date, users) {
       } else if (pickedSells.length < half) {
         pickedBuys = buys.slice(0, MAX_ENTRIES_PER_USER - pickedSells.length);
       }
-
       selectedCands = [...pickedBuys, ...pickedSells];
-    } else {
-      selectedCands = userCands.slice(0, MAX_ENTRIES_PER_USER);
+    } else if (userMode === 'BUY') {
+      selectedCands = buys.slice(0, MAX_ENTRIES_PER_USER);
+    } else if (userMode === 'SELL') {
+      selectedCands = sells.slice(0, MAX_ENTRIES_PER_USER);
     }
 
     // Apply remaining slots limit
@@ -113,7 +121,7 @@ export async function onEntryScan(cands, date, users) {
     for (const c of selectedCands) {
       const token = String(c.token);
       
-      // NEW: Same day same stock pe BUY/SELL dono block karo
+      // Ensure same day same stock pe BUY/SELL dono block rahe
       let alreadyHasToken = false;
       for (const p of positions.values()) {
         if (p.userId === u.userId && p.token === token && p.status === 'open') {
@@ -121,7 +129,7 @@ export async function onEntryScan(cands, date, users) {
           break;
         }
       }
-      if (alreadyHasToken) continue; // Skip if already holding this stock
+      if (alreadyHasToken) continue; 
 
       const key = pkey(u.userId, token, c.side);
       if (positions.has(key)) continue; 

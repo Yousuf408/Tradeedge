@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.28 (No angel_15m_candle + Index Fix)
+   server.js — TradeAlgo Pro backend  |  v5.29 (Stable Index Fix)
    ============================================================ */
 
 import express from 'express';
@@ -353,7 +353,9 @@ async function loadBSCacheFromDB() {
   try {
     const p = getScreenerPhase();
     if (!p.date) return;
-    const activeTokens = STOCKS.map(s => String(s.token));
+    
+    // ✅ ADDED INDEX TOKENS
+    const activeTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
     const { rows } = await db.query(
       `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no, day_open, rsi, rsi_first
        FROM strategy_bs_snapshot
@@ -967,7 +969,7 @@ function handleTick(token, ltp, tickMs, extra) {
   if (INDEX_TOKENS.includes(String(token))) {
     setCachedLTP(token, ltp);
     if (extra && Number.isFinite(extra.close) && extra.close > 0) {
-      prevCloseCache.set(token, +extra.close.toFixed(2)); // ✅ Fixed: Uncommented for accurate index %
+      prevCloseCache.set(token, +extra.close.toFixed(2)); 
     }
     broadcastLTP(token, ltp);
     return;
@@ -1728,7 +1730,6 @@ async function fetchDayHLC() {
     const p = getScreenerPhase();
     if (!p.date) { console.log('❌ [HLC] No date'); return; }
     
-    // ✅ Add INDEX_TOKENS to fetch
     const allTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
     console.log(`🔔 [HLC] Fetching day H/L/C for ${allTokens.length} stocks & indices...`);
 
@@ -1746,14 +1747,12 @@ async function fetchDayHLC() {
       const token = String(q.token);
       const close = q.ltp || q.close;
       
-      // ✅ Determine Symbol (Stocks or Index)
       const sym = SYM_BY_TOKEN[token] || INDEX_SYMS[token] || '?';
 
       setCachedLTP(token, close);
       if (q.close && q.close > 0) prevCloseCache.set(token, +q.close);
 
       try {
-        // ✅ Save to strategy_bs_snapshot
         await db.query(
           `INSERT INTO strategy_bs_snapshot (date, token, sym, strategy_id, day_high, day_low, day_close, prev_close, fetched_at)
            VALUES ($1, $2, $3, 'momentum', $4, $5, $6, $7, NOW())
@@ -2370,7 +2369,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.28 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.29 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2402,7 +2401,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.28`);
+  console.log(`✅ Server on port ${PORT} — v5.29`);
   initMarginService(db, getBrokerSession);
 
   try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }
@@ -2420,16 +2419,17 @@ app.listen(PORT, async () => {
   await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
   computeBuyersGroups();
 
-  // ✅ Fetch accurate prev close for indices via Quote API on startup
+  // ✅ Fetch accurate prev close AND LTP for indices via Quote API on startup
   try {
     const quotes = await fetchQuotesForTokens(INDEX_TOKENS);
     if (quotes) {
       for (const q of quotes) {
         if (q.close && q.close > 0) prevCloseCache.set(String(q.token), +q.close);
+        if (q.ltp && q.ltp > 0) setCachedLTP(String(q.token), +q.ltp);
       }
-      console.log(`📊 Indices PrevClose fetched via Quote API`);
+      console.log(`📊 Indices LTP & PrevClose fetched via Quote API`);
     }
-  } catch(e) { console.log('Indices Quote fetch failed'); }
+  } catch(e) { console.log('Indices Quote fetch failed', e.message); }
 
   initAutoTrader({
     db,

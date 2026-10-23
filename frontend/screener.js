@@ -442,8 +442,8 @@ function renderTicker() {
       sign = isPos ? '+' : '';
     }
 
-    const finalClass = token === INDIAVIX_TOKEN ? (isPos ? 'neg' : 'pos') : colorClass;
-    const changeText = showChange ? `${arrow} ${sign}${pct.toFixed(2)}%` : '';
+       const finalClass = colorClass; 
+       const changeText = showChange ? `${arrow} ${sign}${pct.toFixed(2)}%` : '';
 
     html += `<div class="ticker-item">
       ${data.name}

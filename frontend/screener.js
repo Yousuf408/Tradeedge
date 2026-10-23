@@ -449,7 +449,7 @@ function renderTicker() {
       html = `<div class="ticker-item">Waiting for market data...</div>`;
   }
 
-  el.innerHTML = html + html;
+  el.innerHTML = html;
 }
 
 /* ============================================================

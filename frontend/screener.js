@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.7.3 (Buy/Sell/Mix + Sorting Fix + Chips Cleanup)
+   SCREENER.JS  — v4.8.0 (Market Ticker + Breadth)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -34,19 +34,26 @@ const OPEN_GAIN_REQUIRE_POSITIVE_CHANGE = true;
 let OPEN_GAIN_RANK = {};
 let OPEN_GAIN_RERENDER_TIMER = null;
 
-/* Sell-side (short) thresholds — inverted logic */
-const SELL_OPEN_GAIN_MAX_PCT = -1.0;   // dropped 1% below Day Open
-const SELL_GAP_MAX_PCT = 3.0;          // skip stocks that gapped up hard
+const SELL_OPEN_GAIN_MAX_PCT = -1.0;
+const SELL_GAP_MAX_PCT = 3.0;
 const SELL_REQUIRE_NEGATIVE_CHANGE = true;
 let SELL_CANDIDATE_RANK = {};
 
 let SCREENER_ACTIVE_STRATEGY = 'momentum';
 
 const NIFTY50_TOKEN = '99926000';
-const CURRENT_STRATEGY = 'momentum';
+const BANKNIFTY_TOKEN = '99926009';
+const INDIAVIX_TOKEN = '99926017';
+const INDEX_TOKENS = [NIFTY50_TOKEN, BANKNIFTY_TOKEN, INDIAVIX_TOKEN];
+
+let TICKER_DATA = {
+  [NIFTY50_TOKEN]: { name: 'NIFTY 50', ltp: 0, prev: 0 },
+  [BANKNIFTY_TOKEN]: { name: 'BANK NIFTY', ltp: 0, prev: 0 },
+  [INDIAVIX_TOKEN]: { name: 'INDIA VIX', ltp: 0, prev: 0 }
+};
+let TICKER_BREADTH = { adv: 0, dec: 0 };
 
 let PER_TRADE = Number(localStorage.getItem('ta_capital') || 25000);
-/* Buy / Sell / Mix mode (persisted) */
 let SIDE_MODE = localStorage.getItem('ta_side_mode') || 'MIX';
 
 const BATCH_SIZE = 20;
@@ -160,7 +167,6 @@ function postCapital() {
   }, 600);
 }
 
-/* Mode dropdown handler */
 function onSideModeChange() {
   const sel = document.getElementById('sideModeSelect');
   if (!sel) return;
@@ -203,10 +209,10 @@ async function loadChips() {
 function setMomentumFilter(key) {
   SCREENER_MOMENTUM_FILTER = key;
   if (key === 'open_gain') {
-    SCREENER_SORT_BY = 'change'; // Changed to change % for sorting
+    SCREENER_SORT_BY = 'change';
     SCREENER_SORT_DIR = 'desc';
   } else if (key === 'sell_candidates') {
-    SCREENER_SORT_BY = 'change'; // Changed to change % for sorting
+    SCREENER_SORT_BY = 'change';
     SCREENER_SORT_DIR = 'asc';   
   } else {
     SCREENER_SORT_BY = 'change';
@@ -252,7 +258,6 @@ function renderChips() {
     const ogCount = countOpenGainStocks();
     const scCount = countSellCandidates();
     
-    // REMOVED top_gainers and top_losers chips
     el.innerHTML =
       chip('open_gain', `🏆 Top Performing (${ogCount})`) +
       chip('sell_candidates', `📉 Top Shorts (${scCount})`) +
@@ -408,41 +413,43 @@ function formatQty(n) {
 }
 
 /* ============================================================
-   SECTION 3.2 — NIFTY 50 HEADER
+   SECTION 3.2 — TICKER RENDER
    ============================================================ */
-function updateNiftyHeader() {
-  const ltpEl = document.getElementById('niftyLtp');
-  const chgEl = document.getElementById('niftyChange');
-  if (!ltpEl || !chgEl) return;
+function renderTicker() {
+  const el = document.getElementById('tickerContent');
+  if (!el) return;
 
-  const ltp = SCREENER_LTP[NIFTY50_TOKEN];
-  const prev = SCREENER_PREV_CLOSE[NIFTY50_TOKEN];
-
-  if (!ltp) {
-    ltpEl.textContent = '—';
-    ltpEl.style.color = 'var(--text-primary)';
-    chgEl.textContent = '';
-    return;
-  }
-
-  const ltpText = formatPriceINR(ltp);
-
-  if (prev && prev > 0) {
-    const diff = ltp - prev;
-    const pct = (diff / prev) * 100;
+  let html = '';
+  
+  for (const [token, data] of Object.entries(TICKER_DATA)) {
+    if (!data.prev || !data.ltp) continue;
+    const diff = data.ltp - data.prev;
+    const pct = (diff / data.prev) * 100;
     const isPos = diff >= 0;
-    const color = isPos ? 'var(--success)' : 'var(--danger)';
+    const colorClass = isPos ? 'pos' : 'neg';
     const arrow = isPos ? '▲' : '▼';
     const sign = isPos ? '+' : '';
-    ltpEl.textContent = ltpText;
-    ltpEl.style.color = color;
-    chgEl.textContent = `${arrow} ${sign}${diff.toFixed(2)} (${sign}${pct.toFixed(2)}%)`;
-    chgEl.style.color = color;
-  } else {
-    ltpEl.textContent = ltpText;
-    ltpEl.style.color = 'var(--text-primary)';
-    chgEl.textContent = '';
+
+    const finalClass = token === INDIAVIX_TOKEN ? (isPos ? 'neg' : 'pos') : colorClass;
+
+    html += `<div class="ticker-item">
+      ${data.name}
+      <span class="val ${finalClass}">${data.ltp.toFixed(2)} ${arrow} ${sign}${pct.toFixed(2)}%</span>
+    </div>`;
   }
+
+  if (TICKER_BREADTH.adv > 0 || TICKER_BREADTH.dec > 0) {
+    html += `<div class="ticker-item">
+      NIFTY 500 BREADTH
+      <span class="val"><span class="pos">🟢 ${TICKER_BREADTH.adv} Adv</span> &nbsp;|&nbsp; <span class="neg">🔴 ${TICKER_BREADTH.dec} Dec</span></span>
+    </div>`;
+  }
+
+  if (!html) {
+      html = `<div class="ticker-item">Waiting for market data...</div>`;
+  }
+
+  el.innerHTML = html + html;
 }
 
 /* ============================================================
@@ -482,7 +489,7 @@ function updateLTPCells(ticks, vwaps, rsis) {
       mqEl.textContent = computeMaxQty(token, +price);
     }
 
-    if (vwaps && vwaps[token] != null && !isNaN(vwaps[token])) {
+    if (vwaps && vwaps[token] != null) {
       SCREENER_VWAP[token] = vwaps[token];
       const vwEl = row.querySelector('.vwap-cell');
       if (vwEl) vwEl.textContent = '₹' + (+vwaps[token]).toFixed(2);
@@ -721,9 +728,13 @@ function updateProgress(done, total) {
    ============================================================ */
 async function loadLTP() {
   const baseList = SCREENER_ALL_STOCKS;
-
   const tokens = baseList.map(s => s.token);
-  if (!tokens.includes(NIFTY50_TOKEN)) tokens.push(NIFTY50_TOKEN);
+  
+  // Add Index tokens
+  for (const t of INDEX_TOKENS) {
+      if (!tokens.includes(t)) tokens.push(t);
+  }
+  
   if (!tokens.length) return;
 
   try {
@@ -756,9 +767,15 @@ async function loadLTP() {
             rank: item.rank ?? existing.rank
           };
         }
+
+        // Update Ticker Initial Data
+        if (INDEX_TOKENS.includes(item.token)) {
+          TICKER_DATA[item.token].ltp = item.ltp || 0;
+          TICKER_DATA[item.token].prev = item.prevClose || 0;
+        }
       }
     }
-    updateNiftyHeader();
+    renderTicker();
     renderScreenerTable();
   } catch (e) { console.error('LTP failed:', e); }
 }
@@ -786,10 +803,20 @@ function startSSE() {
           }
         }
 
-        if (msg.ticks[NIFTY50_TOKEN] !== undefined) {
-          SCREENER_LTP[NIFTY50_TOKEN] = msg.ticks[NIFTY50_TOKEN];
-          updateNiftyHeader();
+        // Update Ticker Indices
+        for (const token of INDEX_TOKENS) {
+          if (msg.ticks[token] !== undefined) {
+            TICKER_DATA[token].ltp = msg.ticks[token];
+            TICKER_DATA[token].prev = SCREENER_PREV_CLOSE[token] || msg.prevCloses?.[token] || TICKER_DATA[token].prev;
+          }
         }
+
+        // Update Breadth
+        if (msg.breadth) {
+          TICKER_BREADTH = msg.breadth;
+        }
+        
+        renderTicker();
         updateLTPCells(msg.ticks, msg.vwaps, msg.rsis);
         scheduleOpenGainRerender();
       }
@@ -801,7 +828,7 @@ function startSSE() {
           if (v.rsi != null) SCREENER_RSI[token] = v.rsi;
           if (v.leverage != null) SCREENER_LEVERAGE[token] = v.leverage;
           if (v.marginPerShare != null) SCREENER_MARGIN_PS[token] = v.marginPerShare;
-         // if (v.vwap != null) SCREENER_VWAP[token] = v.vwap;
+          if (v.vwap != null) SCREENER_VWAP[token] = v.vwap;
           if (v.rsiFirst != null) SCREENER_RSI_FIRST[token] = v.rsiFirst;
           if (v.prevClose != null) SCREENER_PREV_CLOSE[token] = v.prevClose;
         }
@@ -873,19 +900,17 @@ function renderScreenerTable() {
       SCREENER_CHIPS.forEach(c => { rankBy[String(c.token)] = c.rank; });
       filtered.sort((a, b) => (rankBy[String(a.token)] ?? 999) - (rankBy[String(b.token)] ?? 999));
     }
-    // REMOVED top_gainers and top_losers blocks completely
 
     OPEN_GAIN_RANK = {};
     SELL_CANDIDATE_RANK = {};
 
-    // Sorting rank logic by change % as requested
     if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
       [...filtered]
-        .sort((a, b) => getSortValue(b, 'change') - getSortValue(a, 'change')) // highest change %
+        .sort((a, b) => getSortValue(b, 'change') - getSortValue(a, 'change'))
         .forEach((s, i) => { OPEN_GAIN_RANK[String(s.token)] = i + 1; });
     } else if (SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
       [...filtered]
-        .sort((a, b) => getSortValue(a, 'change') - getSortValue(b, 'change')) // lowest change %
+        .sort((a, b) => getSortValue(a, 'change') - getSortValue(b, 'change'))
         .forEach((s, i) => { SELL_CANDIDATE_RANK[String(s.token)] = i + 1; });
     }
 

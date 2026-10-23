@@ -245,6 +245,16 @@
   </div>
 </nav>
 
+<!-- ============================================================
+     SECTION 4.1 — MARKET TICKER (NEW)
+     ============================================================ -->
+<div class="ticker-wrap">
+  <div class="ticker" id="tickerContent">
+    <!-- Data will be injected via JS (screener.js) -->
+    <div class="ticker-item">Loading market data...</div>
+  </div>
+</div>
+
 
 <!-- ============================================================
      SECTION 5 — MAIN CONTAINER
@@ -255,13 +265,7 @@
   <div id="page-screener" class="page active">
     <div class="panel-glass">
       <div class="panel-head">
-        <div id="niftyHeader" style="display:flex;flex-direction:column;gap:2px;min-width:220px">
-  <div style="font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1.2px;text-transform:uppercase">NIFTY 50</div>
-  <div style="display:flex;align-items:baseline;gap:10px">
-    <span id="niftyLtp" style="font-size:20px;font-weight:800;letter-spacing:-0.5px;line-height:1.1">—</span>
-    <span id="niftyChange" style="font-size:12px;font-weight:700">—</span>
-  </div>
-</div>
+        <!-- OLD NIFTY HEADER REMOVED FROM HERE -->
         <div class="screener-controls">
           <label>Strategy:</label>
           <select id="strategySelect" onchange="onStrategyChange()">
@@ -659,8 +663,8 @@ Rahul Verma,9876543212,5d"></textarea>
      SECTION 8 — SCRIPTS
      ============================================================ -->
 <script src="admin.js"></script>
-<script src="screener.js?v=20261025"></script>
-<script src="orders.js?v=20261025"></script>
+<script src="screener.js?v=20261026"></script>
+<script src="orders.js?v=20261026"></script>
 <script src="app.js?v=20261014"></script>
 
 </body>

@@ -440,9 +440,10 @@ function renderTicker() {
 
   if (TICKER_BREADTH.adv > 0 || TICKER_BREADTH.dec > 0) {
     html += `<div class="ticker-item">
-  MARKET BREADTH
-  <span class="val"><span class="pos">🟢 ${TICKER_BREADTH.adv} Adv</span> &nbsp;|&nbsp; <span class="neg">🔴 ${TICKER_BREADTH.dec} Dec</span></span>
-</div>`;
+      NIFTY 500 BREADTH
+      <span class="val"><span class="pos">🟢 ${TICKER_BREADTH.adv} Adv</span> &nbsp;|&nbsp; <span class="neg">🔴 ${TICKER_BREADTH.dec} Dec</span></span>
+    </div>`;
+  }
 
   if (!html) {
       html = `<div class="ticker-item">Waiting for market data...</div>`;

@@ -1016,9 +1016,9 @@ function handleTick(token, ltp, tickMs, extra) {
 
   if (INDEX_TOKENS.includes(String(token))) {
     setCachedLTP(token, ltp);
-    if (extra && Number.isFinite(extra.close) && extra.close > 0) {
-      prevCloseCache.set(token, +extra.close.toFixed(2));
-    }
+   // if (extra && Number.isFinite(extra.close) && extra.close > 0) {
+     // prevCloseCache.set(token, +extra.close.toFixed(2));
+    //}
     broadcastLTP(token, ltp);
     return;
   }

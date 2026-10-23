@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.8.0 (Market Ticker + Breadth)
+   SCREENER.JS  — v4.8.1 (Market Ticker + Breadth + Fallback Fix)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -422,34 +422,44 @@ function renderTicker() {
   let html = '';
   
   for (const [token, data] of Object.entries(TICKER_DATA)) {
-    if (!data.prev || !data.ltp) continue;
-    const diff = data.ltp - data.prev;
-    const pct = (diff / data.prev) * 100;
-    const isPos = diff >= 0;
-    const colorClass = isPos ? 'pos' : 'neg';
-    const arrow = isPos ? '▲' : '▼';
-    const sign = isPos ? '+' : '';
+    if (!data.ltp) continue; // LTP aana chahiye, warna skip
+
+    let pct = 0;
+    let isPos = true;
+    let colorClass = 'pos';
+    let arrow = '▲';
+    let sign = '+';
+    let showChange = false;
+
+    // Agar prev close mila hai toh % calculate karo
+    if (data.prev > 0) {
+      showChange = true;
+      const diff = data.ltp - data.prev;
+      pct = (diff / data.prev) * 100;
+      isPos = diff >= 0;
+      colorClass = isPos ? 'pos' : 'neg';
+      arrow = isPos ? '▲' : '▼';
+      sign = isPos ? '+' : '';
+    }
 
     const finalClass = token === INDIAVIX_TOKEN ? (isPos ? 'neg' : 'pos') : colorClass;
+    const changeText = showChange ? `${arrow} ${sign}${pct.toFixed(2)}%` : '';
 
     html += `<div class="ticker-item">
       ${data.name}
-      <span class="val ${finalClass}">${data.ltp.toFixed(2)} ${arrow} ${sign}${pct.toFixed(2)}%</span>
+      <span class="val ${finalClass}">${data.ltp.toFixed(2)} <span style="font-size:10px">${changeText}</span></span>
     </div>`;
   }
 
   if (TICKER_BREADTH.adv > 0 || TICKER_BREADTH.dec > 0) {
     html += `<div class="ticker-item">
-      NIFTY 500 BREADTH
+      MARKET BREADTH
       <span class="val"><span class="pos">🟢 ${TICKER_BREADTH.adv} Adv</span> &nbsp;|&nbsp; <span class="neg">🔴 ${TICKER_BREADTH.dec} Dec</span></span>
     </div>`;
   }
 
-  if (!html) {
-      html = `<div class="ticker-item">Waiting for market data...</div>`;
-  }
-
-  el.innerHTML = html;
+  // Sirf ek baar render karo, html+html (duplicate) hata do
+  el.innerHTML = html || `<div class="ticker-item">Waiting for market data...</div>`;
 }
 
 /* ============================================================
@@ -1012,6 +1022,7 @@ function startDayHLCFetch() { if (typeof showToast === 'function') showToast('�
 function onStrategyChange() { }
 function setStageFilter() { }
 function renderChipBar() { }
+function updateNiftyHeader() { } // Safety stub
 
 /* ============================================================
    SECTION 10 — HELPERS

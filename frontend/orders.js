@@ -1,14 +1,5 @@
 /* ============================================================
-   ORDERS.JS — v1.3 (autoTrader v1.3 stage labels + Long/Short)
-   AutoTrader positions page — Entry / SL / T1 / T2 / Net P&L
-   ------------------------------------------------------------
-   - Data: GET /api/auto/positions (3s poll jab page active ho)
-   - Nav click pe page khud activate karta hai (app.js pe depend nahi)
-   - Stats: NET P&L (total), OPEN, CLOSED, WINS
-   - Table: TIME · STOCK · TYPE · STATUS · QTY · ENTRY · LTP · SL(live trail)
-   - v1.2: stage labels autoTrader v1.3 ke rules pe (BE@+0.7% / T1=+1% / T2=+1.5%)
-            · T1 ✓ · T2 ✓ · NET P&L ₹/% · EXIT reason+time
-   - v1.3: Added TYPE column (LONG / SHORT) based on side
+   ORDERS.JS — v2.1 (Compact UI + Advanced Stats)
    ============================================================ */
 
 let ORDERS_DATA = { date: null, total: 0, positions: [] };
@@ -43,8 +34,7 @@ function startOrdersPoll() {
 }
 
 /* ============================================================
-   SECTION 2 — NAV CLICK HOOK (page activate + load + poll)
-   app.js me page list hardcoded ho tab bhi Orders page khulega
+   SECTION 2 — NAV CLICK HOOK
    ============================================================ */
 document.addEventListener('click', (e) => {
   const link = e.target.closest('[data-page="orders"]');
@@ -66,7 +56,7 @@ function ordTime(d) {
   try {
     const dt = new Date(d);
     const ist = new Date(dt.getTime() + 5.5 * 3600 * 1000);
-    return ist.toISOString().slice(11, 19);
+    return ist.toISOString().slice(11, 16); // HH:MM only
   } catch { return '—'; }
 }
 
@@ -75,18 +65,24 @@ function ordINR(v) {
   return '₹' + (+v).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-function ordStatus(p) {
+function ordShortINR(v) {
+  if (v == null || v === undefined) return '—';
+  return '₹' + (+v).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+}
+
+// Simplified State Column (Removed SL Text)
+function ordState(p) {
   if (p.status === 'open') {
-    // v1.2: autoTrader v1.3 stages — 0=fresh(SL@dayOpen) 1=SL@Cost 2=T1✓trail 3=T2✓trail
-    if (p.stage >= 3) return '<span style="color:#6C5CE7;font-weight:800">🟢 OPEN · T2✓ trail</span>';
-    if (p.stage === 2) return '<span style="color:#6C5CE7;font-weight:800">🟢 OPEN · T1✓ trail</span>';
-    if (p.stage === 1) return '<span style="color:#F5A623;font-weight:800">🟢 OPEN · SL@Cost</span>';
-    return '<span style="color:var(--success);font-weight:800">🟢 OPEN · SL@DayOpen</span>';
+    if (p.stage >= 3) return '<span style="color:#6C5CE7;font-weight:700">🟢 OPEN (T2 Trail)</span>';
+    if (p.stage === 2) return '<span style="color:#6C5CE7;font-weight:700">🟢 OPEN (T1 Trail)</span>';
+    if (p.stage === 1) return '<span style="color:#F5A623;font-weight:700">🟢 OPEN (BE)</span>';
+    return '<span style="color:var(--success);font-weight:700">🟢 OPEN</span>';
   }
+  
   const rsn = p.exitReason || 'EXIT';
-  const col = rsn === 'SL' ? 'var(--danger)'
-            : (rsn === 'EOD_15:00' ? 'var(--text-secondary)' : '#6C5CE7');
-  return `<span style="color:${col};font-weight:800">⏹ ${rsn}</span>`;
+  const col = rsn.includes('SL') ? 'var(--danger)' : 'var(--text-secondary)';
+  return `<span style="color:${col};font-weight:700">🔴 EXIT: ${rsn}</span><br>
+          <span style="font-size:10px;color:var(--text-muted)">${ordTime(p.exitAt)}</span>`;
 }
 
 /* ============================================================
@@ -101,59 +97,88 @@ function renderOrders() {
   const open = ps.filter(p => p.status === 'open');
   const closed = ps.filter(p => p.status !== 'open');
   const wins = closed.filter(p => p.pnl > 0).length;
+  const losses = closed.filter(p => p.pnl <= 0).length;
+  
+  // Calculate New Stats
+  const winRate = closed.length > 0 ? Math.round((wins / closed.length) * 100) : 0;
+  const deployedCapital = open.reduce((sum, p) => sum + (p.entry * p.qty), 0);
+  
   const total = ORDERS_DATA.total ?? 0;
   const tCol = total > 0 ? 'var(--success)' : total < 0 ? 'var(--danger)' : 'var(--text-primary)';
 
-  /* ---- stats row ---- */
+  /* ---- Compact Stats Row ---- */
   if (stats) {
-    const card = (label, value, color) => `
-      <div style="background:var(--bg-secondary);border:1px solid var(--border-soft);
-                  border-radius:12px;padding:14px 20px;min-width:110px">
-        <div style="font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1px">${label}</div>
-        <div style="font-size:20px;font-weight:800;color:${color || 'var(--text-primary)'}">${value}</div>
+    // Reduced padding and font size for professional look
+    const card = (label, value, color, subtext = '') => `
+      <div style="background:var(--bg-secondary); border:1px solid var(--border-soft); border-radius:8px; padding:8px 12px; min-width:90px;">
+        <div style="font-size:9px; font-weight:700; color:var(--text-muted); letter-spacing:0.5px;">${label}</div>
+        <div style="font-size:16px; font-weight:800; color:${color || 'var(--text-primary)'}; margin-top:2px;">${value}</div>
+        ${subtext ? `<div style="font-size:9px; color:var(--text-muted); margin-top:2px;">${subtext}</div>` : ''}
       </div>`;
+      
     stats.innerHTML =
-      card('NET P&L', `${total >= 0 ? '+' : ''}${ordINR(total)}`, tCol) +
-      card('OPEN', open.length, 'var(--success)') +
-      card('CLOSED', closed.length) +
-      card('WINS', wins, 'var(--success)');
+      card('NET P&L', `${total >= 0 ? '+' : ''}${ordShortINR(total)}`, tCol) +
+      card('WIN RATE', `${winRate}%`, winRate >= 50 ? 'var(--success)' : '#F5A623', `${wins} W / ${losses} L`) +
+      card('OPEN / CLOSED', `${open.length} / ${closed.length}`, 'var(--text-primary)') +
+      card('DEPLOYED', `${ordShortINR(deployedCapital)}`, '#6C5CE7', 'Margin Used');
   }
 
-  /* ---- positions table ---- */
+  /* ---- Positions Table ---- */
   const rows = ps.map(p => {
     const pnlCol = p.pnl > 0 ? 'var(--success)' : p.pnl < 0 ? 'var(--danger)' : 'var(--text-secondary)';
     const t1hit = (p.stage >= 2 || (p.exitPrice != null && p.exitPrice >= p.t1));
     const t2hit = (p.stage >= 3 || (p.exitPrice != null && p.exitPrice >= p.t2));
     
-    // NEW: Long / Short Logic
     const isShort = p.side === 'SELL';
     const typeText = isShort ? 'SHORT' : 'LONG';
-    const typeColor = isShort ? 'var(--danger)' : 'var(--success)';
+    const typeBg = isShort ? 'rgba(255,71,87,0.15)' : 'rgba(46,213,115,0.15)';
+    const typeCol = isShort ? 'var(--danger)' : 'var(--success)';
+    const capitalUsed = p.entry * p.qty;
 
-    return `<tr>
-      <td style="font-family:ui-monospace,monospace;font-size:11px;color:var(--text-muted);white-space:nowrap">${ordTime(p.entryAt)}</td>
-      <td><span class="sym">${p.sym}</span><span class="tok">${p.token}</span></td>
-      <td style="font-weight:800;color:${typeColor};white-space:nowrap">${typeText}</td>
-      <td style="white-space:nowrap">${ordStatus(p)}</td>
-      <td style="font-weight:700">${p.qty}</td>
-      <td style="font-weight:700;white-space:nowrap">${ordINR(p.entry)}</td>
-      <td style="white-space:nowrap">${p.ltp ? ordINR(p.ltp) : '—'}</td>
-      <td style="color:#F5A623;font-weight:700;white-space:nowrap">${ordINR(p.slLive ?? p.sl)}</td>
-      <td style="white-space:nowrap;color:${t1hit ? 'var(--success)' : 'var(--text-muted)'}">${ordINR(p.t1)} ${t1hit ? '✓' : ''}</td>
-      <td style="white-space:nowrap;color:${t2hit ? 'var(--success)' : 'var(--text-muted)'}">${ordINR(p.t2)} ${t2hit ? '✓' : ''}</td>
-      <td style="color:${pnlCol};font-weight:800;white-space:nowrap">${p.pnl >= 0 ? '+' : ''}${ordINR(p.pnl)}<br>
-          <span style="font-size:10px;font-weight:600">${p.pnlPct >= 0 ? '+' : ''}${p.pnlPct}%</span></td>
-      <td style="font-size:11px;color:var(--text-muted);white-space:nowrap">${p.status === 'open' ? '—' : (p.exitReason || '') + ' @ ' + ordTime(p.exitAt)}</td>
+    return `<tr style="border-bottom:1px solid rgba(255,255,255,0.05); font-size:12px;">
+      <td style="padding:6px 8px; color:var(--text-muted); font-family:monospace;">${ordTime(p.entryAt)}</td>
+      <td style="padding:6px 8px; font-weight:700; font-size:13px;">${p.sym}</td>
+      <td style="padding:6px 8px;">
+        <span style="background:${typeBg}; color:${typeCol}; padding:2px 6px; border-radius:4px; font-size:10px; font-weight:800;">
+          ${typeText}
+        </span>
+      </td>
+      <td style="padding:6px 8px; font-weight:600;">${p.qty}</td>
+      <td style="padding:6px 8px; font-weight:700;">${ordINR(p.entry)}</td>
+      <td style="padding:6px 8px;">${p.ltp ? ordINR(p.ltp) : '—'}</td>
+      <td style="padding:6px 8px; color:#F5A623; font-weight:700;">${ordINR(p.slLive ?? p.sl)}</td>
+      <td style="padding:6px 8px; color:${t1hit ? 'var(--success)' : 'var(--text-muted)'}">${ordINR(p.t1)} ${t1hit ? '✓' : ''}</td>
+      <td style="padding:6px 8px; color:${t2hit ? 'var(--success)' : 'var(--text-muted)'}">${ordINR(p.t2)} ${t2hit ? '✓' : ''}</td>
+      <td style="padding:6px 8px; color:var(--text-muted); font-size:11px;">${ordINR(capitalUsed)}</td>
+      <td style="padding:6px 8px; color:${pnlCol}; font-weight:800;">
+        ${p.pnl >= 0 ? '+' : ''}${ordINR(p.pnl)} <br>
+        <span style="font-size:10px;">${p.pnlPct >= 0 ? '+' : ''}${p.pnlPct}%</span>
+      </td>
+      <td style="padding:6px 8px;">${ordState(p)}</td>
     </tr>`;
   }).join('');
 
-  wrap.innerHTML = `<table class="table-modern">
-    <thead><tr>
-      <th>TIME</th><th>STOCK</th><th>TYPE</th><th>STATUS</th><th>QTY</th><th>ENTRY</th><th>LTP</th>
-      <th>SL (live)</th><th>T1 (+1.5%)</th><th>T2 (+2%)</th><th>NET P&L</th><th>EXIT</th>
-    </tr></thead>
-    <tbody>${rows || `<tr><td colspan="12" style="text-align:center;padding:50px;color:var(--text-muted)">
-      No orders yet — chip list 9:15 pe lock hoti hai, RSI ≥70 wale stocks pe auto entry hoti hai
-    </td></tr>`}</tbody>
+  wrap.innerHTML = `<table class="table-modern" style="width:100%; text-align:left; border-collapse:collapse;">
+    <thead>
+      <tr style="border-bottom:1px solid var(--border-soft); color:var(--text-muted); font-size:11px;">
+        <th style="padding:8px 8px;">TIME</th>
+        <th style="padding:8px 8px;">STOCK</th>
+        <th style="padding:8px 8px;">TYPE</th>
+        <th style="padding:8px 8px;">QTY</th>
+        <th style="padding:8px 8px;">ENTRY</th>
+        <th style="padding:8px 8px;">LTP</th>
+        <th style="padding:8px 8px;">SL (live)</th>
+        <th style="padding:8px 8px;">T1</th>
+        <th style="padding:8px 8px;">T2</th>
+        <th style="padding:8px 8px;">VALUE</th>
+        <th style="padding:8px 8px;">NET P&L</th>
+        <th style="padding:8px 8px;">STATE / EXIT</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows || `<tr><td colspan="12" style="text-align:center;padding:40px;color:var(--text-muted);font-size:12px;">
+      No positions found.
+    </td></tr>`}
+    </tbody>
   </table>`;
 }

@@ -1,13 +1,14 @@
 /* ============================================================
-   ORDERS.JS — v1.2 (autoTrader v1.3 stage labels)
+   ORDERS.JS — v1.3 (autoTrader v1.3 stage labels + Long/Short)
    AutoTrader positions page — Entry / SL / T1 / T2 / Net P&L
    ------------------------------------------------------------
    - Data: GET /api/auto/positions (3s poll jab page active ho)
    - Nav click pe page khud activate karta hai (app.js pe depend nahi)
    - Stats: NET P&L (total), OPEN, CLOSED, WINS
-   - Table: TIME · STOCK · STATUS · QTY · ENTRY · LTP · SL(live trail)
+   - Table: TIME · STOCK · TYPE · STATUS · QTY · ENTRY · LTP · SL(live trail)
    - v1.2: stage labels autoTrader v1.3 ke rules pe (BE@+0.7% / T1=+1% / T2=+1.5%)
             · T1 ✓ · T2 ✓ · NET P&L ₹/% · EXIT reason+time
+   - v1.3: Added TYPE column (LONG / SHORT) based on side
    ============================================================ */
 
 let ORDERS_DATA = { date: null, total: 0, positions: [] };
@@ -123,9 +124,16 @@ function renderOrders() {
     const pnlCol = p.pnl > 0 ? 'var(--success)' : p.pnl < 0 ? 'var(--danger)' : 'var(--text-secondary)';
     const t1hit = (p.stage >= 2 || (p.exitPrice != null && p.exitPrice >= p.t1));
     const t2hit = (p.stage >= 3 || (p.exitPrice != null && p.exitPrice >= p.t2));
+    
+    // NEW: Long / Short Logic
+    const isShort = p.side === 'SELL';
+    const typeText = isShort ? 'SHORT' : 'LONG';
+    const typeColor = isShort ? 'var(--danger)' : 'var(--success)';
+
     return `<tr>
       <td style="font-family:ui-monospace,monospace;font-size:11px;color:var(--text-muted);white-space:nowrap">${ordTime(p.entryAt)}</td>
       <td><span class="sym">${p.sym}</span><span class="tok">${p.token}</span></td>
+      <td style="font-weight:800;color:${typeColor};white-space:nowrap">${typeText}</td>
       <td style="white-space:nowrap">${ordStatus(p)}</td>
       <td style="font-weight:700">${p.qty}</td>
       <td style="font-weight:700;white-space:nowrap">${ordINR(p.entry)}</td>
@@ -141,10 +149,10 @@ function renderOrders() {
 
   wrap.innerHTML = `<table class="table-modern">
     <thead><tr>
-      <th>TIME</th><th>STOCK</th><th>STATUS</th><th>QTY</th><th>ENTRY</th><th>LTP</th>
+      <th>TIME</th><th>STOCK</th><th>TYPE</th><th>STATUS</th><th>QTY</th><th>ENTRY</th><th>LTP</th>
       <th>SL (live)</th><th>T1 (+1.5%)</th><th>T2 (+2%)</th><th>NET P&L</th><th>EXIT</th>
     </tr></thead>
-    <tbody>${rows || `<tr><td colspan="11" style="text-align:center;padding:50px;color:var(--text-muted)">
+    <tbody>${rows || `<tr><td colspan="12" style="text-align:center;padding:50px;color:var(--text-muted)">
       No orders yet — chip list 9:15 pe lock hoti hai, RSI ≥70 wale stocks pe auto entry hoti hai
     </td></tr>`}</tbody>
   </table>`;

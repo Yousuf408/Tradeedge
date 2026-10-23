@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.26 (Strict Top 15 + DB Side Mode)
+   server.js — TradeAlgo Pro backend  |  v5.27 (Indices + Breadth)
    ============================================================ */
 
 import express from 'express';
@@ -94,6 +94,9 @@ STOCKS.forEach(s => {
 });
 
 const NIFTY50_TOKEN = '99926000';
+const BANKNIFTY_TOKEN = '99926009';
+const INDIAVIX_TOKEN = '99926017';
+const INDEX_TOKENS = [NIFTY50_TOKEN, BANKNIFTY_TOKEN, INDIAVIX_TOKEN];
 
 const STRATEGIES = {
   momentum: {
@@ -166,7 +169,7 @@ const prevCloseCache = new Map();
 
 async function loadPrevCloseFromDB() {
   try {
-    const activeTokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
+    const activeTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
     const latestDate = getIST().toISOString().split('T')[0];
 
     const { rows: bsRows } = await db.query(
@@ -217,6 +220,8 @@ const rsiState = new Map();
 
 const chipList = new Map();
 let chipDate = null;
+
+let latestBreadth = { adv: 0, dec: 0 };
 
 function computeRSI(prevCloses, currentClose) {
   if (!Array.isArray(prevCloses) || prevCloses.length < 13) return null;
@@ -922,6 +927,20 @@ const ssePendingVwap = new Map();
 const ssePendingRsi = new Map();
 const ssePendingPrevClose = new Map();
 
+function updateMarketBreadth() {
+  let adv = 0, dec = 0;
+  for (const s of STOCKS) {
+    const token = String(s.token);
+    const ltp = getCachedLTP(token) || bsCache.get(token)?.ltp;
+    const pc = prevCloseCache.get(token);
+    if (ltp && pc && pc > 0) {
+      if (ltp > pc) adv++;
+      else if (ltp < pc) dec++;
+    }
+  }
+  latestBreadth = { adv, dec };
+}
+
 function broadcastLTP(token, ltp) {
   if (!sseClients.size) return;
   ssePending.set(String(token), ltp);
@@ -942,7 +961,8 @@ function broadcastLTP(token, ltp) {
       ticks: Object.fromEntries(ssePending),
       vwaps: Object.fromEntries(ssePendingVwap),
       rsis: Object.fromEntries(ssePendingRsi),
-      prevCloses: Object.fromEntries(ssePendingPrevClose)
+      prevCloses: Object.fromEntries(ssePendingPrevClose),
+      breadth: latestBreadth
     })}\n\n`;
     ssePending.clear();
     ssePendingVwap.clear();
@@ -994,7 +1014,7 @@ function handleTick(token, ltp, tickMs, extra) {
     }
   }
 
-  if (token === NIFTY50_TOKEN) {
+  if (INDEX_TOKENS.includes(String(token))) {
     setCachedLTP(token, ltp);
     if (extra && Number.isFinite(extra.close) && extra.close > 0) {
       prevCloseCache.set(token, +extra.close.toFixed(2));
@@ -1035,7 +1055,7 @@ function startWebSocketForReadyPhase() {
   const feedToken = restSession.loggedIn ? getFeedTokenREST() : getFeedTokenQuote();
   if (!feedToken) { console.log('⚠️  WS skipped — no feed token'); return; }
 
-  const tokens = [...STOCKS.map(s => String(s.token)), NIFTY50_TOKEN];
+  const tokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
   try {
     startWS({
       apiKey: process.env.ANGEL_API_KEY,
@@ -1276,25 +1296,23 @@ app.get('/api/auto/capital', auth, (req, res) => {
   res.json({ ok: true, capital: userCapital.get(uid) ?? Number(process.env.AUTO_PER_TRADE || 25000) });
 });
 
-// ✅ UPDATED: Save Side Mode to DB
 app.post('/api/auto/side-mode', auth, async (req, res) => {
   const uid = req.user?.id || req.user?.username || 'admin';
   const mode = String(req.body?.value || 'MIX').toUpperCase();
   if (!['BUY', 'SELL', 'MIX'].includes(mode)) return res.status(400).json({ error: 'Invalid mode' });
   
   try {
-    await db.query(`UPDATE users SET side_mode = $1 WHERE user_id = $2`, [mode, uid]);
+    await db.query(`UPDATE users SET side_mode = $1 WHERE id = $2`, [mode, uid]);
     res.json({ ok: true, userId: uid, mode });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ✅ UPDATED: Fetch Side Mode from DB
 app.get('/api/auto/side-mode', auth, async (req, res) => {
   const uid = req.user?.id || req.user?.username || 'admin';
   try {
-    const { rows } = await db.query(`SELECT side_mode FROM users WHERE user_id = $1`, [uid]);
+    const { rows } = await db.query(`SELECT side_mode FROM users WHERE id = $1`, [uid]);
     res.json({ ok: true, mode: rows[0]?.side_mode || 'MIX' });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2112,7 +2130,6 @@ let entryDay = null;
 const entryTriggered = new Set();
 let entryCount = 0;
 
-// ✅ UPDATED: Top 15 Sorting Logic + DB Users Fetch
 async function runEntryScan(date) {
   try {
     if (!date) return;
@@ -2203,10 +2220,9 @@ async function runEntryScan(date) {
     const mi = String(ist.getUTCMinutes()).padStart(2, '0');
     console.log(`🎯 Entry trigger ${hh}:${mi} — ${newList.length} CANDIDATES: ${newList.map(c => `${c.sym}(${c.side} ${c.openGainPct}%)`).join(', ')}`);
 
-    // ✅ FETCH SIDE MODE FROM DB INSTEAD OF MEMORY MAP
     const { rows: dbUsers } = await db.query(`SELECT id, side_mode FROM users`);
     const users = [...userCapital.entries()].map(([userId, capital]) => {
-      const dbU = dbUsers.find(u => u.user_id === userId);
+      const dbU = dbUsers.find(u => u.id === userId);
       return { 
         userId, 
         capital, 
@@ -2442,7 +2458,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.26 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.27 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2497,7 +2513,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.26`);
+  console.log(`✅ Server on port ${PORT} — v5.27`);
   initMarginService(db, getBrokerSession);
 
   try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }
@@ -2515,6 +2531,17 @@ app.listen(PORT, async () => {
   await loadChipListFromDB(getIST().toISOString().split('T')[0]);
   await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
   computeBuyersGroups();
+
+  // ✅ Fetch accurate prev close for indices via Quote API on startup
+  try {
+    const quotes = await fetchQuotesForTokens(INDEX_TOKENS);
+    if (quotes) {
+      for (const q of quotes) {
+        if (q.close && q.close > 0) prevCloseCache.set(String(q.token), +q.close);
+      }
+      console.log(`📊 Indices PrevClose fetched via Quote API`);
+    }
+  } catch(e) { console.log('Indices Quote fetch failed'); }
 
   initAutoTrader({
     db,
@@ -2598,6 +2625,8 @@ app.listen(PORT, async () => {
   startEntryEngine();
 
   maybeRefreshMargins('angelone', { force: true }).catch(() => {});
+
+  setInterval(updateMarketBreadth, 5000);
 
   console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15 (30s) | Quote@9:30 | EntryScan@9:15-11:00 (1s) | HLC@15:31 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');
 });

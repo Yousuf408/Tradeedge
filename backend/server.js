@@ -2204,7 +2204,7 @@ async function runEntryScan(date) {
     console.log(`🎯 Entry trigger ${hh}:${mi} — ${newList.length} CANDIDATES: ${newList.map(c => `${c.sym}(${c.side} ${c.openGainPct}%)`).join(', ')}`);
 
     // ✅ FETCH SIDE MODE FROM DB INSTEAD OF MEMORY MAP
-    const { rows: dbUsers } = await db.query(`SELECT user_id, side_mode FROM users`);
+    const { rows: dbUsers } = await db.query(`SELECT id, side_mode FROM users`);
     const users = [...userCapital.entries()].map(([userId, capital]) => {
       const dbU = dbUsers.find(u => u.user_id === userId);
       return { 

@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.27 (Indices + Breadth)
+   server.js — TradeAlgo Pro backend  |  v5.28 (No angel_15m_candle + Index Fix)
    ============================================================ */
 
 import express from 'express';
@@ -97,6 +97,11 @@ const NIFTY50_TOKEN = '99926000';
 const BANKNIFTY_TOKEN = '99926009';
 const INDIAVIX_TOKEN = '99926017';
 const INDEX_TOKENS = [NIFTY50_TOKEN, BANKNIFTY_TOKEN, INDIAVIX_TOKEN];
+const INDEX_SYMS = {
+  [NIFTY50_TOKEN]: 'NIFTY 50',
+  [BANKNIFTY_TOKEN]: 'BANKNIFTY',
+  [INDIAVIX_TOKEN]: 'INDIA VIX'
+};
 
 const STRATEGIES = {
   momentum: {
@@ -163,7 +168,7 @@ function countFilled(date) {
 }
 
 /* ============================================================
-   SECTION 4.1 — PREV CLOSE (BS-first)
+   SECTION 4.1 — PREV CLOSE (BS-first only, no angel_15m_candle)
    ============================================================ */
 const prevCloseCache = new Map();
 
@@ -172,7 +177,7 @@ async function loadPrevCloseFromDB() {
     const activeTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
     const latestDate = getIST().toISOString().split('T')[0];
 
-    const { rows: bsRows } = await db.query(
+    const { rows } = await db.query(
       `SELECT DISTINCT ON (token) token, prev_close
        FROM strategy_bs_snapshot
        WHERE prev_close IS NOT NULL
@@ -182,23 +187,8 @@ async function loadPrevCloseFromDB() {
       [activeTokens, latestDate]
     );
 
-    if (bsRows.length) {
-      for (const r of bsRows) prevCloseCache.set(String(r.token), +r.prev_close);
-      console.log(`💾 prevClose (BS source): ${bsRows.length} tokens`);
-      return;
-    }
-
-    const { rows: mRows } = await db.query(
-      `SELECT DISTINCT ON (token) token, day_close
-       FROM angel_15m_candle
-       WHERE day_close IS NOT NULL
-         AND token = ANY($1)
-         AND date < $2
-       ORDER BY token, date DESC`,
-      [activeTokens, latestDate]
-    );
-    for (const r of mRows) prevCloseCache.set(String(r.token), +r.day_close);
-    console.log(`💾 prevClose (15m fallback): ${mRows.length} tokens`);
+    for (const r of rows) prevCloseCache.set(String(r.token), +r.prev_close);
+    console.log(`💾 prevClose (BS source): ${rows.length} tokens`);
   } catch (e) { console.error('prevClose load failed:', e.message); }
 }
 
@@ -873,46 +863,6 @@ setInterval(() => {
   }
 }, 10000);
 
-const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000);
-const ltpWriteQueue = new Map();
-let ltpWriteTimer = null;
-
-function queueLtpWrite(token, ltp, date) {
-  ltpWriteQueue.set(String(token), { ltp, date });
-  if (ltpWriteTimer) return;
-  ltpWriteTimer = setTimeout(flushLtpWrites, LTP_FLUSH_MS);
-}
-
-async function flushLtpWrites() {
-  ltpWriteTimer = null;
-  if (!ltpWriteQueue.size) return;
-  const entries = [...ltpWriteQueue.entries()];
-  ltpWriteQueue.clear();
-
-  const byDate = new Map();
-  for (const [token, { ltp, date }] of entries) {
-    if (!byDate.has(date)) byDate.set(date, []);
-    byDate.get(date).push([token, ltp]);
-  }
-  for (const [date, rows] of byDate) {
-    const tokens = rows.map(r => r[0]);
-    const prices = rows.map(r => r[1]);
-    try {
-      await db.query(
-        `UPDATE angel_15m_candle AS c
-         SET ltp = v.ltp, ltp_updated_at = NOW()
-         FROM (SELECT unnest($1::text[]) AS token, unnest($2::numeric[]) AS ltp) AS v
-         WHERE c.date = $3 AND c.token = v.token`,
-        [tokens, prices, date]
-      );
-      console.log(`💾 LTP flushed: ${rows.length} tokens`);
-    } catch (e) { console.error('LTP flush failed:', e.message); }
-  }
-}
-
-process.on('SIGTERM', async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
-process.on('SIGINT',  async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
-
 const sseClients = new Set();
 let ssePending = new Map();
 let sseFlushTimer = null;
@@ -1017,11 +967,12 @@ function handleTick(token, ltp, tickMs, extra) {
   if (INDEX_TOKENS.includes(String(token))) {
     setCachedLTP(token, ltp);
     if (extra && Number.isFinite(extra.close) && extra.close > 0) {
-      prevCloseCache.set(token, +extra.close.toFixed(2));
+      prevCloseCache.set(token, +extra.close.toFixed(2)); // ✅ Fixed: Uncommented for accurate index %
     }
     broadcastLTP(token, ltp);
     return;
   }
+
   setCachedLTP(token, ltp);
   broadcastLTP(token, ltp);
   lastLtpAt.set(String(token), Date.now());
@@ -1041,9 +992,6 @@ function handleTick(token, ltp, tickMs, extra) {
       bsCache.set(String(token), cached);
     }
   }
-
-  const p = getScreenerPhase();
-  queueLtpWrite(token, ltp, p.date);
 }
 
 function startWebSocketForReadyPhase() {
@@ -1081,7 +1029,6 @@ function stopWebSocketIfNeeded() {
 
   stopWS();
   wsStarted = false;
-  flushLtpWrites().catch(() => {});
   console.log('🔌 WS stopped');
 }
 
@@ -1443,7 +1390,7 @@ app.post('/api/admin/force-day-hlc', auth, adminOnly, async (req, res) => {
     await fetchDayHLC();
     const p = getScreenerPhase();
     const { rows } = await db.query(
-      `SELECT COUNT(*) AS cnt FROM angel_15m_candle WHERE date=$1 AND day_high IS NOT NULL`,
+      `SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot WHERE date=$1 AND day_high IS NOT NULL`,
       [p.date]
     );
     res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
@@ -1780,8 +1727,10 @@ async function fetchDayHLC() {
   try {
     const p = getScreenerPhase();
     if (!p.date) { console.log('❌ [HLC] No date'); return; }
-    const allTokens = STOCKS.map(s => String(s.token));
-    console.log(`🔔 [HLC] Fetching day H/L/C for ${allTokens.length} stocks...`);
+    
+    // ✅ Add INDEX_TOKENS to fetch
+    const allTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
+    console.log(`🔔 [HLC] Fetching day H/L/C for ${allTokens.length} stocks & indices...`);
 
     const savedTokens = new Set();
     const t0 = Date.now();
@@ -1796,67 +1745,31 @@ async function fetchDayHLC() {
 
       const token = String(q.token);
       const close = q.ltp || q.close;
-      const pivot = (+q.high + +q.low + +close) / 3;
+      
+      // ✅ Determine Symbol (Stocks or Index)
+      const sym = SYM_BY_TOKEN[token] || INDEX_SYMS[token] || '?';
 
       setCachedLTP(token, close);
       if (q.close && q.close > 0) prevCloseCache.set(token, +q.close);
-      const bsCached = bsCache.get(token);
-      if (bsCached) bsCached.ltp = close;
 
       try {
+        // ✅ Save to strategy_bs_snapshot
         await db.query(
-          `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-           ON CONFLICT (date, token) DO UPDATE SET
+          `INSERT INTO strategy_bs_snapshot (date, token, sym, strategy_id, day_high, day_low, day_close, prev_close, fetched_at)
+           VALUES ($1, $2, $3, 'momentum', $4, $5, $6, $7, NOW())
+           ON CONFLICT (date, token, strategy_id) DO UPDATE SET
              day_high=EXCLUDED.day_high,
              day_low=EXCLUDED.day_low,
              day_close=EXCLUDED.day_close,
-             pivot=EXCLUDED.pivot,
-             updated_at=NOW()`,
-          [p.date, token, SYM_BY_TOKEN[token] || '?', q.high, q.low, close, pivot]
+             prev_close=EXCLUDED.prev_close,
+             fetched_at=NOW()`,
+          [p.date, token, sym, q.high, q.low, close, q.close]
         );
         savedTokens.add(token);
       } catch (e) { dbErrors.push(`${token}: ${e.message}`); }
     }
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const missing = allTokens.filter(t => !savedTokens.has(t));
-      if (!missing.length) break;
-
-      await new Promise(r => setTimeout(r, 1500));
-      const retry = await fetchQuotesForTokens(missing);
-      for (const q of retry) {
-        if (!q || !q.token) continue;
-        if (!Number.isFinite(q.high) || !Number.isFinite(q.low) || q.high <= 0 || q.low <= 0) continue;
-
-        const token = String(q.token);
-        const close = q.ltp || q.close;
-        const pivot = (+q.high + +q.low + +close) / 3;
-
-        setCachedLTP(token, close);
-        if (q.close && q.close > 0) prevCloseCache.set(token, +q.close);
-        const bsCached = bsCache.get(token);
-        if (bsCached) bsCached.ltp = close;
-
-        try {
-          await db.query(
-            `INSERT INTO angel_15m_candle (date, token, sym, day_high, day_low, day_close, pivot, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-             ON CONFLICT (date, token) DO UPDATE SET
-               day_high=EXCLUDED.day_high,
-               day_low=EXCLUDED.day_low,
-               day_close=EXCLUDED.day_close,
-               pivot=EXCLUDED.pivot,
-               updated_at=NOW()`,
-            [p.date, token, SYM_BY_TOKEN[token] || '?', q.high, q.low, close, pivot]
-          );
-          savedTokens.add(token);
-        } catch (e) { dbErrors.push(`${token}: ${e.message}`); }
-      }
-    }
-
     if (dbErrors.length) console.log(`❌ [HLC] DB errors (first 5):`, dbErrors.slice(0, 5));
-    await flushLtpWrites();
     broadcastBS(new Date());
     console.log(`✅ Day H/L/C: ${savedTokens.size}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
   } catch (e) { console.error('❌ Day H/L/C fetch failed:', e); }
@@ -2457,7 +2370,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.27 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.28 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2481,29 +2394,6 @@ function startMarginRefreshLoop() {
   }, 5 * 60 * 1000);
 }
 
-async function loadScreenerCacheFromDB() {
-  try {
-    const p = getScreenerPhase();
-    if (!p.date) return;
-    const activeTokens = STOCKS.map(s => String(s.token));
-
-    const { rows } = await db.query(
-      `SELECT token, open, high, low, close, volume,
-              q15_open, q15_high, q15_low, q15_close
-       FROM angel_15m_candle WHERE date=$1 AND token = ANY($2)`,
-      [p.date, activeTokens]
-    );
-    for (const r of rows) {
-      if (r.high > 0 && r.low > 0) {
-        setCachedCandle(r.token, p.date, [0, +r.open, +r.high, +r.low, +r.close, +r.volume]);
-      } else if (r.q15_high > 0 && r.q15_low > 0) {
-        setCachedCandle(r.token, p.date, [0, +r.q15_open, +r.q15_high, +r.q15_low, +r.q15_close, 0]);
-      }
-    }
-    console.log(`📦 Loaded ${rows.length} candles for ${p.date} (WS provides LTP)`);
-  } catch (e) { console.error('DB load failed:', e.message); }
-}
-
 registerAdminRoutes(app, {
   db, SECRET,
   auth, adminOnly, log,
@@ -2512,7 +2402,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.27`);
+  console.log(`✅ Server on port ${PORT} — v5.28`);
   initMarginService(db, getBrokerSession);
 
   try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }
@@ -2522,7 +2412,6 @@ app.listen(PORT, async () => {
   try { await loginBS(); console.log('✅ [BS] session'); } catch (e) { console.error('⚠️ [BS] login failed:', e.message); }
 
   await loadHolidaysFromDB();
-  await loadScreenerCacheFromDB();
   await loadPrevCloseFromDB();
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
@@ -2557,7 +2446,6 @@ app.listen(PORT, async () => {
   await loadPrevWSClosesFromDB();
   await loadTodayWSClosesFromDB();
 
-  // ✅ VWAP SEED FROM STORED MINUTES ON STARTUP
   const todayStrForVwap = getIST().toISOString().split('T')[0];
   vwapDate = todayStrForVwap;
   for (const [tk, closes] of wsTodayCloses) {
@@ -2577,7 +2465,6 @@ app.listen(PORT, async () => {
   console.log(`🧮 VWAP seeded from stored minutes: ${vwapPV.size} tokens`);
 
   seedRSIStateFromMemory();
-
   await loadCachedMargins('angelone');
 
   const todayDate = getIST().toISOString().split('T')[0];

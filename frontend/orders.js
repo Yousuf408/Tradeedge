@@ -1,5 +1,5 @@
 /* ============================================================
-   ORDERS.JS — v2.1 (Compact UI + Advanced Stats)
+   ORDERS.JS — v2.2 (Clean, Compact, Professional UI)
    ============================================================ */
 
 let ORDERS_DATA = { date: null, total: 0, positions: [] };
@@ -56,7 +56,7 @@ function ordTime(d) {
   try {
     const dt = new Date(d);
     const ist = new Date(dt.getTime() + 5.5 * 3600 * 1000);
-    return ist.toISOString().slice(11, 16); // HH:MM only
+    return ist.toISOString().slice(11, 16); // HH:MM
   } catch { return '—'; }
 }
 
@@ -70,7 +70,7 @@ function ordShortINR(v) {
   return '₹' + (+v).toLocaleString('en-IN', { maximumFractionDigits: 0 });
 }
 
-// Simplified State Column (Removed SL Text)
+// Clean State Column
 function ordState(p) {
   if (p.status === 'open') {
     if (p.stage >= 3) return '<span style="color:#6C5CE7;font-weight:700">🟢 OPEN (T2 Trail)</span>';
@@ -99,7 +99,6 @@ function renderOrders() {
   const wins = closed.filter(p => p.pnl > 0).length;
   const losses = closed.filter(p => p.pnl <= 0).length;
   
-  // Calculate New Stats
   const winRate = closed.length > 0 ? Math.round((wins / closed.length) * 100) : 0;
   const deployedCapital = open.reduce((sum, p) => sum + (p.entry * p.qty), 0);
   
@@ -108,7 +107,6 @@ function renderOrders() {
 
   /* ---- Compact Stats Row ---- */
   if (stats) {
-    // Reduced padding and font size for professional look
     const card = (label, value, color, subtext = '') => `
       <div style="background:var(--bg-secondary); border:1px solid var(--border-soft); border-radius:8px; padding:8px 12px; min-width:90px;">
         <div style="font-size:9px; font-weight:700; color:var(--text-muted); letter-spacing:0.5px;">${label}</div>

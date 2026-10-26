@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.29 (Stable Index Fix)
+   server.js — TradeAlgo Pro backend  |  v5.30 (RVOL + API Fix)
    ============================================================ */
 
 import express from 'express';
@@ -168,9 +168,10 @@ function countFilled(date) {
 }
 
 /* ============================================================
-   SECTION 4.1 — PREV CLOSE (BS-first only, no angel_15m_candle)
+   SECTION 4.1 — PREV CLOSE & RVOL
    ============================================================ */
 const prevCloseCache = new Map();
+const avgVolume5D = new Map(); // ✅ RVOL Cache
 
 async function loadPrevCloseFromDB() {
   try {
@@ -190,6 +191,21 @@ async function loadPrevCloseFromDB() {
     for (const r of rows) prevCloseCache.set(String(r.token), +r.prev_close);
     console.log(`💾 prevClose (BS source): ${rows.length} tokens`);
   } catch (e) { console.error('prevClose load failed:', e.message); }
+}
+
+// ✅ LOAD 5-DAY AVG VOLUME FOR RVOL
+async function loadAvgVolumeFromDB() {
+  try {
+    const { rows } = await db.query(`
+      SELECT token, AVG(volume) as avg_vol 
+      FROM strategy_bs_snapshot 
+      WHERE date < CURRENT_DATE AND date >= CURRENT_DATE - 10
+        AND strategy_id = 'momentum' AND volume > 0 
+      GROUP BY token
+    `);
+    for (const r of rows) avgVolume5D.set(String(r.token), +r.avg_vol);
+    console.log(`📊 Loaded 5-day Avg Volume for ${rows.length} tokens`);
+  } catch (e) { console.error('Avg Volume load failed:', e.message); }
 }
 
 /* ============================================================
@@ -354,7 +370,6 @@ async function loadBSCacheFromDB() {
     const p = getScreenerPhase();
     if (!p.date) return;
     
-    // ✅ ADDED INDEX TOKENS
     const activeTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
     const { rows } = await db.query(
       `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no, day_open, rsi, rsi_first
@@ -932,7 +947,7 @@ function broadcastBS(fetchedAt) {
       const lev = getLeverage('angelone', t);
       return [t, {
         buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
-        volume: v.volume, rank: v.rank,
+        volume: v.volume, rvol: v.rvol ?? null, rank: v.rank,
         dayOpen: v.dayOpen ?? null,
         rsi: v.rsi ?? null,
         leverage: lev ?? null,
@@ -1353,6 +1368,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
       buyQty: bs?.buyQty ?? null,
       sellQty: bs?.sellQty ?? null,
       bsVolume: bs?.volume ?? null,
+      rvol: bs?.rvol ?? null,
       rank: bs?.rank ?? null,
       dayOpen: bs?.dayOpen ?? null,
       rsi: bs?.rsi ?? null,
@@ -1506,7 +1522,8 @@ async function fetchAngelInterval(token, interval, daysBack) {
   if (!jwt) throw new Error('No Angel JWT');
   let out = await doRequest(jwt);
   if (out.authFail) {
-    console.log(`🔑 Historical auth fail (${out.msg}) — re-login + retry`);
+    console.log(`🔑 Historical auth fail (${out.msg}) — waiting 15s for cooldown...`);
+    await new Promise(r => setTimeout(r, 15000)); 
     await loginREST().catch(e => console.error('🔑 re-login failed:', e.message));
     jwt = getAnyAngelJwt();
     if (!jwt) throw new Error('No Angel JWT after re-login');
@@ -1648,7 +1665,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
   const summary = { ok: 0, failed: 0, skipped: 0, days_saved: 0, total: STOCKS.length };
   const errors = [];
 
-  const DELAY_MS = 900;
+  const DELAY_MS = 2500; // ✅ Increased to 2.5s to prevent API block
   const retryOnly = req.body?.all !== true && historicalFailed.size > 0;
   const queue = retryOnly
     ? STOCKS.filter(s => historicalFailed.has(String(s.token)))
@@ -1670,7 +1687,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
         }
         historicalFailed.delete(String(stock.token));
       } catch (e) {
-        await new Promise(r => setTimeout(r, 2000));
+        await new Promise(r => setTimeout(r, 5000)); // Longer wait on error
         try {
           const r2 = await backfillOneStock(stock, days);
           if (r2.days_saved > 0) { summary.ok++; summary.days_saved += r2.days_saved; }
@@ -1825,11 +1842,16 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
           if (closes14) rsi = computeRSIFromArray(closes14);
         }
 
+        const todayVol = r.volume || 0;
+        const histAvg = avgVolume5D.get(String(r.token)) || 0;
+        const rvol = histAvg > 0 ? +(todayVol / histAvg).toFixed(1) : 0;
+
         bsCache.set(String(r.token), {
           buyQty: r.buyQty,
           sellQty: r.sellQty,
           ltp: r.ltp,
-          volume: r.volume,
+          volume: todayVol,
+          rvol: rvol,
           dayOpen: r.dayOpen ?? null,
           rank: existing.rank ?? null,
           rsi,
@@ -2076,7 +2098,6 @@ async function runEntryScan(date) {
       const prevClose = prevCloseCache.get(token) || null;
       if (!dayOpen || !prevClose || prevClose <= 0) continue;
 
-      // Gap Filter (skip if gap > 3%)
       const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
       if (gapPct >= ENTRY_GAP_MAX_PCT) continue;
       if (Math.abs(gapPct) > 20) continue; 
@@ -2096,11 +2117,9 @@ async function runEntryScan(date) {
 
     if (!validStocks.length) return;
 
-    // --- STEP 1 & 2: Sort by Change % and Take Top 15 ---
     const sortedByChange = [...validStocks].sort((a, b) => b.changePct - a.changePct);
     const top15Stocks = sortedByChange.slice(0, 15);
 
-    // --- STEP 3: Check which of these Top 15 hits the 1% requirement ---
     const buyCands = [];
     for (const c of top15Stocks) {
       if (c.openGainPct >= ENTRY_OPEN_GAIN_PCT && c.openGainPct < ENTRY_MAX_GAIN_PCT) {
@@ -2108,7 +2127,6 @@ async function runEntryScan(date) {
       }
     }
 
-    // --- SELL Side Logic (Bottom 15) ---
     const sortedByChangeAsc = [...validStocks].sort((a, b) => a.changePct - b.changePct);
     const bottom15Stocks = sortedByChangeAsc.slice(0, 15);
     const sellCands = [];
@@ -2120,7 +2138,6 @@ async function runEntryScan(date) {
 
     const list = [...buyCands, ...sellCands];
     
-    // Safety: Filter out already triggered
     const newList = list.filter(c => !entryTriggered.has(c.token));
     if (!newList.length) return;
 
@@ -2369,7 +2386,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.29 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.30 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2401,7 +2418,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.29`);
+  console.log(`✅ Server on port ${PORT} — v5.30`);
   initMarginService(db, getBrokerSession);
 
   try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }
@@ -2412,6 +2429,7 @@ app.listen(PORT, async () => {
 
   await loadHolidaysFromDB();
   await loadPrevCloseFromDB();
+  await loadAvgVolumeFromDB(); // ✅ LOAD RVOL HERE
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();
@@ -2419,7 +2437,6 @@ app.listen(PORT, async () => {
   await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
   computeBuyersGroups();
 
-  // ✅ Fetch accurate prev close AND LTP for indices via Quote API on startup
   try {
     const quotes = await fetchQuotesForTokens(INDEX_TOKENS);
     if (quotes) {

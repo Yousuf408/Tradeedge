@@ -1,11 +1,10 @@
 /* ============================================================
-   autoTrader.js — v1.8 (Strict Entry Ranking + Single Side block)
+   autoTrader.js — v2.0 (Lock 1% Profit at 1.2% Trigger)
    ============================================================ */
 
-const BE_TRIGGER_PCT = Number(process.env.AT_BE_PCT ?? 0.7);
-const T1_PCT         = Number(process.env.AT_T1_PCT ?? 1.0);
-const T2_PCT         = Number(process.env.AT_T2_PCT ?? 1.5);
-const TRAIL_PCT      = Number(process.env.AT_TRAIL_PCT ?? 0.2);
+const LOCK_TRIGGER_PCT = Number(process.env.AT_LOCK_TRIGGER_PCT ?? 1.2);
+const LOCK_PROFIT_PCT  = Number(process.env.AT_LOCK_PROFIT_PCT ?? 1.0);
+const TRAIL_PCT        = Number(process.env.AT_TRAIL_PCT ?? 0.2);
 const MAX_ENTRIES_PER_USER = Number(process.env.MAX_ENTRIES || 10);
 
 let db = null;
@@ -35,7 +34,7 @@ export function initAutoTrader(deps) {
   getLtp = deps.getLtp || (() => null);
   getLev = deps.getLeverage || null;
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
-  console.log(`🤖 AutoTrader v1.8 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | rules: Strict Ranking`);
+  console.log(`🤖 AutoTrader v2.0 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | Trigger: ${LOCK_TRIGGER_PCT}% | Lock: ${LOCK_PROFIT_PCT}% | Trail: ${TRAIL_PCT}%`);
   startSquareOffWatch();
 }
 
@@ -74,54 +73,41 @@ export async function onEntryScan(cands, date, users) {
   for (const u of users) {
     const userMode = u.sideMode || 'MIX';
 
-    // Count current positions for this user to enforce limit
     let userEntryCount = 0;
     for (const p of positions.values()) {
       if (p.userId === u.userId) userEntryCount++;
     }
     if (userEntryCount >= MAX_ENTRIES_PER_USER) continue;
 
-    // NEW FIX: Filter and sort BUY and SELL independently so top gainers are always at the top
-    let buys = cands.filter(c => c.side === 'BUY').sort((a, b) => {
-       const valA = a.changePct !== undefined ? a.changePct : a.openGainPct;
-       const valB = b.changePct !== undefined ? b.changePct : b.openGainPct;
-       return valB - valA; // Highest positive change first
-    });
-
-    let sells = cands.filter(c => c.side === 'SELL').sort((a, b) => {
-       const valA = a.changePct !== undefined ? a.changePct : a.openGainPct;
-       const valB = b.changePct !== undefined ? b.changePct : b.openGainPct;
-       return valA - valB; // Most negative change first (biggest losers)
-    });
+    let userCands = cands.filter(c => userMode === 'MIX' || c.side === userMode);
 
     let selectedCands = [];
     
     if (userMode === 'MIX') {
+      const buys = userCands.filter(c => c.side === 'BUY');
+      const sells = userCands.filter(c => c.side === 'SELL');
       const half = Math.floor(MAX_ENTRIES_PER_USER / 2);
+
       let pickedBuys = buys.slice(0, half);
       let pickedSells = sells.slice(0, half);
 
-      // Fill missing slots from the other side
       if (pickedBuys.length < half) {
         pickedSells = sells.slice(0, MAX_ENTRIES_PER_USER - pickedBuys.length);
       } else if (pickedSells.length < half) {
         pickedBuys = buys.slice(0, MAX_ENTRIES_PER_USER - pickedSells.length);
       }
+
       selectedCands = [...pickedBuys, ...pickedSells];
-    } else if (userMode === 'BUY') {
-      selectedCands = buys.slice(0, MAX_ENTRIES_PER_USER);
-    } else if (userMode === 'SELL') {
-      selectedCands = sells.slice(0, MAX_ENTRIES_PER_USER);
+    } else {
+      selectedCands = userCands.slice(0, MAX_ENTRIES_PER_USER);
     }
 
-    // Apply remaining slots limit
     const availableSlots = MAX_ENTRIES_PER_USER - userEntryCount;
     selectedCands = selectedCands.slice(0, availableSlots);
 
     for (const c of selectedCands) {
       const token = String(c.token);
       
-      // Ensure same day same stock pe BUY/SELL dono block rahe
       let alreadyHasToken = false;
       for (const p of positions.values()) {
         if (p.userId === u.userId && p.token === token && p.status === 'open') {
@@ -148,15 +134,12 @@ export async function onEntryScan(cands, date, users) {
       const sl = dayOpen != null 
         ? +dayOpen.toFixed(2) 
         : (isShort ? +(ltp * 1.01).toFixed(2) : +(ltp * 0.99).toFixed(2));
-      
-      const t1 = isShort ? +(ltp * (1 - T1_PCT / 100)).toFixed(2) : +(ltp * (1 + T1_PCT / 100)).toFixed(2);
-      const t2 = isShort ? +(ltp * (1 - T2_PCT / 100)).toFixed(2) : +(ltp * (1 + T2_PCT / 100)).toFixed(2);
 
       const pos = {
         userId: u.userId, token, sym: c.sym || symByToken[token] || '?', qty,
         side: c.side,
         entry: +ltp.toFixed(2),
-        sl, t1, t2,
+        sl, 
         stage: 0, 
         peak: +ltp.toFixed(2),
         status: 'open', reason: null, exitPrice: null,
@@ -191,57 +174,49 @@ export function onTickPos(token, ltp) {
     let changed = false;
 
     if (pos.side === 'BUY') {
-      const beTrigger = pos.entry * (1 + BE_TRIGGER_PCT / 100);
-      if (pos.stage === 0 && ltp >= beTrigger) {
-        pos.stage = 1;
-        if (pos.entry > pos.sl) pos.sl = pos.entry;
+      // 1. Trigger hit (1.2%)
+      if (pos.stage === 0 && ltp >= pos.entry * (1 + LOCK_TRIGGER_PCT / 100)) {
+        pos.stage = 2; // Stage 2 = Locked profit
+        const lockedSL = +(pos.entry * (1 + LOCK_PROFIT_PCT / 100)).toFixed(2);
+        if (lockedSL > pos.sl) pos.sl = lockedSL; 
+        pos.peak = ltp;
         changed = true;
       }
-      if ((pos.stage === 0 || pos.stage === 1) && ltp >= pos.t1) {
-        pos.stage = 2;
-        if (pos.t1 > pos.sl) pos.sl = pos.t1;
-        if (ltp > pos.peak) pos.peak = ltp;
-        changed = true;
-      }
-      if (pos.stage === 2 && ltp >= pos.t2) {
-        pos.stage = 3;
-        changed = true;
-      }
+      
+      // 2. Trailing (If Stage >= 2)
       if (pos.stage >= 2) {
         if (ltp > pos.peak) pos.peak = ltp;
         const trail = +(pos.peak * (1 - TRAIL_PCT / 100)).toFixed(2);
         if (trail > pos.sl) { pos.sl = trail; changed = true; }
       }
 
+      // 3. Exit Check
       if (ltp <= pos.sl) {
-        exitPosition(pos, ltp, pos.stage >= 2 ? 'TRAIL_SL' : (pos.stage === 1 ? 'BE_SL' : 'SL'));
+        const reason = pos.stage >= 2 ? 'PROFIT_TRAIL' : 'SL';
+        exitPosition(pos, ltp, reason);
         continue;
       }
     } else {
-      const beTrigger = pos.entry * (1 - BE_TRIGGER_PCT / 100);
-      if (pos.stage === 0 && ltp <= beTrigger) {
-        pos.stage = 1;
-        if (pos.entry < pos.sl) pos.sl = pos.entry;
+      // 1. Trigger hit (1.2%)
+      if (pos.stage === 0 && ltp <= pos.entry * (1 - LOCK_TRIGGER_PCT / 100)) {
+        pos.stage = 2; 
+        const lockedSL = +(pos.entry * (1 - LOCK_PROFIT_PCT / 100)).toFixed(2);
+        if (lockedSL < pos.sl) pos.sl = lockedSL; 
+        pos.peak = ltp;
         changed = true;
       }
-      if ((pos.stage === 0 || pos.stage === 1) && ltp <= pos.t1) {
-        pos.stage = 2;
-        if (pos.t1 < pos.sl) pos.sl = pos.t1;
-        if (ltp < pos.peak) pos.peak = ltp;
-        changed = true;
-      }
-      if (pos.stage === 2 && ltp <= pos.t2) {
-        pos.stage = 3;
-        changed = true;
-      }
+      
+      // 2. Trailing (If Stage >= 2)
       if (pos.stage >= 2) {
         if (ltp < pos.peak) pos.peak = ltp;
         const trail = +(pos.peak * (1 + TRAIL_PCT / 100)).toFixed(2);
         if (trail < pos.sl) { pos.sl = trail; changed = true; }
       }
 
+      // 3. Exit Check
       if (ltp >= pos.sl) {
-        exitPosition(pos, ltp, pos.stage >= 2 ? 'TRAIL_SL' : (pos.stage === 1 ? 'BE_SL' : 'SL'));
+        const reason = pos.stage >= 2 ? 'PROFIT_TRAIL' : 'SL';
+        exitPosition(pos, ltp, reason);
         continue;
       }
     }
@@ -301,13 +276,13 @@ async function savePos(p, date) {
   if (!db) return;
   await db.query(
     `INSERT INTO auto_positions
-       (date, token, user_id, sym, qty, entry, sl, t1, t2, stage, peak, status, exit_price, exit_reason, entry_at, exit_at, updated_at, side)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW(),$17)
+       (date, token, user_id, sym, qty, entry, sl, stage, peak, status, exit_price, exit_reason, entry_at, exit_at, updated_at, side)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),$15)
      ON CONFLICT (date, token, user_id) DO UPDATE SET
        sl=EXCLUDED.sl, stage=EXCLUDED.stage, peak=EXCLUDED.peak,
        status=EXCLUDED.status, exit_price=EXCLUDED.exit_price,
        exit_reason=EXCLUDED.exit_reason, exit_at=EXCLUDED.exit_at, updated_at=NOW(), side=EXCLUDED.side`,
-    [date, p.token, p.userId, p.sym, p.qty, p.entry, p.sl, p.t1, p.t2, p.stage, p.peak,
+    [date, p.token, p.userId, p.sym, p.qty, p.entry, p.sl, p.stage, p.peak,
      p.status, p.exitPrice, p.reason, p.entryAt, p.exitAt, p.side || 'BUY']
   );
 }
@@ -324,7 +299,7 @@ export async function loadOpenPositions(date, userId) {
         userId: r.user_id || 'admin',
         token: String(r.token), sym: r.sym, qty: +r.qty,
         side: r.side || 'BUY',
-        entry: +r.entry, sl: +r.sl, t1: +r.t1, t2: +r.t2,
+        entry: +r.entry, sl: +r.sl,
         stage: +r.stage, peak: r.peak != null ? +r.peak : +r.entry,
         status: r.status, reason: r.exit_reason,
         exitPrice: r.exit_price != null ? +r.exit_price : null,

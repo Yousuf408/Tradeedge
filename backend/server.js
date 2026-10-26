@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.33 (Structural Breakout + High/Low Tracking)
+   server.js — TradeAlgo Pro backend  |  v5.34 (Background Fetch + Safe API)
    ============================================================ */
 
 import express from 'express';
@@ -168,12 +168,9 @@ function countFilled(date) {
 }
 
 /* ============================================================
-   SECTION 4.1 — PREV CLOSE & PDH/PDL CACHES
+   SECTION 4.1 — PREV CLOSE (BS-first)
    ============================================================ */
 const prevCloseCache = new Map();
-const prevHighCache = new Map();
-const prevLowCache = new Map();
-const avgVolume5D = new Map();
 
 async function loadPrevCloseFromDB() {
   try {
@@ -189,37 +186,10 @@ async function loadPrevCloseFromDB() {
        ORDER BY token, date DESC`,
       [activeTokens, latestDate]
     );
+
     for (const r of rows) prevCloseCache.set(String(r.token), +r.prev_close);
     console.log(`💾 prevClose (BS source): ${rows.length} tokens`);
-
-    const prevDate = getPreviousTradingDay(getIST());
-    const { rows: hlRows } = await db.query(
-      `SELECT token, day_high, day_low
-       FROM strategy_bs_snapshot
-       WHERE date = $1 AND token = ANY($2)`,
-      [prevDate, activeTokens]
-    );
-    for (const r of hlRows) {
-      if (r.day_high) prevHighCache.set(String(r.token), +r.day_high);
-      if (r.day_low) prevLowCache.set(String(r.token), +r.day_low);
-    }
-    console.log(`📈 Loaded PDH/PDL for ${hlRows.length} tokens (from ${prevDate})`);
-
-  } catch (e) { console.error('prevClose/HL load failed:', e.message); }
-}
-
-async function loadAvgVolumeFromDB() {
-  try {
-    const { rows } = await db.query(`
-      SELECT token, AVG(volume) as avg_vol 
-      FROM strategy_bs_snapshot 
-      WHERE date < CURRENT_DATE AND date >= CURRENT_DATE - 10
-        AND strategy_id = 'momentum' AND volume > 0 
-      GROUP BY token
-    `);
-    for (const r of rows) avgVolume5D.set(String(r.token), +r.avg_vol);
-    console.log(`📊 Loaded 5-day Avg Volume for ${rows.length} tokens`);
-  } catch (e) { console.error('Avg Volume load failed:', e.message); }
+  } catch (e) { console.error('prevClose load failed:', e.message); }
 }
 
 /* ============================================================
@@ -234,19 +204,12 @@ const RSI_SOURCE = process.env.RSI_SOURCE || 'ws';
 const wsPrevCloses = new Map();
 const wsTodayCloses = new Map();
 const wsTodayVols = new Map();
-const wsTodayHighs = new Map(); // ✅ NEW: Track minute highs
-const wsTodayLows = new Map();  // ✅ NEW: Track minute lows
-
-const currentMinHighs = new Map();
-const currentMinLows = new Map();
 
 const CHIP_TEST_MODE = String(process.env.CHIP_TEST_MODE || 'true') === 'true';
 const rsiState = new Map();
 
 const chipList = new Map();
 let chipDate = null;
-
-let latestBreadth = { adv: 0, dec: 0 };
 
 function computeRSI(prevCloses, currentClose) {
   if (!Array.isArray(prevCloses) || prevCloses.length < 13) return null;
@@ -523,8 +486,6 @@ async function loadTodayWSClosesFromDB() {
     );
     wsTodayCloses.clear();
     wsTodayVols.clear();
-    wsTodayHighs.clear(); // ✅ Clear Highs
-    wsTodayLows.clear();  // ✅ Clear Lows
     for (const r of rows) {
       if (Array.isArray(r.ws_1min_close) && r.ws_1min_close.length > 0) {
         wsTodayCloses.set(String(r.token), r.ws_1min_close.map(c => +c));
@@ -773,23 +734,12 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
       );
     }
     for (let i = 0; i < tokens.length; i++) {
-      const tk = tokens[i];
-      const arr = wsTodayCloses.get(tk) || [];
+      const arr = wsTodayCloses.get(tokens[i]) || [];
       arr.push(closes[i]);
-      wsTodayCloses.set(tk, arr);
-      
-      const va = wsTodayVols.get(tk) || [];
+      wsTodayCloses.set(tokens[i], arr);
+      const va = wsTodayVols.get(tokens[i]) || [];
       va.push(minVols[i]);
-      wsTodayVols.set(tk, va);
-
-      // ✅ Track Highs/Lows
-      const h = currentMinHighs.get(tk) ?? closes[i];
-      const l = currentMinLows.get(tk) ?? closes[i];
-      const arrH = wsTodayHighs.get(tk) || []; arrH.push(h); wsTodayHighs.set(tk, arrH);
-      const arrL = wsTodayLows.get(tk) || []; arrL.push(l); wsTodayLows.set(tk, arrL);
-      
-      currentMinHighs.delete(tk);
-      currentMinLows.delete(tk);
+      wsTodayVols.set(tokens[i], va);
     }
     if (RSI_SOURCE === 'ws') await updateRSIFromWS(date, prevKey);
 
@@ -905,6 +855,46 @@ setInterval(() => {
   }
 }, 10000);
 
+const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000);
+const ltpWriteQueue = new Map();
+let ltpWriteTimer = null;
+
+function queueLtpWrite(token, ltp, date) {
+  ltpWriteQueue.set(String(token), { ltp, date });
+  if (ltpWriteTimer) return;
+  ltpWriteTimer = setTimeout(flushLtpWrites, LTP_FLUSH_MS);
+}
+
+async function flushLtpWrites() {
+  ltpWriteTimer = null;
+  if (!ltpWriteQueue.size) return;
+  const entries = [...ltpWriteQueue.entries()];
+  ltpWriteQueue.clear();
+
+  const byDate = new Map();
+  for (const [token, { ltp, date }] of entries) {
+    if (!byDate.has(date)) byDate.set(date, []);
+    byDate.get(date).push([token, ltp]);
+  }
+  for (const [date, rows] of byDate) {
+    const tokens = rows.map(r => r[0]);
+    const prices = rows.map(r => r[1]);
+    try {
+      await db.query(
+        `UPDATE angel_15m_candle AS c
+         SET ltp = v.ltp, ltp_updated_at = NOW()
+         FROM (SELECT unnest($1::text[]) AS token, unnest($2::numeric[]) AS ltp) AS v
+         WHERE c.date = $3 AND c.token = v.token`,
+        [tokens, prices, date]
+      );
+      console.log(`💾 LTP flushed: ${rows.length} tokens`);
+    } catch (e) { console.error('LTP flush failed:', e.message); }
+  }
+}
+
+process.on('SIGTERM', async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
+process.on('SIGINT',  async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
+
 const sseClients = new Set();
 let ssePending = new Map();
 let sseFlushTimer = null;
@@ -991,13 +981,8 @@ function broadcastChip() {
 
 function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
-  
-  const tk = String(token);
-  // ✅ Update current minute Highs/Lows
-  if (!currentMinHighs.has(tk) || ltp > currentMinHighs.get(tk)) currentMinHighs.set(tk, ltp);
-  if (!currentMinLows.has(tk) || ltp < currentMinLows.get(tk)) currentMinLows.set(tk, ltp);
-
   if (extra && Number.isFinite(extra.volume) && extra.volume > 0) {
+    const tk = String(token);
     const today = getIST().toISOString().split('T')[0];
     if (vwapDate !== today) { vwapPV.clear(); vwapV.clear(); vwapDate = today; }
     const prevVol = lastWsVolume.get(tk);
@@ -1076,6 +1061,7 @@ function stopWebSocketIfNeeded() {
 
   stopWS();
   wsStarted = false;
+  flushLtpWrites().catch(() => {});
   console.log('🔌 WS stopped');
 }
 
@@ -1549,16 +1535,10 @@ async function fetchAngelInterval(token, interval, daysBack) {
   let jwt = getAnyAngelJwt();
   if (!jwt) throw new Error('No Angel JWT');
   let out = await doRequest(jwt);
+  
+  // ✅ NO RE-LOGIN LOOP HERE
   if (out.authFail) {
-    console.log(`🔑 Historical auth fail (${out.msg}) — attempting single re-login...`);
-    await new Promise(r => setTimeout(r, 3000)); 
-    await loginREST().catch(e => console.error('🔑 re-login failed:', e.message));
-    jwt = getAnyAngelJwt();
-    if (!jwt) throw new Error('No Angel JWT after re-login');
-    out = await doRequest(jwt);
-    if (out.authFail) {
-      throw new Error('HTTP 403 - Blocked. Stopping fetch.');
-    }
+    throw new Error(out.msg + ' (Auth fail)');
   }
   return out.data;
 }
@@ -1665,12 +1645,8 @@ async function backfillOneStock(stock, daysBack) {
   return { sym, days_saved: saved, dates };
 }
 
-app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
-  if (historicalRunning) {
-    return res.status(409).json({ error: 'Historical fetch already running' });
-  }
-  historicalRunning = true;
-
+// ✅ Background Process Function
+async function processHistoricalFetch(body) {
   let lockClient = null;
   try {
     lockClient = await db.connect();
@@ -1681,30 +1657,38 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
       lockClient.release();
       lockClient = null;
       historicalRunning = false;
-      return res.status(409).json({ error: 'Historical fetch already running on another instance' });
+      return;
     }
   } catch (e) {
     try { if (lockClient) { await lockClient.query('ROLLBACK'); lockClient.release(); } } catch {}
-    lockClient = null;
     historicalRunning = false;
-    return res.status(500).json({ error: 'lock failed: ' + e.message });
+    return;
   }
 
-  const days = Math.min(Math.max(+req.body?.days || HISTORICAL_DAYS_DEFAULT, 1), 15);
+  const days = Math.min(Math.max(+body?.days || HISTORICAL_DAYS_DEFAULT, 1), 15);
   const t0 = Date.now();
   const summary = { ok: 0, failed: 0, skipped: 0, days_saved: 0, total: STOCKS.length };
   const errors = [];
 
-  const DELAY_MS = 3000; 
-  const retryOnly = req.body?.all !== true && historicalFailed.size > 0;
+  const DELAY_MS = 5000; 
+  const retryOnly = body?.all !== true && historicalFailed.size > 0;
   const queue = retryOnly
     ? STOCKS.filter(s => historicalFailed.has(String(s.token)))
     : [...STOCKS];
   if (!retryOnly) historicalFailed.clear();
+  
   console.log(`📥 Historical start: ${queue.length} stocks (${retryOnly ? 'retry-failed only' : 'full run'})`);
   let processed = 0;
 
   try {
+    // ✅ FORCE LOGIN ONCE HERE
+    try { 
+      await loginREST(); 
+      console.log('✅ Fresh login successful before starting bulk fetch'); 
+    } catch(e) { 
+      console.log('❌ Initial login failed:', e.message); 
+    }
+
     while (queue.length) {
       const stock = queue.shift();
       try {
@@ -1717,7 +1701,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
         }
         historicalFailed.delete(String(stock.token));
       } catch (e) {
-        if (e.message.includes('403') || e.message.includes('Blocked')) {
+        if (e.message.includes('403') || e.message.includes('Auth fail')) {
           console.error('🛑 API BLOCKED. Stopping historical fetch to protect the account.');
           break; 
         }
@@ -1731,7 +1715,6 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
         } catch (e2) {
           summary.failed++;
           historicalFailed.add(String(stock.token));
-          if (summary.failed === 1) console.error('❌ First error:', stock.sym, e2.message);
           if (errors.length < 20) errors.push(`${stock.sym}: ${e2.message}`);
         }
       }
@@ -1748,30 +1731,40 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
     try {
       await loadPrevWSClosesFromDB();
       await loadTodayWSClosesFromDB();
-  {
-    const t0 = getIST().toISOString().split('T')[0];
-    vwapDate = t0;
-    for (const [tk, closes] of wsTodayCloses) {
-      const vols = wsTodayVols.get(tk) || [];
-      let pv = 0, vv = 0;
-      for (let i = 0; i < closes.length; i++) { const v = vols[i] || 0; pv += closes[i] * v; vv += v; }
-      if (vv > 0) { vwapPV.set(tk, pv); vwapV.set(tk, vv); lastWsAvg.set(tk, +(pv / vv).toFixed(2)); }
-    }
-    if (vwapPV.size) console.log(`🧮 VWAP seeded from stored minutes: ${vwapPV.size} tokens`);
-  }
-  await backfillRsiFirst(getIST().toISOString().split('T')[0]);
-  seedRSIStateFromMemory();
+      const t0 = getIST().toISOString().split('T')[0];
+      vwapDate = t0;
+      for (const [tk, closes] of wsTodayCloses) {
+        const vols = wsTodayVols.get(tk) || [];
+        let pv = 0, vv = 0;
+        for (let i = 0; i < closes.length; i++) { const v = vols[i] || 0; pv += closes[i] * v; vv += v; }
+        if (vv > 0) { vwapPV.set(tk, pv); vwapV.set(tk, vv); lastWsAvg.set(tk, +(pv / vv).toFixed(2)); }
+      }
+      await backfillRsiFirst(getIST().toISOString().split('T')[0]);
+      seedRSIStateFromMemory();
       console.log('🔄 WS caches reloaded after backfill');
     } catch (e) { console.error('Post-backfill reload failed:', e.message); }
 
-    res.json({ ok: true, elapsed_sec: elapsed, summary, errors });
   } catch (e) {
     console.error('Historical fetch error:', e);
-    res.status(500).json({ error: e.message });
   } finally {
     historicalRunning = false;
     try { if (lockClient) { await lockClient.query('ROLLBACK'); lockClient.release(); } } catch {}
   }
+}
+
+// ✅ ROUTE ONLY STARTS BACKGROUND PROCESS
+app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
+  if (historicalRunning) {
+    return res.status(409).json({ error: 'Historical fetch already running' });
+  }
+  historicalRunning = true;
+  
+  res.json({ ok: true, message: 'Historical fetch started in background. Check server logs for progress.' });
+
+  processHistoricalFetch(req.body).catch(e => {
+    console.error('🛑 Historical Background Error:', e.message);
+    historicalRunning = false;
+  });
 });
 
 /* ============================================================
@@ -1798,7 +1791,6 @@ async function fetchDayHLC() {
 
       const token = String(q.token);
       const close = q.ltp || q.close;
-      
       const sym = SYM_BY_TOKEN[token] || INDEX_SYMS[token] || '?';
 
       setCachedLTP(token, close);
@@ -2155,10 +2147,8 @@ async function runEntryScan(date) {
 
       // --- BUY LOGIC ---
       if (dayOpen > pdh && pdh > 0) {
-        // Gap up open
         if (openGainPct >= ENTRY_OPEN_GAIN_PCT) isBuy = true;
       } else if (pdh > 0) {
-        // Inside open (wait for close > PDH, then next candle high break)
         let breakoutIdx = -1;
         for (let i = 0; i < todayCloses.length; i++) {
           if (todayCloses[i] > pdh) {
@@ -2178,10 +2168,8 @@ async function runEntryScan(date) {
 
       // --- SELL LOGIC ---
       if (dayOpen < pdl && pdl > 0) {
-        // Gap down open
         if (openGainPct <= -ENTRY_OPEN_GAIN_PCT) isSell = true;
       } else if (pdl > 0) {
-        // Inside open (wait for close < PDL, then next candle low break)
         let breakoutIdx = -1;
         for (let i = 0; i < todayCloses.length; i++) {
           if (todayCloses[i] < pdl) {
@@ -2253,7 +2241,7 @@ function startEntryEngine() {
     const p = getScreenerPhase();
     if (p && p.date) runEntryScan(p.date);
   }, ENTRY_SCAN_MS);
-  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | Structural Breakout Logic`);
+  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | PDH/PDL Breakout Logic`);
 }
 
 async function loadChipListFromDB(date) {
@@ -2470,7 +2458,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.33 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.34 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2502,7 +2490,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.33`);
+  console.log(`✅ Server on port ${PORT} — v5.34 (Background Fetch + Safe API)`);
   initMarginService(db, getBrokerSession);
 
   try { 
@@ -2514,7 +2502,6 @@ app.listen(PORT, async () => {
 
   await loadHolidaysFromDB();
   await loadPrevCloseFromDB();
-  await loadAvgVolumeFromDB(); 
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();

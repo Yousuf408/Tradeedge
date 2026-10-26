@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.30 (RVOL + API Fix)
+   server.js — TradeAlgo Pro backend  |  v5.32 (Single Login + Loop Fix)
    ============================================================ */
 
 import express from 'express';
@@ -168,10 +168,12 @@ function countFilled(date) {
 }
 
 /* ============================================================
-   SECTION 4.1 — PREV CLOSE & RVOL
+   SECTION 4.1 — PREV CLOSE & PDH/PDL CACHES
    ============================================================ */
 const prevCloseCache = new Map();
-const avgVolume5D = new Map(); // ✅ RVOL Cache
+const prevHighCache = new Map();
+const prevLowCache = new Map();
+const avgVolume5D = new Map();
 
 async function loadPrevCloseFromDB() {
   try {
@@ -187,13 +189,25 @@ async function loadPrevCloseFromDB() {
        ORDER BY token, date DESC`,
       [activeTokens, latestDate]
     );
-
     for (const r of rows) prevCloseCache.set(String(r.token), +r.prev_close);
     console.log(`💾 prevClose (BS source): ${rows.length} tokens`);
-  } catch (e) { console.error('prevClose load failed:', e.message); }
+
+    const prevDate = getPreviousTradingDay(getIST());
+    const { rows: hlRows } = await db.query(
+      `SELECT token, day_high, day_low
+       FROM strategy_bs_snapshot
+       WHERE date = $1 AND token = ANY($2)`,
+      [prevDate, activeTokens]
+    );
+    for (const r of hlRows) {
+      if (r.day_high) prevHighCache.set(String(r.token), +r.day_high);
+      if (r.day_low) prevLowCache.set(String(r.token), +r.day_low);
+    }
+    console.log(`📈 Loaded PDH/PDL for ${hlRows.length} tokens (from ${prevDate})`);
+
+  } catch (e) { console.error('prevClose/HL load failed:', e.message); }
 }
 
-// ✅ LOAD 5-DAY AVG VOLUME FOR RVOL
 async function loadAvgVolumeFromDB() {
   try {
     const { rows } = await db.query(`
@@ -795,15 +809,9 @@ setInterval(() => {
    ============================================================ */
 function getBrokerSession(broker) {
   if (broker !== 'angelone') return null;
-
-  let jwt = null;
-  if (getSessionStatusREST()?.loggedIn)          jwt = getJwtREST?.();
-  if (!jwt && getSessionStatusQuote()?.loggedIn) jwt = getJwtQuote?.();
-  if (!jwt && getSessionStatusBS()?.loggedIn)    jwt = getJwtBS?.();
-  if (!jwt) jwt = process.env.ANGEL_JWT || null;
-
+  // ✅ SINGLE LOGIN: Only use REST token for everything
+  const jwt = getJwtREST();
   if (!jwt) return null;
-
   return {
     jwt,
     apiKey: process.env.ANGEL_API_KEY,
@@ -1474,9 +1482,8 @@ let historicalRunning = false;
 const historicalFailed = new Set();
 
 function getAnyAngelJwt() {
+  // ✅ SINGLE LOGIN: Only REST JWT
   if (getSessionStatusREST()?.loggedIn && getJwtREST?.())  return getJwtREST();
-  if (getSessionStatusQuote()?.loggedIn && getJwtQuote?.()) return getJwtQuote();
-  if (getSessionStatusBS()?.loggedIn && getJwtBS?.())       return getJwtBS();
   return process.env.ANGEL_JWT || null;
 }
 
@@ -1521,14 +1528,20 @@ async function fetchAngelInterval(token, interval, daysBack) {
   let jwt = getAnyAngelJwt();
   if (!jwt) throw new Error('No Angel JWT');
   let out = await doRequest(jwt);
+  
+  // ✅ MAX 2 ATTEMPTS FIX
   if (out.authFail) {
-    console.log(`🔑 Historical auth fail (${out.msg}) — waiting 15s for cooldown...`);
-    await new Promise(r => setTimeout(r, 15000)); 
+    console.log(`🔑 Historical auth fail (${out.msg}) — attempting single re-login...`);
+    await new Promise(r => setTimeout(r, 3000)); // 3 sec wait before re-login
+    
     await loginREST().catch(e => console.error('🔑 re-login failed:', e.message));
     jwt = getAnyAngelJwt();
     if (!jwt) throw new Error('No Angel JWT after re-login');
     out = await doRequest(jwt);
-    if (out.authFail) throw new Error(out.msg + ' (after re-login)');
+    
+    if (out.authFail) {
+      throw new Error('HTTP 403 - Blocked. Stopping fetch.'); // Throws and breaks the loop
+    }
   }
   return out.data;
 }
@@ -1665,7 +1678,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
   const summary = { ok: 0, failed: 0, skipped: 0, days_saved: 0, total: STOCKS.length };
   const errors = [];
 
-  const DELAY_MS = 2500; // ✅ Increased to 2.5s to prevent API block
+  const DELAY_MS = 3000; // ✅ Increased delay for safety
   const retryOnly = req.body?.all !== true && historicalFailed.size > 0;
   const queue = retryOnly
     ? STOCKS.filter(s => historicalFailed.has(String(s.token)))
@@ -1687,7 +1700,13 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
         }
         historicalFailed.delete(String(stock.token));
       } catch (e) {
-        await new Promise(r => setTimeout(r, 5000)); // Longer wait on error
+        // ✅ IF 403 BLOCK, STOP FETCHING IMMEDIATELY
+        if (e.message.includes('403') || e.message.includes('Blocked')) {
+          console.error('🛑 API BLOCKED. Stopping historical fetch to protect the account.');
+          break; // Exit the while loop
+        }
+        
+        await new Promise(r => setTimeout(r, 5000)); 
         try {
           const r2 = await backfillOneStock(stock, days);
           if (r2.days_saved > 0) { summary.ok++; summary.days_saved += r2.days_saved; }
@@ -2107,36 +2126,44 @@ async function runEntryScan(date) {
       
       const changePct = ((ltp - prevClose) / prevClose) * 100;
       const openGainPct = ((ltp - dayOpen) / dayOpen) * 100;
+
+      const pdh = prevHighCache.get(token) || 0;
+      const pdl = prevLowCache.get(token) || 0;
       
-      validStocks.push({
-        token, sym: st.sym, dayOpen: +dayOpen.toFixed(2),
-        gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), 
-        changePct: +changePct.toFixed(2)
-      });
+      const c1 = wsTodayCloses.get(token)?.[0] || 0;
+      const c2 = wsTodayCloses.get(token)?.[1] || 0;
+
+      // --- BUY LOGIC ---
+      const buyStructure = (dayOpen > pdh && pdh > 0) || (c1 > pdh && pdh > 0) || (c2 > pdh && pdh > 0);
+      const buyMomentum = openGainPct >= ENTRY_OPEN_GAIN_PCT;
+
+      if (buyStructure && buyMomentum) {
+        validStocks.push({
+          token, sym: st.sym, dayOpen: +dayOpen.toFixed(2),
+          gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), 
+          changePct: +changePct.toFixed(2), side: 'BUY'
+        });
+      }
+
+      // --- SELL LOGIC ---
+      const sellStructure = (dayOpen < pdl && pdl > 0) || (c1 < pdl && pdl > 0) || (c2 < pdl && pdl > 0);
+      const sellMomentum = openGainPct <= -ENTRY_OPEN_GAIN_PCT;
+
+      if (sellStructure && sellMomentum) {
+        validStocks.push({
+          token, sym: st.sym, dayOpen: +dayOpen.toFixed(2),
+          gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), 
+          changePct: +changePct.toFixed(2), side: 'SELL'
+        });
+      }
     }
 
     if (!validStocks.length) return;
 
-    const sortedByChange = [...validStocks].sort((a, b) => b.changePct - a.changePct);
-    const top15Stocks = sortedByChange.slice(0, 15);
-
-    const buyCands = [];
-    for (const c of top15Stocks) {
-      if (c.openGainPct >= ENTRY_OPEN_GAIN_PCT && c.openGainPct < ENTRY_MAX_GAIN_PCT) {
-        buyCands.push({ ...c, side: 'BUY' });
-      }
-    }
-
-    const sortedByChangeAsc = [...validStocks].sort((a, b) => a.changePct - b.changePct);
-    const bottom15Stocks = sortedByChangeAsc.slice(0, 15);
-    const sellCands = [];
-    for (const c of bottom15Stocks) {
-      if (c.openGainPct <= -ENTRY_OPEN_GAIN_PCT && c.openGainPct > -ENTRY_MAX_GAIN_PCT) {
-        sellCands.push({ ...c, side: 'SELL' });
-      }
-    }
-
-    const list = [...buyCands, ...sellCands];
+    const buyCands = validStocks.filter(c => c.side === 'BUY').sort((a, b) => b.openGainPct - a.openGainPct);
+    const sellCands = validStocks.filter(c => c.side === 'SELL').sort((a, b) => a.openGainPct - b.openGainPct);
+    
+    const list = [...buyCands.slice(0, 15), ...sellCands.slice(0, 15)];
     
     const newList = list.filter(c => !entryTriggered.has(c.token));
     if (!newList.length) return;
@@ -2148,9 +2175,9 @@ async function runEntryScan(date) {
     const mi = String(ist.getUTCMinutes()).padStart(2, '0');
     console.log(`🎯 Entry trigger ${hh}:${mi} — ${newList.length} CANDIDATES: ${newList.map(c => `${c.sym}(${c.side} ${c.openGainPct}%)`).join(', ')}`);
 
-    const { rows: dbUsers } = await db.query(`SELECT id, side_mode FROM users`);
+    const { rows: dbUsers } = await db.query(`SELECT id, username, side_mode FROM users`);
     const users = [...userCapital.entries()].map(([userId, capital]) => {
-      const dbU = dbUsers.find(u => u.id === userId);
+      const dbU = dbUsers.find(u => u.id === userId || u.username === userId);
       return { 
         userId, 
         capital, 
@@ -2169,7 +2196,7 @@ function startEntryEngine() {
     const p = getScreenerPhase();
     if (p && p.date) runEntryScan(p.date);
   }, ENTRY_SCAN_MS);
-  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | Strict Top 15 Logic`);
+  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | PDH/PDL Breakout Logic`);
 }
 
 async function loadChipListFromDB(date) {
@@ -2386,7 +2413,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.30 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.32 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2418,18 +2445,20 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.30`);
+  console.log(`✅ Server on port ${PORT} — v5.32`);
   initMarginService(db, getBrokerSession);
 
-  try { await loginREST(); console.log('✅ [REST] session'); } catch (e) { console.error('⚠️ [REST] login failed:', e.message); }
-  await new Promise(r => setTimeout(r, 4000));
-  try { await loginQuote(); console.log('✅ [Quote] session'); } catch (e) { console.error('⚠️ [Quote] login failed:', e.message); }
-  await new Promise(r => setTimeout(r, 4000));
-  try { await loginBS(); console.log('✅ [BS] session'); } catch (e) { console.error('⚠️ [BS] login failed:', e.message); }
+  // ✅ SINGLE LOGIN (Sirf REST se login)
+  try { 
+    await loginREST(); 
+    console.log('✅ [REST] Logged in via Single Session'); 
+  } catch (e) { 
+    console.error('⚠️ [REST] login failed:', e.message); 
+  }
 
   await loadHolidaysFromDB();
   await loadPrevCloseFromDB();
-  await loadAvgVolumeFromDB(); // ✅ LOAD RVOL HERE
+  await loadAvgVolumeFromDB(); 
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();

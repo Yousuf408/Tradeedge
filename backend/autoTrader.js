@@ -1,5 +1,5 @@
 /* ============================================================
-   autoTrader.js — v2.0 (Lock 1% Profit at 1.2% Trigger)
+   autoTrader.js — v2.1 (Dynamic MIX + 1.2% Profit Lock)
    ============================================================ */
 
 const LOCK_TRIGGER_PCT = Number(process.env.AT_LOCK_TRIGGER_PCT ?? 1.2);
@@ -34,7 +34,7 @@ export function initAutoTrader(deps) {
   getLtp = deps.getLtp || (() => null);
   getLev = deps.getLeverage || null;
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
-  console.log(`🤖 AutoTrader v2.0 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | Trigger: ${LOCK_TRIGGER_PCT}% | Lock: ${LOCK_PROFIT_PCT}% | Trail: ${TRAIL_PCT}%`);
+  console.log(`🤖 AutoTrader v2.1 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | Dynamic MIX Enabled`);
   startSquareOffWatch();
 }
 
@@ -79,28 +79,15 @@ export async function onEntryScan(cands, date, users) {
     }
     if (userEntryCount >= MAX_ENTRIES_PER_USER) continue;
 
+    // Filter by user preference (if they selected strict BUY or SELL)
     let userCands = cands.filter(c => userMode === 'MIX' || c.side === userMode);
 
-    let selectedCands = [];
-    
-    if (userMode === 'MIX') {
-      const buys = userCands.filter(c => c.side === 'BUY');
-      const sells = userCands.filter(c => c.side === 'SELL');
-      const half = Math.floor(MAX_ENTRIES_PER_USER / 2);
+    // ✅ DYNAMIC MIX LOGIC
+    // Sort all candidates (both Buy & Sell) by absolute momentum strength
+    // Highest OpenGainPct (whether + or -) gets priority.
+    userCands.sort((a, b) => Math.abs(b.openGainPct || 0) - Math.abs(a.openGainPct || 0));
 
-      let pickedBuys = buys.slice(0, half);
-      let pickedSells = sells.slice(0, half);
-
-      if (pickedBuys.length < half) {
-        pickedSells = sells.slice(0, MAX_ENTRIES_PER_USER - pickedBuys.length);
-      } else if (pickedSells.length < half) {
-        pickedBuys = buys.slice(0, MAX_ENTRIES_PER_USER - pickedSells.length);
-      }
-
-      selectedCands = [...pickedBuys, ...pickedSells];
-    } else {
-      selectedCands = userCands.slice(0, MAX_ENTRIES_PER_USER);
-    }
+    let selectedCands = userCands.slice(0, MAX_ENTRIES_PER_USER);
 
     const availableSlots = MAX_ENTRIES_PER_USER - userEntryCount;
     selectedCands = selectedCands.slice(0, availableSlots);
@@ -108,6 +95,7 @@ export async function onEntryScan(cands, date, users) {
     for (const c of selectedCands) {
       const token = String(c.token);
       
+      // Ensure same day same stock pe BUY/SELL dono block rahe
       let alreadyHasToken = false;
       for (const p of positions.values()) {
         if (p.userId === u.userId && p.token === token && p.status === 'open') {
@@ -321,5 +309,4 @@ export function getPositions(userId) {
   }
   return out;
 }
-
 export function getPositionDate() { return posDate; }

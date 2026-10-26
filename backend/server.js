@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.32 (Single Login + Loop Fix)
+   server.js — TradeAlgo Pro backend  |  v5.33 (Structural Breakout + High/Low Tracking)
    ============================================================ */
 
 import express from 'express';
@@ -234,6 +234,11 @@ const RSI_SOURCE = process.env.RSI_SOURCE || 'ws';
 const wsPrevCloses = new Map();
 const wsTodayCloses = new Map();
 const wsTodayVols = new Map();
+const wsTodayHighs = new Map(); // ✅ NEW: Track minute highs
+const wsTodayLows = new Map();  // ✅ NEW: Track minute lows
+
+const currentMinHighs = new Map();
+const currentMinLows = new Map();
 
 const CHIP_TEST_MODE = String(process.env.CHIP_TEST_MODE || 'true') === 'true';
 const rsiState = new Map();
@@ -518,6 +523,8 @@ async function loadTodayWSClosesFromDB() {
     );
     wsTodayCloses.clear();
     wsTodayVols.clear();
+    wsTodayHighs.clear(); // ✅ Clear Highs
+    wsTodayLows.clear();  // ✅ Clear Lows
     for (const r of rows) {
       if (Array.isArray(r.ws_1min_close) && r.ws_1min_close.length > 0) {
         wsTodayCloses.set(String(r.token), r.ws_1min_close.map(c => +c));
@@ -766,12 +773,23 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
       );
     }
     for (let i = 0; i < tokens.length; i++) {
-      const arr = wsTodayCloses.get(tokens[i]) || [];
+      const tk = tokens[i];
+      const arr = wsTodayCloses.get(tk) || [];
       arr.push(closes[i]);
-      wsTodayCloses.set(tokens[i], arr);
-      const va = wsTodayVols.get(tokens[i]) || [];
+      wsTodayCloses.set(tk, arr);
+      
+      const va = wsTodayVols.get(tk) || [];
       va.push(minVols[i]);
-      wsTodayVols.set(tokens[i], va);
+      wsTodayVols.set(tk, va);
+
+      // ✅ Track Highs/Lows
+      const h = currentMinHighs.get(tk) ?? closes[i];
+      const l = currentMinLows.get(tk) ?? closes[i];
+      const arrH = wsTodayHighs.get(tk) || []; arrH.push(h); wsTodayHighs.set(tk, arrH);
+      const arrL = wsTodayLows.get(tk) || []; arrL.push(l); wsTodayLows.set(tk, arrL);
+      
+      currentMinHighs.delete(tk);
+      currentMinLows.delete(tk);
     }
     if (RSI_SOURCE === 'ws') await updateRSIFromWS(date, prevKey);
 
@@ -809,7 +827,6 @@ setInterval(() => {
    ============================================================ */
 function getBrokerSession(broker) {
   if (broker !== 'angelone') return null;
-  // ✅ SINGLE LOGIN: Only use REST token for everything
   const jwt = getJwtREST();
   if (!jwt) return null;
   return {
@@ -974,8 +991,13 @@ function broadcastChip() {
 
 function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
+  
+  const tk = String(token);
+  // ✅ Update current minute Highs/Lows
+  if (!currentMinHighs.has(tk) || ltp > currentMinHighs.get(tk)) currentMinHighs.set(tk, ltp);
+  if (!currentMinLows.has(tk) || ltp < currentMinLows.get(tk)) currentMinLows.set(tk, ltp);
+
   if (extra && Number.isFinite(extra.volume) && extra.volume > 0) {
-    const tk = String(token);
     const today = getIST().toISOString().split('T')[0];
     if (vwapDate !== today) { vwapPV.clear(); vwapV.clear(); vwapDate = today; }
     const prevVol = lastWsVolume.get(tk);
@@ -1482,7 +1504,6 @@ let historicalRunning = false;
 const historicalFailed = new Set();
 
 function getAnyAngelJwt() {
-  // ✅ SINGLE LOGIN: Only REST JWT
   if (getSessionStatusREST()?.loggedIn && getJwtREST?.())  return getJwtREST();
   return process.env.ANGEL_JWT || null;
 }
@@ -1528,19 +1549,15 @@ async function fetchAngelInterval(token, interval, daysBack) {
   let jwt = getAnyAngelJwt();
   if (!jwt) throw new Error('No Angel JWT');
   let out = await doRequest(jwt);
-  
-  // ✅ MAX 2 ATTEMPTS FIX
   if (out.authFail) {
     console.log(`🔑 Historical auth fail (${out.msg}) — attempting single re-login...`);
-    await new Promise(r => setTimeout(r, 3000)); // 3 sec wait before re-login
-    
+    await new Promise(r => setTimeout(r, 3000)); 
     await loginREST().catch(e => console.error('🔑 re-login failed:', e.message));
     jwt = getAnyAngelJwt();
     if (!jwt) throw new Error('No Angel JWT after re-login');
     out = await doRequest(jwt);
-    
     if (out.authFail) {
-      throw new Error('HTTP 403 - Blocked. Stopping fetch.'); // Throws and breaks the loop
+      throw new Error('HTTP 403 - Blocked. Stopping fetch.');
     }
   }
   return out.data;
@@ -1678,7 +1695,7 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
   const summary = { ok: 0, failed: 0, skipped: 0, days_saved: 0, total: STOCKS.length };
   const errors = [];
 
-  const DELAY_MS = 3000; // ✅ Increased delay for safety
+  const DELAY_MS = 3000; 
   const retryOnly = req.body?.all !== true && historicalFailed.size > 0;
   const queue = retryOnly
     ? STOCKS.filter(s => historicalFailed.has(String(s.token)))
@@ -1700,10 +1717,9 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
         }
         historicalFailed.delete(String(stock.token));
       } catch (e) {
-        // ✅ IF 403 BLOCK, STOP FETCHING IMMEDIATELY
         if (e.message.includes('403') || e.message.includes('Blocked')) {
           console.error('🛑 API BLOCKED. Stopping historical fetch to protect the account.');
-          break; // Exit the while loop
+          break; 
         }
         
         await new Promise(r => setTimeout(r, 5000)); 
@@ -2130,26 +2146,67 @@ async function runEntryScan(date) {
       const pdh = prevHighCache.get(token) || 0;
       const pdl = prevLowCache.get(token) || 0;
       
-      const c1 = wsTodayCloses.get(token)?.[0] || 0;
-      const c2 = wsTodayCloses.get(token)?.[1] || 0;
+      const todayCloses = wsTodayCloses.get(token) || [];
+      const todayHighs = wsTodayHighs.get(token) || [];
+      const todayLows = wsTodayLows.get(token) || [];
+
+      let isBuy = false;
+      let isSell = false;
 
       // --- BUY LOGIC ---
-      const buyStructure = (dayOpen > pdh && pdh > 0) || (c1 > pdh && pdh > 0) || (c2 > pdh && pdh > 0);
-      const buyMomentum = openGainPct >= ENTRY_OPEN_GAIN_PCT;
+      if (dayOpen > pdh && pdh > 0) {
+        // Gap up open
+        if (openGainPct >= ENTRY_OPEN_GAIN_PCT) isBuy = true;
+      } else if (pdh > 0) {
+        // Inside open (wait for close > PDH, then next candle high break)
+        let breakoutIdx = -1;
+        for (let i = 0; i < todayCloses.length; i++) {
+          if (todayCloses[i] > pdh) {
+            breakoutIdx = i;
+            break;
+          }
+        }
+        if (breakoutIdx !== -1) {
+          const breakoutHigh = todayHighs[breakoutIdx] || todayCloses[breakoutIdx];
+          if (todayCloses.length > breakoutIdx) {
+            if (ltp > breakoutHigh && openGainPct >= ENTRY_OPEN_GAIN_PCT) {
+              isBuy = true;
+            }
+          }
+        }
+      }
 
-      if (buyStructure && buyMomentum) {
+      // --- SELL LOGIC ---
+      if (dayOpen < pdl && pdl > 0) {
+        // Gap down open
+        if (openGainPct <= -ENTRY_OPEN_GAIN_PCT) isSell = true;
+      } else if (pdl > 0) {
+        // Inside open (wait for close < PDL, then next candle low break)
+        let breakoutIdx = -1;
+        for (let i = 0; i < todayCloses.length; i++) {
+          if (todayCloses[i] < pdl) {
+            breakoutIdx = i;
+            break;
+          }
+        }
+        if (breakoutIdx !== -1) {
+          const breakoutLow = todayLows[breakoutIdx] || todayCloses[breakoutIdx];
+          if (todayCloses.length > breakoutIdx) {
+            if (ltp < breakoutLow && openGainPct <= -ENTRY_OPEN_GAIN_PCT) {
+              isSell = true;
+            }
+          }
+        }
+      }
+
+      if (isBuy) {
         validStocks.push({
           token, sym: st.sym, dayOpen: +dayOpen.toFixed(2),
           gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), 
           changePct: +changePct.toFixed(2), side: 'BUY'
         });
       }
-
-      // --- SELL LOGIC ---
-      const sellStructure = (dayOpen < pdl && pdl > 0) || (c1 < pdl && pdl > 0) || (c2 < pdl && pdl > 0);
-      const sellMomentum = openGainPct <= -ENTRY_OPEN_GAIN_PCT;
-
-      if (sellStructure && sellMomentum) {
+      if (isSell) {
         validStocks.push({
           token, sym: st.sym, dayOpen: +dayOpen.toFixed(2),
           gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), 
@@ -2196,7 +2253,7 @@ function startEntryEngine() {
     const p = getScreenerPhase();
     if (p && p.date) runEntryScan(p.date);
   }, ENTRY_SCAN_MS);
-  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | PDH/PDL Breakout Logic`);
+  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | Structural Breakout Logic`);
 }
 
 async function loadChipListFromDB(date) {
@@ -2413,7 +2470,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.32 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.33 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2445,10 +2502,9 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.32`);
+  console.log(`✅ Server on port ${PORT} — v5.33`);
   initMarginService(db, getBrokerSession);
 
-  // ✅ SINGLE LOGIN (Sirf REST se login)
   try { 
     await loginREST(); 
     console.log('✅ [REST] Logged in via Single Session'); 

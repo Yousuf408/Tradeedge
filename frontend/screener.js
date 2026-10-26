@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.8.1 (Market Ticker + Breadth + Fallback Fix)
+   SCREENER.JS  — v4.8.2 (RVOL UI + Columns Removed)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -105,12 +105,11 @@ function renderStrategyControls() {
 
   const btnStyle = 'style="padding:6px 10px;font-size:12px;white-space:nowrap"';
 
-  let strategyButtons = '';
-  strategyButtons = `
+  let strategyButtons = `
     <button id="fetchBSBtn" class="btn btn-primary" ${btnStyle} onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
-    <button id="fetchPreopenBtn" class="btn btn-outline" ${btnStyle} onclick="startPreopenFetch()">📡 Fetch Pre-Open</button>
     <button id="fetchHistoricalBtn" class="btn btn-outline" ${btnStyle} onclick="startHistoricalFetch()">📥 Fetch Historical</button>
     <button id="fetchEODBtn" class="btn btn-outline" ${btnStyle} onclick="startEODClosesFetch()">⚙️ Fetch EOD Closes</button>`;
+  // ✅ REMOVED: fetchPreopenBtn
 
   controls.innerHTML = `
     ${strategyButtons}
@@ -302,6 +301,7 @@ function getSortValue(stock, field) {
   }
   if (field === 'ltp') return SCREENER_LTP[stock.token] ?? -Infinity;
   if (field === 'rsi') return SCREENER_RSI[stock.token] ?? -Infinity;
+  if (field === 'rvol') return SCREENER_BS[stock.token]?.rvol ?? -Infinity;
   return 0;
 }
 
@@ -422,7 +422,7 @@ function renderTicker() {
   let html = '';
   
   for (const [token, data] of Object.entries(TICKER_DATA)) {
-    if (!data.ltp) continue; // LTP aana chahiye, warna skip
+    if (!data.ltp) continue;
 
     let pct = 0;
     let isPos = true;
@@ -431,7 +431,6 @@ function renderTicker() {
     let sign = '+';
     let showChange = false;
 
-    // Agar prev close mila hai toh % calculate karo
     if (data.prev > 0) {
       showChange = true;
       const diff = data.ltp - data.prev;
@@ -442,8 +441,8 @@ function renderTicker() {
       sign = isPos ? '+' : '';
     }
 
-       const finalClass = colorClass; 
-       const changeText = showChange ? `${arrow} ${sign}${pct.toFixed(2)}%` : '';
+    const finalClass = colorClass; 
+    const changeText = showChange ? `${arrow} ${sign}${pct.toFixed(2)}%` : '';
 
     html += `<div class="ticker-item">
       ${data.name}
@@ -458,7 +457,6 @@ function renderTicker() {
     </div>`;
   }
 
-  // Sirf ek baar render karo, html+html (duplicate) hata do
   el.innerHTML = html || `<div class="ticker-item">Waiting for market data...</div>`;
 }
 
@@ -603,41 +601,6 @@ async function startBSFetch() {
 }
 
 /* ============================================================
-   SECTION 5.4 — MANUAL PRE-OPEN FETCH
-   ============================================================ */
-async function startPreopenFetch() {
-  const btn = document.getElementById('fetchPreopenBtn');
-  if (!btn) return;
-  if (btn.disabled) return;
-
-  const ok = confirm('Fetch NSE pre-open prices for all stocks now?');
-  if (!ok) return;
-
-  btn.disabled = true;
-  btn.textContent = '⏳ Fetching pre-open...';
-
-  try {
-    const r = await fetch(API + '/api/admin/fetch-preopen', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
-    });
-    const d = await r.json();
-
-    if (!r.ok) {
-      showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
-    } else {
-      showToast('✅ Pre-Open Saved', `${d.matched} matched / ${d.nseTotal} NSE · ${d.unmatchedCount} unmatched`);
-      await loadLTP();
-    }
-  } catch (e) {
-    showToast('⚠️ Error', e.message);
-  }
-
-  btn.disabled = false;
-  btn.textContent = '📡 Fetch Pre-Open';
-}
-
-/* ============================================================
    SECTION 5.5 — MANUAL EOD CLOSES FETCH
    ============================================================ */
 async function startEODClosesFetch() {
@@ -740,7 +703,6 @@ async function loadLTP() {
   const baseList = SCREENER_ALL_STOCKS;
   const tokens = baseList.map(s => s.token);
   
-  // Add Index tokens
   for (const t of INDEX_TOKENS) {
       if (!tokens.includes(t)) tokens.push(t);
   }
@@ -768,17 +730,17 @@ async function loadLTP() {
         if (item.leverage != null) SCREENER_LEVERAGE[item.token] = item.leverage;
         if (item.marginPerShare != null) SCREENER_MARGIN_PS[item.token] = item.marginPerShare;
 
-        if (item.buyQty != null || item.sellQty != null || item.rank != null) {
+        if (item.buyQty != null || item.sellQty != null || item.rank != null || item.rvol != null) {
           const existing = SCREENER_BS[item.token] || {};
           SCREENER_BS[item.token] = {
             buyQty: item.buyQty ?? existing.buyQty,
             sellQty: item.sellQty ?? existing.sellQty,
             volume: item.bsVolume ?? existing.volume,
+            rvol: item.rvol ?? existing.rvol,
             rank: item.rank ?? existing.rank
           };
         }
 
-        // Update Ticker Initial Data
         if (INDEX_TOKENS.includes(item.token)) {
           TICKER_DATA[item.token].ltp = item.ltp || 0;
           TICKER_DATA[item.token].prev = item.prevClose || 0;
@@ -813,7 +775,6 @@ function startSSE() {
           }
         }
 
-        // Update Ticker Indices
         for (const token of INDEX_TOKENS) {
           if (msg.ticks[token] !== undefined) {
             TICKER_DATA[token].ltp = msg.ticks[token];
@@ -821,7 +782,6 @@ function startSSE() {
           }
         }
 
-        // Update Breadth
         if (msg.breadth) {
           TICKER_BREADTH = msg.breadth;
         }
@@ -832,7 +792,13 @@ function startSSE() {
       }
       else if (msg.type === 'bs' && msg.bs) {
         for (const [token, v] of Object.entries(msg.bs)) {
-          SCREENER_BS[token] = { buyQty: v.buyQty, sellQty: v.sellQty, volume: v.volume, rank: v.rank };
+          SCREENER_BS[token] = { 
+            buyQty: v.buyQty, 
+            sellQty: v.sellQty, 
+            volume: v.volume, 
+            rvol: v.rvol, 
+            rank: v.rank 
+          };
           if (v.preopenPrice != null) SCREENER_PREOPEN[token] = { price: v.preopenPrice };
           if (v.dayOpen != null) SCREENER_DAY_OPEN[token] = v.dayOpen;
           if (v.rsi != null) SCREENER_RSI[token] = v.rsi;
@@ -876,25 +842,25 @@ function renderScreenerTable() {
     const isOpenGainTab = SCREENER_MOMENTUM_FILTER === 'open_gain';
     const isSellTab = SCREENER_MOMENTUM_FILTER === 'sell_candidates';
     const showRankCol = isOpenGainTab || isSellTab;
-    const COLSPAN = showRankCol ? 14 : 13;
+    
+    // ✅ UPDATED COLSPAN (Removed Pre-Open, 20 EMA, Action)
+    const COLSPAN = showRankCol ? 11 : 10;
 
+    // ✅ REMOVED: PRE-OPEN, 20 EMA, ACTION Headers
     head.innerHTML = `<tr>
       ${showRankCol ? `<th class="th-sortable" style="width:46px" onclick="setSort('change')"
           title="${isSellTab ? 'Short rank — Change % (Lowest first)' : 'Top Performing rank — Change % (Highest first)'}">#${sortIndicator('change')}</th>` : ''}
       <th>Stock / Company</th>
       <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
           <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
-      <th>PRE-OPEN</th>
       <th>DAY OPEN</th>
       <th class="th-sortable" onclick="setSort('rsi')">RSI ${sortIndicator('rsi')}</th>
       <th>RSI 9:15 🔒</th>
-      <th>B/S Volume</th>
-      <th>Volume</th>
+      <th>B/S VOLUME</th>
+      <th class="th-sortable" onclick="setSort('rvol')">VOLUME ${sortIndicator('rvol')}</th>
       <th>VWAP</th>
-      <th>20 EMA</th>
       <th>MAXQTY</th>
       <th>LAST UPDATE</th>
-      <th>ACTION</th>
     </tr>`;
 
     let filtered = [...SCREENER_ALL_STOCKS];
@@ -933,10 +899,10 @@ function renderScreenerTable() {
             <span style="font-size:11px">Chips lock at 9:15 (top-10 rank · gap ≤3% · RSI ≥70)</span>`;
       } else if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
         emptyMsg = `🏆 Abhi koi stock DAY OPEN se <b>+${OPEN_GAIN_MIN_PCT.toFixed(2)}%</b> (change% positive, gap-up < ${OPEN_GAIN_MAX_GAP_PCT}%) nahi hai.<br>
-            <span style="font-size:11px">Live ticks pe har 2 second auto-refresh · DAY OPEN data pehle B/S fetch se aata hai</span>`;
+            <span style="font-size:11px">Live ticks pe har 2 second auto-refresh</span>`;
       } else if (SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
         emptyMsg = `📉 Abhi koi stock DAY OPEN se <b>${SELL_OPEN_GAIN_MAX_PCT.toFixed(2)}%</b> neeche (change% negative, gap-up < ${SELL_GAP_MAX_PCT}%) nahi hai.<br>
-            <span style="font-size:11px">Live ticks pe har 2 second auto-refresh · DAY OPEN data pehle B/S fetch se aata hai</span>`;
+            <span style="font-size:11px">Live ticks pe har 2 second auto-refresh</span>`;
       } else {
         emptyMsg = `Loading stocks...<br>Please wait a few seconds.`;
       }
@@ -951,7 +917,6 @@ function renderScreenerTable() {
     body.innerHTML = sorted.map(s => {
       const ltp = SCREENER_LTP[s.token];
       const bs = SCREENER_BS[s.token];
-      const preopen = SCREENER_PREOPEN[s.token];
       const dayOpen = SCREENER_DAY_OPEN[s.token];
 
       const maxQty = computeMaxQty(s.token, ltp);
@@ -966,10 +931,7 @@ function renderScreenerTable() {
         changeLine = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
       }
 
-      const preopenCell = preopen
-        ? `<span style="color:#F5A623;font-weight:700">₹${(+preopen.price).toFixed(2)}</span>`
-        : '<span style="color:var(--text-muted)">—</span>';
-
+      // ✅ REMOVED preopenCell logic
       const dayOpenCell = dayOpen
         ? `<span style="font-weight:700">₹${(+dayOpen).toFixed(2)}</span><span class="ogain-cell">${renderOpenGainSub(s.token)}</span>`
         : '<span style="color:var(--text-muted)">—</span><span class="ogain-cell"></span>';
@@ -979,6 +941,7 @@ function renderScreenerTable() {
 
       const rankNum = (isSellTab ? SELL_CANDIDATE_RANK : OPEN_GAIN_RANK)[String(s.token)];
 
+      // ✅ REMOVED PRE-OPEN, 20 EMA, ACTION <td> elements
       return `<tr class="${rowClass}" data-token="${s.token}">
         ${showRankCol ? `<td style="font-weight:800;color:${isSellTab ? 'var(--danger)' : '#6C5CE7'};font-size:12px;text-align:center">${rankNum ?? '—'}</td>` : ''}
         <td><span class="sym">${s.sym}</span><span class="tok">${s.token}</span></td>
@@ -986,17 +949,18 @@ function renderScreenerTable() {
           <span class="cell-primary ltp-cell">${ltp ? '₹' + (+ltp).toFixed(2) : '—'}</span>
           <span class="cell-sub change-cell">${changeLine}</span>
         </td>
-        <td style="white-space:nowrap">${preopenCell}</td>
         <td style="white-space:nowrap">${dayOpenCell}</td>
         <td class="rsi-cell" style="white-space:nowrap">${renderRSICell(s.token)}</td>
         <td style="white-space:nowrap;font-weight:700;color:#F5A623">${SCREENER_RSI_FIRST[s.token] != null ? (+SCREENER_RSI_FIRST[s.token]).toFixed(1) : '—'}</td>
         <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
-        <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">${bs?.volume ? formatQty(bs.volume) : '—'}</td>
+        <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">
+          ${bs?.volume ? formatQty(bs.volume) : '—'} 
+          ${bs?.rvol ? `<span style="color:${bs.rvol >= 2 ? 'var(--success)' : '#F5A623'}; font-size:10px; margin-left:4px">(${bs.rvol}x)</span>` : ''}
+        </td>
         <td class="vwap-cell" style="white-space:nowrap;font-weight:700;color:#6C5CE7">${SCREENER_VWAP[s.token] != null ? '₹' + (+SCREENER_VWAP[s.token]).toFixed(2) : '—'}</td>
-        <td style="white-space:nowrap"><span style="color:var(--text-muted)">—</span></td>
         <td class="maxqty-cell" style="font-weight:700;color:#6C5CE7">${maxQty}</td>
         <td style="color:var(--text-muted);font-size:11px;font-family:ui-monospace,monospace">${lastUpdate}</td>
-        <td class="cell-action"><span style="color:var(--text-muted);font-size:11px">—</span></td></tr>`;
+      </tr>`;
     }).join('');
 
     if (count) count.textContent = `${sorted.length} / ${SCREENER_ALL_STOCKS.length} shown`;
@@ -1019,6 +983,7 @@ function loadCachedData() { return Promise.resolve(); }
 function startFetch() { if (typeof showToast === 'function') showToast('⚠️ Removed', 'Advance ORB fetch hata diya gaya'); }
 function startQuoteFetch() { if (typeof showToast === 'function') showToast('⚠️ Removed', 'Advance ORB fetch hata diya gaya'); }
 function startDayHLCFetch() { if (typeof showToast === 'function') showToast('⚠️ Removed', 'Advance ORB fetch hata diya gaya'); }
+function startPreopenFetch() { } // ✅ Safety Stub
 function onStrategyChange() { }
 function setStageFilter() { }
 function renderChipBar() { }

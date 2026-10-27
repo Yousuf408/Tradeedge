@@ -661,7 +661,7 @@ async function startHistoricalFetch() {
     const r = await fetch(API + '/api/admin/fetch-historical', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
-      body: JSON.stringify({ days: 10 })
+      body: JSON.stringify({ days: 5 })
     });
     
     // ✅ Safe JSON parsing

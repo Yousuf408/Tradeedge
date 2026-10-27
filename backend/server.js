@@ -1,5 +1,19 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.40 (Exact Cumulative RVOL)
+   server.js — TradeAlgo Pro backend  |  v5.41 (Auto re-login + rate-limit-safe backfill)
+   ============================================================
+   CHANGES vs v5.40 (nothing else touched):
+   1. getAnyAngelJwt() → async; re-logins when the session dies; ANGEL_JWT env kept
+      only as an emergency spare (never the main path).
+   2. 401/403/429 + "too many requests" are now all treated as fatal → the backfill
+      queue STOPS instead of retrying into the rate-limit wall.
+   3. Pause between the 1-minute and 5-minute historical calls: 400ms → 1200ms.
+   4. Mid-run session guard: re-login if the session dies + scheduled re-login
+      every 100 stocks.
+   5. stopDepthWS() was called but never imported → now called safely via a
+      namespace import (no crash if Angel_Depth.js doesn't export it).
+   6. Advisory lock is now session-level and held for the whole run
+      (the old pg_try_advisory_xact_lock died with the ROLLBACK → protected nothing).
+   7. HISTORICAL_DAYS_DEFAULT: 10 → 5 (last 5 working days).
    ============================================================ */
 
 import express from 'express';
@@ -41,6 +55,8 @@ import {
 
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 import { startDepthWS, resubscribeDepth, getDepthStatus } from './brokers/angelone/Angel_Depth.js';
+// CHANGE 5: namespace import so we can call stopDepthWS() safely if it exists
+import * as AngelDepth from './brokers/angelone/Angel_Depth.js';
 
 import {
   initAutoTrader, onEntryScan, onTickPos, loadOpenPositions, getPositions, getPositionDate
@@ -1208,7 +1224,13 @@ function startDepthLive(feedToken) {
       if (!st.connected || silentMs > 90000) {
         depthRestarts++;
         console.warn(`🧿 Depth WATCHDOG: restart #${depthRestarts} (connected=${st.connected}, silent=${Math.round(silentMs / 1000)}s)`);
-        try { stopDepthWS(); } catch {}
+        // CHANGE 5: stopDepthWS was never imported in v5.40 → ReferenceError swallowed
+        // by the try{}. Now called safely; if Angel_Depth.js doesn't export it we
+        // log a warning and behave exactly like before (no crash).
+        try {
+          if (typeof AngelDepth.stopDepthWS === 'function') AngelDepth.stopDepthWS();
+          else console.warn('🧿 stopDepthWS not exported by Angel_Depth.js — skipping clean stop');
+        } catch {}
         startDepthLive(getLastFeedToken());
       }
     }, 60000);
@@ -1541,13 +1563,26 @@ app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
 /* ============================================================
    SECTION 7.2 — HISTORICAL BACKFILL
    ============================================================ */
-const HISTORICAL_DAYS_DEFAULT = 10;
+// CHANGE 7: last 5 working days instead of 10 (≈60% less data per request)
+const HISTORICAL_DAYS_DEFAULT = 5;
 const ANGEL_HISTORICAL_URL = 'https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData';
 let historicalRunning = false;
 const historicalFailed = new Set();
 
-function getAnyAngelJwt() {
-  if (getSessionStatusREST()?.loggedIn && getJwtREST?.())  return getJwtREST();
+// CHANGE 1: async + auto re-login. The live session token is always preferred;
+// a fresh login happens if the session died; ANGEL_JWT from .env stays ONLY as
+// an emergency spare (last resort), never the main path.
+async function getAnyAngelJwt() {
+  if (getSessionStatusREST()?.loggedIn && getJwtREST?.()) return getJwtREST();
+  try {
+    await loginREST();
+    if (getSessionStatusREST()?.loggedIn && getJwtREST?.()) {
+      console.log('🔑 getAnyAngelJwt: fresh login done (session had died)');
+      return getJwtREST();
+    }
+  } catch (e) {
+    console.error('🔑 getAnyAngelJwt: re-login failed:', e.message);
+  }
   return process.env.ANGEL_JWT || null;
 }
 
@@ -1579,17 +1614,18 @@ async function fetchAngelInterval(token, interval, daysBack) {
         todate: `${toDate} 15:30`
       })
     });
-    if (r.status === 401 || r.status === 403) return { authFail: true, msg: `HTTP ${r.status}` };
+    // CHANGE 2: 429 (rate limit) now counts as "Angel is refusing us" too
+    if (r.status === 401 || r.status === 403 || r.status === 429) return { authFail: true, msg: `HTTP ${r.status}` };
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
     if (!j.status || !Array.isArray(j.data)) {
-      if (/invalid token|session expired|token expired/i.test(j.message || '')) return { authFail: true, msg: j.message };
+      if (/invalid token|session expired|token expired|too many requests|rate limit/i.test(j.message || '')) return { authFail: true, msg: j.message };
       throw new Error(j.message || 'no data');
     }
     return { data: j.data };
   };
 
-  let jwt = getAnyAngelJwt();
+  let jwt = await getAnyAngelJwt();
   if (!jwt) throw new Error('No Angel JWT');
   let out = await doRequest(jwt);
   
@@ -1656,7 +1692,8 @@ async function backfillOneStock(stock, daysBack) {
   const raw1m = await fetchAngelInterval(token, 'ONE_MINUTE', daysBack);
   const by1m = fillMissingMinutes(groupCandlesByDate(raw1m), 1, 555, 929);
 
-  await new Promise(r => setTimeout(r, 400));
+  // CHANGE 3: breathing room between the 1m and 5m calls (was 400ms)
+  await new Promise(r => setTimeout(r, 1200));
   const raw5m = await fetchAngelInterval(token, 'FIVE_MINUTE', daysBack);
   const by5m = fillMissingMinutes(groupCandlesByDate(raw5m, 4), 5, 559, 929);
 
@@ -1701,21 +1738,26 @@ async function backfillOneStock(stock, daysBack) {
   return { sym, days_saved: saved, dates };
 }
 
+// CHANGE 2: single place that decides "Angel is refusing us → stop the queue"
+const isFatalApiError = e => /403|429|auth fail|too many requests|rate limit/i.test(e?.message || '');
+
 async function processHistoricalFetch(body) {
   let lockClient = null;
   try {
     lockClient = await db.connect();
-    await lockClient.query('BEGIN');
-    const lk = await lockClient.query('SELECT pg_try_advisory_xact_lock(7451) AS got');
+    // CHANGE 6: session-level lock held for the WHOLE run.
+    // (v5.40 used pg_try_advisory_xact_lock inside a BEGIN that was never
+    //  committed → the lock died with the final ROLLBACK → protected nothing.)
+    const lk = await lockClient.query('SELECT pg_try_advisory_lock(7451) AS got');
     if (!lk.rows[0]?.got) {
-      await lockClient.query('ROLLBACK');
       lockClient.release();
       lockClient = null;
       historicalRunning = false;
+      console.log('📥 Historical: another run already holds the lock — skipping');
       return;
     }
   } catch (e) {
-    try { if (lockClient) { await lockClient.query('ROLLBACK'); lockClient.release(); } } catch {}
+    try { if (lockClient) { lockClient.release(); } } catch {}
     historicalRunning = false;
     return;
   }
@@ -1732,7 +1774,7 @@ async function processHistoricalFetch(body) {
     : [...STOCKS];
   if (!retryOnly) historicalFailed.clear();
   
-  console.log(`📥 Historical start: ${queue.length} stocks (${retryOnly ? 'retry-failed only' : 'full run'})`);
+  console.log(`📥 Historical start: ${queue.length} stocks (${retryOnly ? 'retry-failed only' : 'full run'}) | window=${days} working days`);
   let processed = 0;
 
   try {
@@ -1745,6 +1787,22 @@ async function processHistoricalFetch(body) {
 
     while (queue.length) {
       const stock = queue.shift();
+
+      // CHANGE 4a: if the session died, bring it back BEFORE the next stock
+      if (!getSessionStatusREST()?.loggedIn) {
+        try {
+          await loginREST();
+          console.log('🔑 Session refreshed mid-run (token had died)');
+        } catch (e) { console.error('🔑 Mid-run re-login failed:', e.message); }
+      }
+      // CHANGE 4b: belt & braces — full re-login every 100 stocks
+      if (processed > 0 && processed % 100 === 0) {
+        try {
+          await loginREST();
+          console.log(`🔑 Scheduled re-login after ${processed} stocks`);
+        } catch (e) { console.error('🔑 Scheduled re-login failed:', e.message); }
+      }
+
       try {
         const r = await backfillOneStock(stock, days);
         if (r.days_saved > 0) {
@@ -1755,8 +1813,9 @@ async function processHistoricalFetch(body) {
         }
         historicalFailed.delete(String(stock.token));
       } catch (e) {
-        if (e.message.includes('403') || e.message.includes('Auth fail')) {
-          console.error('🛑 API BLOCKED. Stopping historical fetch to protect the account.');
+        // CHANGE 2: 403 / 429 / auth-fail all stop the queue now (429 was missed in v5.40)
+        if (isFatalApiError(e)) {
+          console.error('🛑 API BLOCKED / RATE-LIMITED. Stopping historical fetch to protect the account.');
           break; 
         }
         
@@ -1767,6 +1826,12 @@ async function processHistoricalFetch(body) {
           else summary.skipped++;
           historicalFailed.delete(String(stock.token));
         } catch (e2) {
+          // CHANGE 2: also stop if the RETRY hits a fatal error (v5.40 kept hammering)
+          if (isFatalApiError(e2)) {
+            console.error('🛑 API BLOCKED / RATE-LIMITED on retry. Stopping historical fetch.');
+            historicalFailed.add(String(stock.token));
+            break;
+          }
           summary.failed++;
           historicalFailed.add(String(stock.token));
           if (errors.length < 20) errors.push(`${stock.sym}: ${e2.message}`);
@@ -1802,7 +1867,13 @@ async function processHistoricalFetch(body) {
     console.error('Historical fetch error:', e);
   } finally {
     historicalRunning = false;
-    try { if (lockClient) { await lockClient.query('ROLLBACK'); lockClient.release(); } } catch {}
+    // CHANGE 6: release the session lock properly when the run ends
+    try {
+      if (lockClient) {
+        await lockClient.query('SELECT pg_advisory_unlock(7451)').catch(() => {});
+        lockClient.release();
+      }
+    } catch {}
   }
 }
 
@@ -2507,7 +2578,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.40 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.41 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2539,7 +2610,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.40`);
+  console.log(`✅ Server on port ${PORT} — v5.41`);
   initMarginService(db, getBrokerSession);
 
   try { 

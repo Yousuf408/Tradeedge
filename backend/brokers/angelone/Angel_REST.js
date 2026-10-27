@@ -1,7 +1,7 @@
 /* ============================================================
-   ANGEL_REST.js  —  v2.4
+   ANGEL_REST.js  —  v2.5  (SINGLE SESSION OWNER)
    ALL Angel One REST logic lives here:
-   - Login (auto, platform creds)
+   - Login (auto, platform creds)  ← THE ONLY MODULE THAT LOGS IN
    - 1-min candle aggregation (9:15-9:30 window)
    - Rate-limited parallel fetch (150/min, 5 workers)
    - LTP batch (50/call, market hours only)
@@ -9,12 +9,14 @@
    - Prev-day last N one-min closes (for RSI bootstrap)
    - Cache helpers (memory only — server.js persists to DB)
 
-   CHANGELOG v2.3 (2026-10-09):
-   - Added getPrevDayLastCloses(token, prevDate, count)
-   - Added getPrevDayLastClosesBatch(tokens, prevDate, count)
-
-   CHANGELOG v2.4 (2026-10-12):
-   - Added getJwt() export — exposes session JWT for broker margin service
+   CHANGELOG v2.5 (2026-10-27):
+   - This module is now the SINGLE session owner. Angel One allows only
+     ONE live session per client code — every extra login (Quote/BS modules
+     used to do their own) was killing this token → historical candles 403.
+   - post() now auto-detects dead session (AB1010 / "Invalid Session or
+     Session is Expired") → force re-login (single-flight) → retry same call.
+   - New exports for sibling modules: ensureLoggedIn, forceRelogin.
+   - Everything else identical to v2.4 (same exports, same behaviour).
    ============================================================ */
 
 import crypto from 'crypto';
@@ -97,7 +99,7 @@ function generateTOTP(secret) {
   const hmac = crypto.createHmac('sha1', key);
   hmac.update(buf);
   const hash = hmac.digest();
-  const off = hash[hash.length - 1] & 0x0f;
+  const off = hash[hash.length - 1] & 0xf;
   const code = ((hash[off] & 0x7f) << 24) |
                ((hash[off + 1] & 0xff) << 16) |
                ((hash[off + 2] & 0xff) << 8) |
@@ -106,7 +108,7 @@ function generateTOTP(secret) {
 }
 
 /* ============================================================
-   HTTP (text-first parsing, retries, cooldown)
+   HTTP (text-first parsing, retries, cooldown, AUTO RE-LOGIN)
    ============================================================ */
 function buildHeaders() {
   const h = {
@@ -125,8 +127,10 @@ function buildHeaders() {
 
 async function post(path, body, { retries = 2, baseBackoff = 1200 } = {}) {
   let lastErr = null;
+  let attempt = 0;
+  let relogins = 0;   // v2.5: max 2 auto re-logins per request
 
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  while (attempt <= retries) {
     if (attempt > 0) {
       const backoff = baseBackoff * Math.pow(2, attempt - 1) + Math.random() * 500;
       console.warn(`↻ retry ${attempt}/${retries} for ${path} in ${Math.round(backoff)}ms`);
@@ -142,10 +146,26 @@ async function post(path, body, { retries = 2, baseBackoff = 1200 } = {}) {
       text = await res.text();
     } catch (e) {
       lastErr = new Error(`Network error: ${e.message}`);
+      attempt++;
       continue;
     }
 
-    try { return JSON.parse(text); } catch {}
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+
+    if (json) {
+      // v2.5: dead session (AB1010 etc.) → single shared re-login → retry same call
+      const why = `${json.errorcode || ''} ${json.message || ''}`;
+      if (json.status === false &&
+          /AB1010|invalid session|session.{0,20}expired|please re-?login/i.test(why) &&
+          relogins < 2) {
+        relogins++;
+        console.warn(`🔑 [REST] session dead (${json.errorcode || json.message}) — force re-login, retry ${path}`);
+        await forceRelogin();
+        continue;   // fresh token, same attempt budget
+      }
+      return json;
+    }
 
     const snippet = text.slice(0, 120).replace(/\s+/g, ' ');
     console.error(`⛔ non-JSON response HTTP ${res.status} from ${path}: "${snippet}"`);
@@ -153,6 +173,7 @@ async function post(path, body, { retries = 2, baseBackoff = 1200 } = {}) {
     if (res.status === 403 || res.status === 429 || /access denied/i.test(text)) {
       startCooldown(COOLDOWN_ON_403_MS, `rate-limited on ${path}`);
       lastErr = new Error(`Rate limited (HTTP ${res.status}): ${snippet}`);
+      attempt++;
       continue;
     }
 
@@ -163,7 +184,7 @@ async function post(path, body, { retries = 2, baseBackoff = 1200 } = {}) {
 }
 
 /* ============================================================
-   LOGIN (single-flight)
+   LOGIN (single-flight) — THE ONLY LOGIN IN THE WHOLE APP
    ============================================================ */
 export async function loginPlatform() {
   if (!API_KEY || !CLIENT_ID || !PIN || !TOTP_SECRET) {
@@ -190,7 +211,7 @@ export async function loginPlatform() {
 
 let loginInFlight = null;
 
-function ensureLoggedIn() {
+export function ensureLoggedIn() {
   if (session.jwtToken && Date.now() < session.expiresAt - 60000) return Promise.resolve(true);
   if (!loginInFlight) {
     loginInFlight = loginPlatform()
@@ -199,6 +220,13 @@ function ensureLoggedIn() {
       .finally(() => { loginInFlight = null; });
   }
   return loginInFlight;
+}
+
+/* v2.5: drop the dead token and re-login (single-flight, shared by all modules) */
+export async function forceRelogin() {
+  session.jwtToken = null;
+  session.expiresAt = 0;
+  return ensureLoggedIn();
 }
 
 export function getSessionStatus() {

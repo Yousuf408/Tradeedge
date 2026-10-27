@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.35 (Quote API Fallback + Crash Fix)
+   server.js — TradeAlgo Pro backend  |  v5.36 (Strict PDH/PDL Crossover + Quote Fallback)
    ============================================================ */
 
 import express from 'express';
@@ -2182,45 +2182,41 @@ async function runEntryScan(date) {
       const todayHighs = wsTodayHighs.get(token) || [];
       const todayLows = wsTodayLows.get(token) || [];
 
-      const c1 = todayCloses[0] || 0;
-      if (c1 === 0) continue;
-      
-      const c1Gain = ((c1 - dayOpen) / dayOpen) * 100;
+      const c1High = todayHighs[0] || 0;
+      const c2High = todayHighs[1] || 0;
+      const c1Low = todayLows[0] || 0;
+      const c2Low = todayLows[1] || 0;
 
       let isBuy = false;
       let isSell = false;
 
-      if (c1Gain >= ENTRY_OPEN_GAIN_PCT) {
-        if (dayOpen > pdh && pdh > 0) {
+      // --- BUY LOGIC ---
+      // Condition 1: Opened >= PDH
+      if (dayOpen >= pdh && pdh > 0) {
+        if (openGainPct >= ENTRY_OPEN_GAIN_PCT) {
           isBuy = true;
-        } else if (pdh > 0) {
-          let breakoutIdx = -1;
-          for (let i = 0; i < todayCloses.length; i++) {
-            if (todayCloses[i] > pdh) { breakoutIdx = i; break; }
-          }
-          if (breakoutIdx !== -1) {
-            const breakoutHigh = todayHighs[breakoutIdx] || todayCloses[breakoutIdx];
-            if (todayCloses.length > breakoutIdx && ltp > breakoutHigh) {
-              isBuy = true;
-            }
-          }
+        }
+      } 
+      // Condition 2: Opened < PDH (Check 1st/2nd candle crossover)
+      else if (pdh > 0) {
+        const crossedPdh = (c1High >= pdh) || (c2High >= pdh) || (todayHighs.length === 0 && ltp >= pdh);
+        if (crossedPdh && openGainPct >= ENTRY_OPEN_GAIN_PCT) {
+          isBuy = true;
         }
       }
 
-      if (c1Gain <= -ENTRY_OPEN_GAIN_PCT) {
-        if (dayOpen < pdl && pdl > 0) {
+      // --- SELL LOGIC ---
+      // Condition 1: Opened <= PDL
+      if (dayOpen <= pdl && pdl > 0) {
+        if (openGainPct <= -ENTRY_OPEN_GAIN_PCT) {
           isSell = true;
-        } else if (pdl > 0) {
-          let breakoutIdx = -1;
-          for (let i = 0; i < todayCloses.length; i++) {
-            if (todayCloses[i] < pdl) { breakoutIdx = i; break; }
-          }
-          if (breakoutIdx !== -1) {
-            const breakoutLow = todayLows[breakoutIdx] || todayCloses[breakoutIdx];
-            if (todayCloses.length > breakoutIdx && ltp < breakoutLow) {
-              isSell = true;
-            }
-          }
+        }
+      } 
+      // Condition 2: Opened > PDL (Check 1st/2nd candle crossover)
+      else if (pdl > 0) {
+        const crossedPdl = (c1Low <= pdl) || (c2Low <= pdl) || (todayLows.length === 0 && ltp <= pdl);
+        if (crossedPdl && openGainPct <= -ENTRY_OPEN_GAIN_PCT) {
+          isSell = true;
         }
       }
 
@@ -2278,7 +2274,7 @@ function startEntryEngine() {
     const p = getScreenerPhase();
     if (p && p.date) runEntryScan(p.date);
   }, ENTRY_SCAN_MS);
-  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | PDH/PDL Breakout + 1st Candle 1% Logic`);
+  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | PDH/PDL Crossover Logic`);
 }
 
 async function loadChipListFromDB(date) {
@@ -2495,7 +2491,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.35 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.36 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2527,7 +2523,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.35`);
+  console.log(`✅ Server on port ${PORT} — v5.36`);
   initMarginService(db, getBrokerSession);
 
   try { 
@@ -2547,8 +2543,6 @@ app.listen(PORT, async () => {
   await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
   computeBuyersGroups();
 
-  // ✅ Quote API fallback is now inside loadPrevCloseFromDB
-  // But we still call it here for Indices specifically to ensure immediate LTP
   try {
     const quotes = await fetchQuotesForTokens(INDEX_TOKENS);
     if (quotes) {

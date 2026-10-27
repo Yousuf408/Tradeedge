@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.34 (Background Fetch + Safe API)
+   server.js — TradeAlgo Pro backend  |  v5.35 (Quote API Fallback + Crash Fix)
    ============================================================ */
 
 import express from 'express';
@@ -168,15 +168,19 @@ function countFilled(date) {
 }
 
 /* ============================================================
-   SECTION 4.1 — PREV CLOSE (BS-first)
+   SECTION 4.1 — PREV CLOSE & PDH/PDL CACHES
    ============================================================ */
 const prevCloseCache = new Map();
+const prevHighCache = new Map();
+const prevLowCache = new Map();
+const avgVolume5D = new Map();
 
 async function loadPrevCloseFromDB() {
   try {
     const activeTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
     const latestDate = getIST().toISOString().split('T')[0];
 
+    // 1. Fetch from DB
     const { rows } = await db.query(
       `SELECT DISTINCT ON (token) token, prev_close
        FROM strategy_bs_snapshot
@@ -189,7 +193,63 @@ async function loadPrevCloseFromDB() {
 
     for (const r of rows) prevCloseCache.set(String(r.token), +r.prev_close);
     console.log(`💾 prevClose (BS source): ${rows.length} tokens`);
-  } catch (e) { console.error('prevClose load failed:', e.message); }
+
+    // 2. ✅ FALLBACK: Fetch from Quote API if DB is empty (e.g., 9:15 AM)
+    if (rows.length < activeTokens.length) {
+      console.log(`🔄 Fetching prevClose via Quote API fallback for missing tokens...`);
+      const missingTokens = activeTokens.filter(t => !prevCloseCache.has(String(t)));
+      
+      try {
+        const quotes = await fetchQuotesForTokens(missingTokens);
+        if (quotes && quotes.length > 0) {
+          let count = 0;
+          for (const q of quotes) {
+            if (q.close && q.close > 0) {
+              prevCloseCache.set(String(q.token), +q.close);
+              count++;
+            }
+            if (q.ltp && q.ltp > 0) {
+              setCachedLTP(String(q.token), +q.ltp);
+            }
+          }
+          console.log(`✅ Quote API Fallback: Fetched data for ${count} tokens`);
+        }
+      } catch (apiErr) {
+        console.error('⚠️ Quote API fallback failed:', apiErr.message);
+      }
+    }
+
+    // 3. Load PDH/PDL
+    const prevDate = getPreviousTradingDay(getIST());
+    const { rows: hlRows } = await db.query(
+      `SELECT token, day_high, day_low
+       FROM strategy_bs_snapshot
+       WHERE date = $1 AND token = ANY($2)`,
+      [prevDate, activeTokens]
+    );
+    for (const r of hlRows) {
+      if (r.day_high) prevHighCache.set(String(r.token), +r.day_high);
+      if (r.day_low) prevLowCache.set(String(r.token), +r.day_low);
+    }
+    console.log(`📈 Loaded PDH/PDL for ${hlRows.length} tokens (from ${prevDate})`);
+
+  } catch (e) { 
+    console.error('prevClose load failed:', e.message); 
+  }
+}
+
+async function loadAvgVolumeFromDB() {
+  try {
+    const { rows } = await db.query(`
+      SELECT token, AVG(volume) as avg_vol 
+      FROM strategy_bs_snapshot 
+      WHERE date < CURRENT_DATE AND date >= CURRENT_DATE - 10
+        AND strategy_id = 'momentum' AND volume > 0 
+      GROUP BY token
+    `);
+    for (const r of rows) avgVolume5D.set(String(r.token), +r.avg_vol);
+    console.log(`📊 Loaded 5-day Avg Volume for ${rows.length} tokens`);
+  } catch (e) { console.error('Avg Volume load failed:', e.message); }
 }
 
 /* ============================================================
@@ -204,12 +264,19 @@ const RSI_SOURCE = process.env.RSI_SOURCE || 'ws';
 const wsPrevCloses = new Map();
 const wsTodayCloses = new Map();
 const wsTodayVols = new Map();
+const wsTodayHighs = new Map();
+const wsTodayLows = new Map();
+
+const currentMinHighs = new Map();
+const currentMinLows = new Map();
 
 const CHIP_TEST_MODE = String(process.env.CHIP_TEST_MODE || 'true') === 'true';
 const rsiState = new Map();
 
 const chipList = new Map();
 let chipDate = null;
+
+let latestBreadth = { adv: 0, dec: 0 }; // ✅ FIX: Declared globally
 
 function computeRSI(prevCloses, currentClose) {
   if (!Array.isArray(prevCloses) || prevCloses.length < 13) return null;
@@ -486,6 +553,8 @@ async function loadTodayWSClosesFromDB() {
     );
     wsTodayCloses.clear();
     wsTodayVols.clear();
+    wsTodayHighs.clear();
+    wsTodayLows.clear();
     for (const r of rows) {
       if (Array.isArray(r.ws_1min_close) && r.ws_1min_close.length > 0) {
         wsTodayCloses.set(String(r.token), r.ws_1min_close.map(c => +c));
@@ -734,12 +803,23 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
       );
     }
     for (let i = 0; i < tokens.length; i++) {
-      const arr = wsTodayCloses.get(tokens[i]) || [];
+      const tk = tokens[i];
+      const arr = wsTodayCloses.get(tk) || [];
       arr.push(closes[i]);
-      wsTodayCloses.set(tokens[i], arr);
-      const va = wsTodayVols.get(tokens[i]) || [];
+      wsTodayCloses.set(tk, arr);
+      
+      const va = wsTodayVols.get(tk) || [];
       va.push(minVols[i]);
-      wsTodayVols.set(tokens[i], va);
+      wsTodayVols.set(tk, va);
+
+      // ✅ Track Highs/Lows
+      const h = currentMinHighs.get(tk) ?? closes[i];
+      const l = currentMinLows.get(tk) ?? closes[i];
+      const arrH = wsTodayHighs.get(tk) || []; arrH.push(h); wsTodayHighs.set(tk, arrH);
+      const arrL = wsTodayLows.get(tk) || []; arrL.push(l); wsTodayLows.set(tk, arrL);
+      
+      currentMinHighs.delete(tk);
+      currentMinLows.delete(tk);
     }
     if (RSI_SOURCE === 'ws') await updateRSIFromWS(date, prevKey);
 
@@ -855,46 +935,6 @@ setInterval(() => {
   }
 }, 10000);
 
-const LTP_FLUSH_MS = Number(process.env.LTP_FLUSH_MS || 300000);
-const ltpWriteQueue = new Map();
-let ltpWriteTimer = null;
-
-function queueLtpWrite(token, ltp, date) {
-  ltpWriteQueue.set(String(token), { ltp, date });
-  if (ltpWriteTimer) return;
-  ltpWriteTimer = setTimeout(flushLtpWrites, LTP_FLUSH_MS);
-}
-
-async function flushLtpWrites() {
-  ltpWriteTimer = null;
-  if (!ltpWriteQueue.size) return;
-  const entries = [...ltpWriteQueue.entries()];
-  ltpWriteQueue.clear();
-
-  const byDate = new Map();
-  for (const [token, { ltp, date }] of entries) {
-    if (!byDate.has(date)) byDate.set(date, []);
-    byDate.get(date).push([token, ltp]);
-  }
-  for (const [date, rows] of byDate) {
-    const tokens = rows.map(r => r[0]);
-    const prices = rows.map(r => r[1]);
-    try {
-      await db.query(
-        `UPDATE angel_15m_candle AS c
-         SET ltp = v.ltp, ltp_updated_at = NOW()
-         FROM (SELECT unnest($1::text[]) AS token, unnest($2::numeric[]) AS ltp) AS v
-         WHERE c.date = $3 AND c.token = v.token`,
-        [tokens, prices, date]
-      );
-      console.log(`💾 LTP flushed: ${rows.length} tokens`);
-    } catch (e) { console.error('LTP flush failed:', e.message); }
-  }
-}
-
-process.on('SIGTERM', async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
-process.on('SIGINT',  async () => { try { await flushLtpWrites(); } catch {} process.exit(0); });
-
 const sseClients = new Set();
 let ssePending = new Map();
 let sseFlushTimer = null;
@@ -908,7 +948,7 @@ function sseSend(payload) {
 const ssePendingVwap = new Map();
 const ssePendingRsi = new Map();
 const ssePendingPrevClose = new Map();
-let latestBreadth = { adv: 0, dec: 0 };
+
 function updateMarketBreadth() {
   let adv = 0, dec = 0;
   for (const s of STOCKS) {
@@ -981,8 +1021,13 @@ function broadcastChip() {
 
 function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
+  
+  const tk = String(token);
+  // ✅ Update current minute Highs/Lows
+  if (!currentMinHighs.has(tk) || ltp > currentMinHighs.get(tk)) currentMinHighs.set(tk, ltp);
+  if (!currentMinLows.has(tk) || ltp < currentMinLows.get(tk)) currentMinLows.set(tk, ltp);
+
   if (extra && Number.isFinite(extra.volume) && extra.volume > 0) {
-    const tk = String(token);
     const today = getIST().toISOString().split('T')[0];
     if (vwapDate !== today) { vwapPV.clear(); vwapV.clear(); vwapDate = today; }
     const prevVol = lastWsVolume.get(tk);
@@ -1061,7 +1106,6 @@ function stopWebSocketIfNeeded() {
 
   stopWS();
   wsStarted = false;
-  flushLtpWrites().catch(() => {});
   console.log('🔌 WS stopped');
 }
 
@@ -1536,7 +1580,6 @@ async function fetchAngelInterval(token, interval, daysBack) {
   if (!jwt) throw new Error('No Angel JWT');
   let out = await doRequest(jwt);
   
-  // ✅ NO RE-LOGIN LOOP HERE
   if (out.authFail) {
     throw new Error(out.msg + ' (Auth fail)');
   }
@@ -1645,7 +1688,6 @@ async function backfillOneStock(stock, daysBack) {
   return { sym, days_saved: saved, dates };
 }
 
-// ✅ Background Process Function
 async function processHistoricalFetch(body) {
   let lockClient = null;
   try {
@@ -1681,7 +1723,6 @@ async function processHistoricalFetch(body) {
   let processed = 0;
 
   try {
-    // ✅ FORCE LOGIN ONCE HERE
     try { 
       await loginREST(); 
       console.log('✅ Fresh login successful before starting bulk fetch'); 
@@ -1752,7 +1793,6 @@ async function processHistoricalFetch(body) {
   }
 }
 
-// ✅ ROUTE ONLY STARTS BACKGROUND PROCESS
 app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
   if (historicalRunning) {
     return res.status(409).json({ error: 'Historical fetch already running' });
@@ -2142,45 +2182,42 @@ async function runEntryScan(date) {
       const todayHighs = wsTodayHighs.get(token) || [];
       const todayLows = wsTodayLows.get(token) || [];
 
+      const c1 = todayCloses[0] || 0;
+      if (c1 === 0) continue;
+      
+      const c1Gain = ((c1 - dayOpen) / dayOpen) * 100;
+
       let isBuy = false;
       let isSell = false;
 
-      // --- BUY LOGIC ---
-      if (dayOpen > pdh && pdh > 0) {
-        if (openGainPct >= ENTRY_OPEN_GAIN_PCT) isBuy = true;
-      } else if (pdh > 0) {
-        let breakoutIdx = -1;
-        for (let i = 0; i < todayCloses.length; i++) {
-          if (todayCloses[i] > pdh) {
-            breakoutIdx = i;
-            break;
+      if (c1Gain >= ENTRY_OPEN_GAIN_PCT) {
+        if (dayOpen > pdh && pdh > 0) {
+          isBuy = true;
+        } else if (pdh > 0) {
+          let breakoutIdx = -1;
+          for (let i = 0; i < todayCloses.length; i++) {
+            if (todayCloses[i] > pdh) { breakoutIdx = i; break; }
           }
-        }
-        if (breakoutIdx !== -1) {
-          const breakoutHigh = todayHighs[breakoutIdx] || todayCloses[breakoutIdx];
-          if (todayCloses.length > breakoutIdx) {
-            if (ltp > breakoutHigh && openGainPct >= ENTRY_OPEN_GAIN_PCT) {
+          if (breakoutIdx !== -1) {
+            const breakoutHigh = todayHighs[breakoutIdx] || todayCloses[breakoutIdx];
+            if (todayCloses.length > breakoutIdx && ltp > breakoutHigh) {
               isBuy = true;
             }
           }
         }
       }
 
-      // --- SELL LOGIC ---
-      if (dayOpen < pdl && pdl > 0) {
-        if (openGainPct <= -ENTRY_OPEN_GAIN_PCT) isSell = true;
-      } else if (pdl > 0) {
-        let breakoutIdx = -1;
-        for (let i = 0; i < todayCloses.length; i++) {
-          if (todayCloses[i] < pdl) {
-            breakoutIdx = i;
-            break;
+      if (c1Gain <= -ENTRY_OPEN_GAIN_PCT) {
+        if (dayOpen < pdl && pdl > 0) {
+          isSell = true;
+        } else if (pdl > 0) {
+          let breakoutIdx = -1;
+          for (let i = 0; i < todayCloses.length; i++) {
+            if (todayCloses[i] < pdl) { breakoutIdx = i; break; }
           }
-        }
-        if (breakoutIdx !== -1) {
-          const breakoutLow = todayLows[breakoutIdx] || todayCloses[breakoutIdx];
-          if (todayCloses.length > breakoutIdx) {
-            if (ltp < breakoutLow && openGainPct <= -ENTRY_OPEN_GAIN_PCT) {
+          if (breakoutIdx !== -1) {
+            const breakoutLow = todayLows[breakoutIdx] || todayCloses[breakoutIdx];
+            if (todayCloses.length > breakoutIdx && ltp < breakoutLow) {
               isSell = true;
             }
           }
@@ -2241,7 +2278,7 @@ function startEntryEngine() {
     const p = getScreenerPhase();
     if (p && p.date) runEntryScan(p.date);
   }, ENTRY_SCAN_MS);
-  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | PDH/PDL Breakout Logic`);
+  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | PDH/PDL Breakout + 1st Candle 1% Logic`);
 }
 
 async function loadChipListFromDB(date) {
@@ -2458,7 +2495,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.34 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.35 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2490,7 +2527,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.34 (Background Fetch + Safe API)`);
+  console.log(`✅ Server on port ${PORT} — v5.35`);
   initMarginService(db, getBrokerSession);
 
   try { 
@@ -2502,6 +2539,7 @@ app.listen(PORT, async () => {
 
   await loadHolidaysFromDB();
   await loadPrevCloseFromDB();
+  await loadAvgVolumeFromDB(); 
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();
@@ -2509,6 +2547,8 @@ app.listen(PORT, async () => {
   await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
   computeBuyersGroups();
 
+  // ✅ Quote API fallback is now inside loadPrevCloseFromDB
+  // But we still call it here for Indices specifically to ensure immediate LTP
   try {
     const quotes = await fetchQuotesForTokens(INDEX_TOKENS);
     if (quotes) {

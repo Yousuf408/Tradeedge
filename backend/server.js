@@ -908,7 +908,7 @@ function sseSend(payload) {
 const ssePendingVwap = new Map();
 const ssePendingRsi = new Map();
 const ssePendingPrevClose = new Map();
-
+let latestBreadth = { adv: 0, dec: 0 };
 function updateMarketBreadth() {
   let adv = 0, dec = 0;
   for (const s of STOCKS) {

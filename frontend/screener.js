@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.8.2 (RVOL UI + Columns Removed)
+   SCREENER.JS  — v4.8.2 (RVOL UI + Columns Removed + Background Fetch Fix)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -638,7 +638,7 @@ async function startEODClosesFetch() {
 }
 
 /* ============================================================
-   SECTION 5.6 — FETCH HISTORICAL
+   SECTION 5.6 — FETCH HISTORICAL (Background Process)
    ============================================================ */
 async function startHistoricalFetch() {
   const btn = document.getElementById('fetchHistoricalBtn');
@@ -647,18 +647,15 @@ async function startHistoricalFetch() {
 
   const ok = confirm(
     '📥 Fetch Historical (Angel REST)\n\n' +
-    'Ye last 10 working days ka 1-min + 5-min candle Angel REST se fetch karega ' +
-    '(dono intervals alag-alag API call — 776 calls, rate-limit safe) ' +
-    'aur ws_1min_close / ws_5min_close columns overwrite karega.\n\n' +
-    'Saare 388 stocks — approx 8-9 minutes (400ms+900ms gaps).\n\n' +
+    'Ye background mein chalega (approx 20-25 minutes) taaki server timeout na ho.\n' +
+    'Aap progress check karne ke liye apna Node.js terminal (server console) dekhein.\n\n' +
     'Continue?'
   );
   if (!ok) return;
 
   HISTORICAL_FETCHING = true;
   btn.disabled = true;
-  btn.textContent = '⏳ Historical fetch... (~8-9 min)';
-  showToast('📥 Historical Fetch', 'Starting Angel REST backfill...');
+  btn.textContent = '⏳ Historical fetch... (Background)';
 
   try {
     const r = await fetch(API + '/api/admin/fetch-historical', {
@@ -666,26 +663,26 @@ async function startHistoricalFetch() {
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
       body: JSON.stringify({ days: 10 })
     });
-    const d = await r.json();
+    
+    // ✅ Safe JSON parsing
+    let d = {};
+    try { d = await r.json(); } catch(e) { d = { error: 'Server timeout or invalid response' }; }
 
     if (!r.ok) {
       showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
     } else {
-      const s = d.summary || {};
-      showToast(
-        '✅ Historical Saved',
-        `${s.ok || 0} ok · ${s.skipped || 0} skipped · ${s.failed || 0} failed · ` +
-        `${s.days_saved || 0} days · ${d.elapsed_sec || 0}s`
-      );
-      await loadLTP();
+      showToast('✅ Fetch Started', 'Background process running. Check Node.js terminal.');
     }
   } catch (e) {
-    showToast('⚠️ Error', e.message);
+    showToast('⚠️ Network Error', 'Server is not reachable.');
   }
 
-  HISTORICAL_FETCHING = false;
-  btn.disabled = false;
-  btn.textContent = '📥 Fetch Historical';
+  // Button ko 15 sec baad wapas enable karein
+  setTimeout(() => {
+    HISTORICAL_FETCHING = false;
+    btn.disabled = false;
+    btn.textContent = '📥 Fetch Historical';
+  }, 15000); 
 }
 
 function updateProgress(done, total) {

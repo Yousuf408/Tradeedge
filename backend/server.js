@@ -1,6 +1,15 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.41 (Auto re-login + rate-limit-safe backfill)
+   server.js — TradeAlgo Pro backend  |  v5.42 (Single session + wait-and-resume backfill)
    ============================================================
+   CHANGES vs v5.41 (nothing else touched):
+   8. Angel_REST is now the ONLY login in the app (Quote/BS borrow its token).
+      server.js imports forceRelogin for the backfill's session recovery.
+   9. Historical backfill now CLASSIFIES refusals:
+      - AB1010/session dead → force re-login once → retry once → else stop.
+      - AB1021/429/403 rate  → wait 60s → ONE retry (2nd & last attempt) →
+        still limited = STOP the run immediately (leftover stocks resume on
+        the next manual run). Max 2 attempts per stock, never a retry loop.
+   10. Every refusal now logs Angel's exact message + error code.
    CHANGES vs v5.40 (nothing else touched):
    1. getAnyAngelJwt() → async; re-logins when the session dies; ANGEL_JWT env kept
       only as an emergency spare (never the main path).
@@ -35,7 +44,8 @@ import {
   getCachedLTP,
   getSessionStatus as getSessionStatusREST,
   getFeedToken as getFeedTokenREST,
-  getJwt as getJwtREST
+  getJwt as getJwtREST,
+  forceRelogin as forceReloginREST
 } from './brokers/angelone/Angel_REST.js';
 
 import {
@@ -1614,8 +1624,15 @@ async function fetchAngelInterval(token, interval, daysBack) {
         todate: `${toDate} 15:30`
       })
     });
-    // CHANGE 2: 429 (rate limit) now counts as "Angel is refusing us" too
-    if (r.status === 401 || r.status === 403 || r.status === 429) return { authFail: true, msg: `HTTP ${r.status}` };
+    // v5.42: 401/403/429 = refusal; capture Angel's exact code+message for logs & classification
+    if (r.status === 401 || r.status === 403 || r.status === 429) {
+      let m = `HTTP ${r.status}`;
+      try {
+        const j = await r.json();
+        if (j && (j.message || j.errorcode)) m += ` [${j.errorcode || '-'}] ${j.message || ''}`.trim();
+      } catch {}
+      return { authFail: true, msg: m };
+    }
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
     if (!j.status || !Array.isArray(j.data)) {
@@ -1738,8 +1755,10 @@ async function backfillOneStock(stock, daysBack) {
   return { sym, days_saved: saved, dates };
 }
 
-// CHANGE 2: single place that decides "Angel is refusing us → stop the queue"
-const isFatalApiError = e => /403|429|auth fail|too many requests|rate limit/i.test(e?.message || '');
+// v5.42: classify Angel's refusals (messages now carry the exact AB code)
+const sleepMs = ms => new Promise(r => setTimeout(r, ms));
+const isSessionError = e => /401|ab1010|invalid session|session.{0,20}expired|please re-?login/i.test(e?.message || '');
+const isRateError = e => /429|ab1021|too many requests|rate limit/i.test(e?.message || '');
 
 async function processHistoricalFetch(body) {
   let lockClient = null;
@@ -1813,28 +1832,51 @@ async function processHistoricalFetch(body) {
         }
         historicalFailed.delete(String(stock.token));
       } catch (e) {
-        // CHANGE 2: 403 / 429 / auth-fail all stop the queue now (429 was missed in v5.40)
-        if (isFatalApiError(e)) {
-          console.error('🛑 API BLOCKED / RATE-LIMITED. Stopping historical fetch to protect the account.');
-          break; 
-        }
-        
-        await new Promise(r => setTimeout(r, 5000)); 
-        try {
-          const r2 = await backfillOneStock(stock, days);
-          if (r2.days_saved > 0) { summary.ok++; summary.days_saved += r2.days_saved; }
-          else summary.skipped++;
-          historicalFailed.delete(String(stock.token));
-        } catch (e2) {
-          // CHANGE 2: also stop if the RETRY hits a fatal error (v5.40 kept hammering)
-          if (isFatalApiError(e2)) {
-            console.error('🛑 API BLOCKED / RATE-LIMITED on retry. Stopping historical fetch.');
+        // v5.42 BRANCH 1 — SESSION dead: force re-login once, retry once, else stop
+        if (isSessionError(e)) {
+          console.error(`🔑 Session error on ${stock.sym}: ${e.message} — forcing shared re-login`);
+          try { await forceReloginREST(); } catch (le) { console.error('🔑 Re-login failed:', le.message); }
+          try {
+            const r2 = await backfillOneStock(stock, days);
+            if (r2.days_saved > 0) { summary.ok++; summary.days_saved += r2.days_saved; }
+            else summary.skipped++;
+            historicalFailed.delete(String(stock.token));
+          } catch (e2) {
+            console.error(`🛑 Session still dead after re-login (${e2.message}). Stopping historical fetch.`);
             historicalFailed.add(String(stock.token));
             break;
           }
-          summary.failed++;
-          historicalFailed.add(String(stock.token));
-          if (errors.length < 20) errors.push(`${stock.sym}: ${e2.message}`);
+        }
+        // v5.42 BRANCH 2 — RATE limit (AB1021/429/plain 403):
+        // wait 60s → ONE retry (2nd & last attempt) → still limited = STOP RUN
+        // (protects the API key; leftover stocks resume on the next manual run)
+        else if (isRateError(e) || /403/.test(e?.message || '')) {
+          console.warn(`⛔ Rate-limit on ${stock.sym}: ${e.message} — waiting 60s, then 1 retry (2nd & last attempt)`);
+          await sleepMs(60000);
+          try {
+            const r2 = await backfillOneStock(stock, days);
+            if (r2.days_saved > 0) { summary.ok++; summary.days_saved += r2.days_saved; }
+            else summary.skipped++;
+            historicalFailed.delete(String(stock.token));
+          } catch (e2) {
+            console.error(`🛑 Rate-limit again on ${stock.sym}: ${e2.message} — STOPPING run to protect the API key. Leftover stocks resume next run.`);
+            historicalFailed.add(String(stock.token));
+            break;
+          }
+        }
+        // v5.42 BRANCH 3 — any other error: original gentle retry
+        else {
+          await new Promise(r => setTimeout(r, 5000));
+          try {
+            const r2 = await backfillOneStock(stock, days);
+            if (r2.days_saved > 0) { summary.ok++; summary.days_saved += r2.days_saved; }
+            else summary.skipped++;
+            historicalFailed.delete(String(stock.token));
+          } catch (e2) {
+            summary.failed++;
+            historicalFailed.add(String(stock.token));
+            if (errors.length < 20) errors.push(`${stock.sym}: ${e2.message}`);
+          }
         }
       }
       processed++;

@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.37 (Position API Fix)
+   server.js — TradeAlgo Pro backend  |  v5.38 (EOD Volume Update Fix)
    ============================================================ */
 
 import express from 'express';
@@ -1818,7 +1818,7 @@ async function fetchDayHLC() {
     if (!p.date) { console.log('❌ [HLC] No date'); return; }
     
     const allTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
-    console.log(`🔔 [HLC] Fetching day H/L/C for ${allTokens.length} stocks & indices...`);
+    console.log(`🔔 [HLC] Fetching day H/L/C + Volume for ${allTokens.length} stocks & indices...`);
 
     const savedTokens = new Set();
     const t0 = Date.now();
@@ -1833,6 +1833,7 @@ async function fetchDayHLC() {
 
       const token = String(q.token);
       const close = q.ltp || q.close;
+      const vol = q.volume || 0; // ✅ Full Day EOD Volume
       const sym = SYM_BY_TOKEN[token] || INDEX_SYMS[token] || '?';
 
       setCachedLTP(token, close);
@@ -1840,15 +1841,17 @@ async function fetchDayHLC() {
 
       try {
         await db.query(
-          `INSERT INTO strategy_bs_snapshot (date, token, sym, strategy_id, day_high, day_low, day_close, prev_close, fetched_at)
-           VALUES ($1, $2, $3, 'momentum', $4, $5, $6, $7, NOW())
+          `INSERT INTO strategy_bs_snapshot AS s 
+             (date, token, sym, strategy_id, day_high, day_low, day_close, prev_close, volume, fetched_at)
+           VALUES ($1, $2, $3, 'momentum', $4, $5, $6, $7, $8, NOW())
            ON CONFLICT (date, token, strategy_id) DO UPDATE SET
              day_high=EXCLUDED.day_high,
              day_low=EXCLUDED.day_low,
              day_close=EXCLUDED.day_close,
              prev_close=EXCLUDED.prev_close,
+             volume=COALESCE(EXCLUDED.volume, s.volume),
              fetched_at=NOW()`,
-          [p.date, token, sym, q.high, q.low, close, q.close]
+          [p.date, token, sym, q.high, q.low, close, q.close, vol]
         );
         savedTokens.add(token);
       } catch (e) { dbErrors.push(`${token}: ${e.message}`); }
@@ -1856,7 +1859,7 @@ async function fetchDayHLC() {
 
     if (dbErrors.length) console.log(`❌ [HLC] DB errors (first 5):`, dbErrors.slice(0, 5));
     broadcastBS(new Date());
-    console.log(`✅ Day H/L/C: ${savedTokens.size}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
+    console.log(`✅ Day H/L/C + Volume: ${savedTokens.size}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
   } catch (e) { console.error('❌ Day H/L/C fetch failed:', e); }
 }
 
@@ -2493,7 +2496,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.37 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.38 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2525,7 +2528,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.37`);
+  console.log(`✅ Server on port ${PORT} — v5.38`);
   initMarginService(db, getBrokerSession);
 
   try { 

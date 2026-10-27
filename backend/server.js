@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.36 (Strict PDH/PDL Crossover + Quote Fallback)
+   server.js — TradeAlgo Pro backend  |  v5.37 (Position API Fix)
    ============================================================ */
 
 import express from 'express';
@@ -1350,8 +1350,10 @@ app.get('/api/auto/positions', auth, async (req, res) => {
   try {
     const date = req.query.date || getIST().toISOString().split('T')[0];
     const uid = req.user?.id || req.user?.username || 'admin';
+    
+    // ✅ FIX: Removed t1, t2 from query
     const { rows } = await db.query(
-      `SELECT date::text AS date, token, sym, qty, entry, sl, t1, t2, stage, peak, side,
+      `SELECT date::text AS date, token, sym, qty, entry, sl, stage, peak, side,
               status, exit_price, exit_reason, entry_at, exit_at
        FROM auto_positions WHERE date=$1 AND user_id=$2 ORDER BY entry_at`,
       [date, uid]
@@ -1367,7 +1369,7 @@ app.get('/api/auto/positions', auth, async (req, res) => {
       const pnlPct = +(((pnl / (r.entry * r.qty)) * 100)).toFixed(2);
       return {
         date: r.date, token: String(r.token), sym: r.sym, qty: +r.qty, side: r.side || 'BUY',
-        entry: +r.entry, sl: +r.sl, t1: +r.t1, t2: +r.t2,
+        entry: +r.entry, sl: +r.sl, t1: null, t2: null, // ✅ FIX: Null values for UI
         stage: lp ? lp.stage : +r.stage,
         slLive: lp ? lp.sl : +r.sl,
         peak: lp ? lp.peak : (r.peak != null ? +r.peak : null),
@@ -2491,7 +2493,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.36 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.37 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2523,7 +2525,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.36`);
+  console.log(`✅ Server on port ${PORT} — v5.37`);
   initMarginService(db, getBrokerSession);
 
   try { 

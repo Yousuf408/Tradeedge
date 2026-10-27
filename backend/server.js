@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.38 (EOD Volume Update Fix)
+   server.js — TradeAlgo Pro backend  |  v5.39 (1-Min RVOL Storage)
    ============================================================ */
 
 import express from 'express';
@@ -266,6 +266,7 @@ const wsTodayCloses = new Map();
 const wsTodayVols = new Map();
 const wsTodayHighs = new Map();
 const wsTodayLows = new Map();
+const cumulativeWsVols = new Map(); // ✅ NEW: Track cumulative WS volume for RVOL
 
 const currentMinHighs = new Map();
 const currentMinLows = new Map();
@@ -276,7 +277,7 @@ const rsiState = new Map();
 const chipList = new Map();
 let chipDate = null;
 
-let latestBreadth = { adv: 0, dec: 0 }; // ✅ FIX: Declared globally
+let latestBreadth = { adv: 0, dec: 0 };
 
 function computeRSI(prevCloses, currentClose) {
   if (!Array.isArray(prevCloses) || prevCloses.length < 13) return null;
@@ -555,10 +556,17 @@ async function loadTodayWSClosesFromDB() {
     wsTodayVols.clear();
     wsTodayHighs.clear();
     wsTodayLows.clear();
+    cumulativeWsVols.clear(); // ✅ Clear cumulative on startup
+    
     for (const r of rows) {
       if (Array.isArray(r.ws_1min_close) && r.ws_1min_close.length > 0) {
         wsTodayCloses.set(String(r.token), r.ws_1min_close.map(c => +c));
-        wsTodayVols.set(String(r.token), Array.isArray(r.ws_1min_volume) ? r.ws_1min_volume.map(v => +v || 0) : []);
+        const vols = Array.isArray(r.ws_1min_volume) ? r.ws_1min_volume.map(v => +v || 0) : [];
+        wsTodayVols.set(String(r.token), vols);
+        
+        // ✅ Recalculate cumulative volume for today
+        const cumVol = vols.reduce((a, b) => a + b, 0);
+        cumulativeWsVols.set(String(r.token), cumVol);
       }
     }
     console.log(`📊 WS today closes: ${wsTodayCloses.size} tokens`);
@@ -750,7 +758,8 @@ const minVolRing = new Map();
 let wsMinuteKey = null;
 
 async function flushWSMinuteClose(prevKey, prevTs, date) {
-  const tokens = [], closes = [], minVols = [];
+  const tokens = [], closes = [], minVols = [], minRvols = []; // ✅ Added minRvols
+  
   for (const s of STOCKS) {
     const token = String(s.token);
     const age = Date.now() - (lastLtpAt.get(token) || 0);
@@ -765,9 +774,18 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     if (cum != null && prev != null && cum >= prev) mv = cum - prev;
     if (cum != null) prevCumVol.set(token, cum);
 
+    // ✅ Calculate cumulative volume for RVOL
+    let cumVolWs = cumulativeWsVols.get(token) || 0;
+    cumVolWs += mv;
+    cumulativeWsVols.set(token, cumVolWs);
+
+    const histAvg = avgVolume5D.get(token) || 0;
+    const rvol = histAvg > 0 ? +(cumVolWs / histAvg).toFixed(2) : 0;
+
     tokens.push(token);
     closes.push(close);
     minVols.push(mv);
+    minRvols.push(rvol); // ✅ Store calculated RVOL
 
     const ring = minVolRing.get(token) || [];
     ring.push(mv);
@@ -786,10 +804,11 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
        SET ws_1min_close  = COALESCE(s.ws_1min_close,  ARRAY[]::numeric[]) || v.c,
            ws_1min_ts     = COALESCE(s.ws_1min_ts,     ARRAY[]::timestamptz[]) || v.t,
            ws_1min_volume = COALESCE(s.ws_1min_volume, ARRAY[]::numeric[]) || v.vol,
-           ws_1min_vwap   = COALESCE(s.ws_1min_vwap,   ARRAY[]::numeric[]) || v.w
-       FROM unnest($1::text[], $2::numeric[], $3::timestamptz[], $4::numeric[], $5::numeric[]) AS v(token, c, t, vol, w)
-       WHERE s.date = $6 AND s.token = v.token AND s.strategy_id = 'momentum'`,
-      [tokens, closes, tss, minVols, vwaps, date]
+           ws_1min_vwap   = COALESCE(s.ws_1min_vwap,   ARRAY[]::numeric[]) || v.w,
+           ws_1min_rvol   = COALESCE(s.ws_1min_rvol,   ARRAY[]::numeric[]) || v.rvol -- ✅ Added RVOL
+       FROM unnest($1::text[], $2::numeric[], $3::timestamptz[], $4::numeric[], $5::numeric[], $6::numeric[]) AS v(token, c, t, vol, w, rvol)
+       WHERE s.date = $7 AND s.token = v.token AND s.strategy_id = 'momentum'`,
+      [tokens, closes, tss, minVols, vwaps, minRvols, date]
     );
     if (isFive) {
       await db.query(
@@ -2496,7 +2515,7 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    console.log('🧹 v5.38 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 v5.39 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -2528,7 +2547,7 @@ registerAdminRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.38`);
+  console.log(`✅ Server on port ${PORT} — v5.39`);
   initMarginService(db, getBrokerSession);
 
   try { 

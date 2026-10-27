@@ -1,31 +1,39 @@
 /* ============================================================
-   Angel_Quote.js  —  v1.0  (standalone)
+   Angel_Quote.js  —  v1.1  (SHARED SESSION — no private login)
    ============================================================
 
    FULL QUOTE based candle service — replaces REST historical.
 
-   - Standalone login (own TOTP, own session)
+   v1.1 CHANGE (2026-10-27) — WHY:
+   Angel One allows only ONE live session per client code. This module's
+   private login was killing the REST session (used by historical candles)
+   every time it logged in. Login/TOTP/session are now REMOVED from here —
+   the single session lives in Angel_REST.js and is borrowed from there.
+
+   - No private login anymore (borrows Angel_REST session)
    - FULL quote batch fetch (50 tokens per call)
    - Candle cache (memory) + LTP cache
    - Strategy filter helper (1.5% body, price band)
    - fetchAndCacheQuotes() — fetch + filter + cache in one call
 
-   Exports mirror Angel_REST.js interface for easy server.js swap.
+   Exports keep the SAME names & signatures as v1.0 → server.js unchanged.
    ============================================================ */
 
-import crypto from 'crypto';
+import {
+  ensureLoggedIn as ensureSharedSession,
+  getSessionStatus as getSharedSessionStatus,
+  getJwt as getSharedJwt,
+  getFeedToken as getSharedFeedToken,
+  forceRelogin as forceSharedRelogin
+} from './Angel_REST.js';
 
 const BASE_URL = 'https://apiconnect.angelone.in';
 const API_KEY = process.env.ANGEL_API_KEY;
-const CLIENT_ID = process.env.ANGEL_CLIENT_ID;
-const PIN = process.env.ANGEL_PIN;
-const TOTP_SECRET = process.env.ANGEL_TOTP_SECRET;
 
 const BATCH_SIZE = 50;                                        // tokens per FULL quote call
 const BATCH_DELAY_MS = Number(process.env.QUOTE_BATCH_DELAY_MS || 400);
 const COOLDOWN_ON_403_MS = Number(process.env.ANGEL_COOLDOWN_403_MS || 3000);
 
-const session = { jwtToken: null, feedToken: null, expiresAt: null, loginTime: null };
 const candleCache = new Map();
 const ltpCache = new Map();
 
@@ -47,42 +55,7 @@ async function waitForCooldown() {
 }
 
 /* ============================================================
-   TOTP
-   ============================================================ */
-const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-
-function base32Decode(str) {
-  str = str.toUpperCase().replace(/=+$/, '').replace(/\s/g, '');
-  let bits = '';
-  for (const c of str) {
-    const v = B32.indexOf(c);
-    if (v === -1) continue;
-    bits += v.toString(2).padStart(5, '0');
-  }
-  const bytes = [];
-  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.slice(i, i + 8), 2));
-  return Buffer.from(bytes);
-}
-
-function generateTOTP(secret) {
-  const key = base32Decode(secret);
-  const counter = Math.floor(Date.now() / 1000 / 30);
-  const buf = Buffer.alloc(8);
-  buf.writeUInt32BE(0, 0);
-  buf.writeUInt32BE(counter, 4);
-  const hmac = crypto.createHmac('sha1', key);
-  hmac.update(buf);
-  const hash = hmac.digest();
-  const off = hash[hash.length - 1] & 0x0f;
-  const code = ((hash[off] & 0x7f) << 24) |
-               ((hash[off + 1] & 0xff) << 16) |
-               ((hash[off + 2] & 0xff) << 8) |
-               (hash[off + 3] & 0xff);
-  return String(code % 1000000).padStart(6, '0');
-}
-
-/* ============================================================
-   HTTP (text-first parsing, retries, cooldown)
+   HTTP (shared token, auto re-login on dead session)
    ============================================================ */
 function buildHeaders() {
   const h = {
@@ -95,14 +68,17 @@ function buildHeaders() {
     'X-MACAddress': '00:00:00:00:00:00',
     'X-PrivateKey': API_KEY
   };
-  if (session.jwtToken) h['Authorization'] = 'Bearer ' + session.jwtToken;
+  const jwt = getSharedJwt();
+  if (jwt) h['Authorization'] = 'Bearer ' + jwt;
   return h;
 }
 
 async function post(path, body, { retries = 2, baseBackoff = 1200 } = {}) {
   let lastErr = null;
+  let attempt = 0;
+  let relogins = 0;
 
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  while (attempt <= retries) {
     if (attempt > 0) {
       const backoff = baseBackoff * Math.pow(2, attempt - 1) + Math.random() * 500;
       console.warn(`↻ [Quote] retry ${attempt}/${retries} for ${path} in ${Math.round(backoff)}ms`);
@@ -118,10 +94,25 @@ async function post(path, body, { retries = 2, baseBackoff = 1200 } = {}) {
       text = await res.text();
     } catch (e) {
       lastErr = new Error(`Network error: ${e.message}`);
+      attempt++;
       continue;
     }
 
-    try { return JSON.parse(text); } catch {}
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+
+    if (json) {
+      const why = `${json.errorcode || ''} ${json.message || ''}`;
+      if (json.status === false &&
+          /AB1010|invalid session|session.{0,20}expired|please re-?login/i.test(why) &&
+          relogins < 2) {
+        relogins++;
+        console.warn(`🔑 [Quote] session dead (${json.errorcode || json.message}) — shared re-login, retry ${path}`);
+        await forceSharedRelogin();
+        continue;
+      }
+      return json;
+    }
 
     const snippet = text.slice(0, 120).replace(/\s+/g, ' ');
     console.error(`⛔ [Quote] non-JSON HTTP ${res.status} from ${path}: "${snippet}"`);
@@ -129,6 +120,7 @@ async function post(path, body, { retries = 2, baseBackoff = 1200 } = {}) {
     if (res.status === 403 || res.status === 429 || /access denied/i.test(text)) {
       startCooldown(COOLDOWN_ON_403_MS, `rate-limited on ${path}`);
       lastErr = new Error(`Rate limited (HTTP ${res.status}): ${snippet}`);
+      attempt++;
       continue;
     }
 
@@ -139,56 +131,13 @@ async function post(path, body, { retries = 2, baseBackoff = 1200 } = {}) {
 }
 
 /* ============================================================
-   LOGIN (standalone — own session)
+   SESSION — delegated to the single shared session (Angel_REST)
+   (names kept so server.js imports keep working)
    ============================================================ */
-export async function loginPlatform() {
-  if (!API_KEY || !CLIENT_ID || !PIN || !TOTP_SECRET) {
-    throw new Error('Angel credentials missing in .env');
-  }
-  const totp = generateTOTP(TOTP_SECRET);
-  const r = await post('/rest/auth/angelbroking/user/v1/loginByPassword', {
-    clientcode: CLIENT_ID,
-    password: PIN,
-    totp
-  }, { retries: 2, baseBackoff: 3000 });
-
-  if (!r.status || !r.data?.jwtToken) {
-    throw new Error(r.message || 'Login failed');
-  }
-  session.jwtToken = r.data.jwtToken;
-  session.feedToken = r.data.feedToken;
-  session.loginTime = Date.now();
-  const midnight = new Date();
-  midnight.setHours(23, 59, 59, 999);
-  session.expiresAt = midnight.getTime();
-  return { ok: true, expiresAt: session.expiresAt };
-}
-
-let loginInFlight = null;
-
-function ensureLoggedIn() {
-  if (session.jwtToken && Date.now() < session.expiresAt - 60000) return Promise.resolve(true);
-  if (!loginInFlight) {
-    loginInFlight = loginPlatform()
-      .then(() => { console.log('✅ [Quote] session started'); return true; })
-      .catch(e => { console.error('❌ [Quote] login failed:', e.message); return false; })
-      .finally(() => { loginInFlight = null; });
-  }
-  return loginInFlight;
-}
-
-export function getSessionStatus() {
-  return {
-    loggedIn: !!session.jwtToken && Date.now() < session.expiresAt,
-    expiresAt: session.expiresAt,
-    loginTime: session.loginTime
-  };
-}
-
-export function getFeedToken() { return session.feedToken; }
-
-/* v2.4: expose JWT for broker margin service */
-export function getJwt() { return session.jwtToken || null; }
+export async function loginPlatform() { return ensureSharedSession(); }
+export function getSessionStatus() { return getSharedSessionStatus(); }
+export function getFeedToken() { return getSharedFeedToken(); }
+export function getJwt() { return getSharedJwt(); }
 
 /* ============================================================
    CACHE — candles + LTP
@@ -219,7 +168,7 @@ export function clearLtpCache() { ltpCache.clear(); }
    QUOTE FETCH — pure fetch, returns raw OHLC+LTP array
    ============================================================ */
 export async function fetchQuotesForTokens(tokens) {
-  const ok = await ensureLoggedIn();
+  const ok = await ensureSharedSession();
   if (!ok) return [];
 
   const out = [];
@@ -233,7 +182,6 @@ export async function fetchQuotesForTokens(tokens) {
         mode: 'FULL',
         exchangeTokens: { NSE: batch }
       });
-
       if (r.status && r.data?.fetched) {
         for (const q of r.data.fetched) {
           const open  = +q.open;

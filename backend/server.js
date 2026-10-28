@@ -79,7 +79,7 @@ import { startDepthWS, resubscribeDepth, getDepthStatus } from './brokers/angelo
 import * as AngelDepth from './brokers/angelone/Angel_Depth.js';
 
 import {
-  initAutoTrader, onEntryScan, onTickPos, loadOpenPositions, getPositions, getPositionDate,
+  initAutoTrader, onTickPos, loadOpenPositions, getPositions, getPositionDate,
   loadVCWatchlist, rebuildVCState, vcOnMinuteCandle
 } from './autoTrader.js';
 
@@ -2290,7 +2290,6 @@ async function buildChipList(date) {
   } catch (e) { console.error('Chip list build failed:', e.message); }
 }
 
-const MAX_ENTRIES = Number(process.env.MAX_ENTRIES || 10);
 
 // v5.43: shared users builder (old scan + VC engine both use it)
 async function buildAutoUsers() {
@@ -2301,165 +2300,6 @@ async function buildAutoUsers() {
   });
   if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000), sideMode: 'MIX' });
   return users;
-}
-const ENTRY_OPEN_GAIN_PCT = Number(process.env.ENTRY_OPEN_GAIN_PCT || 1.0);
-const ENTRY_MAX_GAIN_PCT = Number(process.env.ENTRY_MAX_GAIN_PCT || 3.0);
-const ENTRY_GAP_MAX_PCT = Number(process.env.ENTRY_GAP_MAX_PCT || 3.0);
-const ENTRY_START_MIN = Number(process.env.ENTRY_START_MIN || 9 * 60 + 15);
-const ENTRY_END_MIN = Number(process.env.ENTRY_END_MIN || 11 * 60);
-const ENTRY_SCAN_MS = Number(process.env.ENTRY_SCAN_MS || 1000); 
-
-let entryDay = null;
-const entryTriggered = new Set();
-let entryCount = 0;
-
-async function runEntryScan(date) {
-  try {
-    if (!date) return;
-    // v5.43: old PDH/PDL entry engine REPLACED by VC engine (set ENTRY_ENGINE=old to restore)
-    if (String(process.env.ENTRY_ENGINE || 'vc') === 'vc') return;
-    if (entryDay !== date) {
-      entryDay = date;
-      entryTriggered.clear();
-      entryCount = 0;
-      if (getPositionDate() === date) {
-        for (const p of getPositions()) entryTriggered.add(String(p.token));
-        entryCount = entryTriggered.size;
-        if (entryCount) console.log(`🎯 Entry engine: ${entryCount} tokens aaj already-entered`);
-      }
-    }
-
-    if (bsFreshDate !== date) return;
-
-    const ist = getIST();
-    const dow = ist.getUTCDay();
-    if (dow < 1 || dow > 5 || !isTradingDay(ist)) return;
-    const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-    if (mins < ENTRY_START_MIN || mins >= ENTRY_END_MIN) return;
-    if (entryCount >= MAX_ENTRIES * 2) return; 
-
-    const validStocks = [];
-    for (const st of STOCKS) {
-      const token = String(st.token);
-      if (entryTriggered.has(token)) continue;
-      
-      const bs = bsCache.get(token);
-      if (!bs) continue;
-      
-      const dayOpen = bs.dayOpen ?? null;
-      const prevClose = prevCloseCache.get(token) || null;
-      if (!dayOpen || !prevClose || prevClose <= 0) continue;
-
-      const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
-      if (gapPct >= ENTRY_GAP_MAX_PCT) continue;
-      if (Math.abs(gapPct) > 20) continue; 
-
-      const ltp = getCachedLTP(token);
-      if (!ltp) continue;
-      
-      const changePct = ((ltp - prevClose) / prevClose) * 100;
-      const openGainPct = ((ltp - dayOpen) / dayOpen) * 100;
-
-      const pdh = prevHighCache.get(token) || 0;
-      const pdl = prevLowCache.get(token) || 0;
-      
-      const todayCloses = wsTodayCloses.get(token) || [];
-      const todayHighs = wsTodayHighs.get(token) || [];
-      const todayLows = wsTodayLows.get(token) || [];
-
-      const c1High = todayHighs[0] || 0;
-      const c2High = todayHighs[1] || 0;
-      const c1Low = todayLows[0] || 0;
-      const c2Low = todayLows[1] || 0;
-
-      let isBuy = false;
-      let isSell = false;
-
-      // --- BUY LOGIC ---
-      // Condition 1: Opened >= PDH
-      if (dayOpen >= pdh && pdh > 0) {
-        if (openGainPct >= ENTRY_OPEN_GAIN_PCT) {
-          isBuy = true;
-        }
-      } 
-      // Condition 2: Opened < PDH (Check 1st/2nd candle crossover)
-      else if (pdh > 0) {
-        const crossedPdh = (c1High >= pdh) || (c2High >= pdh) || (todayHighs.length === 0 && ltp >= pdh);
-        if (crossedPdh && openGainPct >= ENTRY_OPEN_GAIN_PCT) {
-          isBuy = true;
-        }
-      }
-
-      // --- SELL LOGIC ---
-      // Condition 1: Opened <= PDL
-      if (dayOpen <= pdl && pdl > 0) {
-        if (openGainPct <= -ENTRY_OPEN_GAIN_PCT) {
-          isSell = true;
-        }
-      } 
-      // Condition 2: Opened > PDL (Check 1st/2nd candle crossover)
-      else if (pdl > 0) {
-        const crossedPdl = (c1Low <= pdl) || (c2Low <= pdl) || (todayLows.length === 0 && ltp <= pdl);
-        if (crossedPdl && openGainPct <= -ENTRY_OPEN_GAIN_PCT) {
-          isSell = true;
-        }
-      }
-
-      if (isBuy) {
-        validStocks.push({
-          token, sym: st.sym, dayOpen: +dayOpen.toFixed(2),
-          gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), 
-          changePct: +changePct.toFixed(2), side: 'BUY'
-        });
-      }
-      if (isSell) {
-        validStocks.push({
-          token, sym: st.sym, dayOpen: +dayOpen.toFixed(2),
-          gapPct: +gapPct.toFixed(2), openGainPct: +openGainPct.toFixed(2), 
-          changePct: +changePct.toFixed(2), side: 'SELL'
-        });
-      }
-    }
-
-    if (!validStocks.length) return;
-
-    const buyCands = validStocks.filter(c => c.side === 'BUY').sort((a, b) => b.openGainPct - a.openGainPct);
-    const sellCands = validStocks.filter(c => c.side === 'SELL').sort((a, b) => a.openGainPct - b.openGainPct);
-    
-    const list = [...buyCands.slice(0, 15), ...sellCands.slice(0, 15)];
-    
-    const newList = list.filter(c => !entryTriggered.has(c.token));
-    if (!newList.length) return;
-
-    for (const c of newList) entryTriggered.add(c.token);
-    entryCount += newList.length;
-
-    const hh = String(ist.getUTCHours()).padStart(2, '0');
-    const mi = String(ist.getUTCMinutes()).padStart(2, '0');
-    console.log(`🎯 Entry trigger ${hh}:${mi} — ${newList.length} CANDIDATES: ${newList.map(c => `${c.sym}(${c.side} ${c.openGainPct}%)`).join(', ')}`);
-
-    const { rows: dbUsers } = await db.query(`SELECT id, username, side_mode FROM users`);
-    const users = [...userCapital.entries()].map(([userId, capital]) => {
-      const dbU = dbUsers.find(u => u.id === userId || u.username === userId);
-      return { 
-        userId, 
-        capital, 
-        sideMode: dbU?.side_mode || 'MIX' 
-      };
-    });
-    
-    if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000), sideMode: 'MIX' });
-    
-    onEntryScan(newList, date, users).catch(e => console.error('🤖 Entry error:', e.message));
-  } catch (e) { console.error('Entry scan failed:', e.message); }
-}
-
-function startEntryEngine() {
-  setInterval(() => {
-    const p = getScreenerPhase();
-    if (p && p.date) runEntryScan(p.date);
-  }, ENTRY_SCAN_MS);
-  console.log(`🎯 Entry engine ON — scan ${ENTRY_SCAN_MS / 1000}s | window 9:15–11:00 IST | PDH/PDL Crossover Logic`);
 }
 
 async function loadChipListFromDB(date) {
@@ -2848,11 +2688,10 @@ app.listen(PORT, async () => {
   scheduleDailyHistorical();
   scheduleMorningPreload();
   startMarginRefreshLoop();
-  startEntryEngine();
 
   maybeRefreshMargins('angelone', { force: true }).catch(() => {});
 
   setInterval(updateMarketBreadth, 5000);
 
-  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15 (30s) | Quote@9:30 | EntryScan@9:15-11:00 (1s) | HLC@15:31 | FinalFlush@15:31 | Preload@9:00 | Margins@30min');
+  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15 (30s) | Quote@9:30 | VC entries@9:16-14:30 | HLC@15:31 | FinalFlush@15:31 | AutoHistorical@16:00 | Preload@9:00 | Margins@30min');
 });

@@ -116,9 +116,9 @@ export async function loadVCWatchlist(date, watchDate) {
     const { rows } = await db.query(
       `SELECT token, sym, day_close, ws_5min_close
        FROM strategy_bs_snapshot
-       WHERE strategy_id='momentum' AND date = $2
+       WHERE strategy_id='momentum' AND date = $1
          AND ws_5min_close IS NOT NULL AND array_length(ws_5min_close,1) >= 30`,
-      [date, watchDate]
+      [watchDate]
     );
     vcWatch.clear();
     for (const r of rows) {

@@ -210,6 +210,22 @@ const prevCloseCache = new Map();
 const prevHighCache = new Map();
 const prevLowCache = new Map();
 const avgVolume5D = new Map();
+const lastEodVolume = new Map();   // v5.43: last known EOD volume per token (pre-market fallback)
+
+async function loadLastEodVolumeFromDB() {
+  try {
+    const { rows } = await db.query(
+      `SELECT DISTINCT ON (token) token,
+              (SELECT COALESCE(SUM(x),0) FROM unnest(ws_1min_volume) x) AS vol
+       FROM strategy_bs_snapshot
+       WHERE strategy_id='momentum' AND ws_1min_volume IS NOT NULL
+         AND array_length(ws_1min_volume,1) > 0 AND date < CURRENT_DATE
+       ORDER BY token, date DESC`
+    );
+    for (const r of rows) if (+r.vol > 0) lastEodVolume.set(String(r.token), +r.vol);
+    console.log(`📊 Last EOD volume loaded: ${lastEodVolume.size} tokens`);
+  } catch (e) { console.error('EOD volume load failed:', e.message); }
+}
 
 async function loadPrevCloseFromDB() {
   try {
@@ -1048,7 +1064,8 @@ function broadcastBS(fetchedAt) {
     bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => {
       const lev = getLeverage('angelone', t);
       const wsV = (wsTodayVols.get(t) || []).reduce((a, b) => a + (+b || 0), 0);
-      const volV = (v.volume > 0 ? +v.volume : (wsV > 0 ? wsV : null));
+      const eodV = lastEodVolume.get(t) > 0 ? lastEodVolume.get(t) : null;
+      const volV = (v.volume > 0 ? +v.volume : (wsV > 0 ? wsV : eodV));
       return [t, {
         buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
         volume: volV,
@@ -1483,7 +1500,8 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const bs = bsCache.get(token) || null;
     const lev = getLeverage('angelone', token);
     const wsVol = (wsTodayVols.get(token) || []).reduce((a, b) => a + (+b || 0), 0);
-    const vol = (bs?.volume > 0 ? +bs.volume : (wsVol > 0 ? wsVol : null));
+    const eodVol = lastEodVolume.get(token) > 0 ? lastEodVolume.get(token) : null;
+    const vol = (bs?.volume > 0 ? +bs.volume : (wsVol > 0 ? wsVol : eodVol));
     const rvol = vol && avgVolume5D.get(token) ? +(vol / avgVolume5D.get(token)).toFixed(1) : (bs?.rvol ?? null);
     return {
       token, ltp, prevClose,
@@ -2703,6 +2721,7 @@ app.listen(PORT, async () => {
   await loadHolidaysFromDB();
   await loadPrevCloseFromDB();
   await loadAvgVolumeFromDB(); 
+  await loadLastEodVolumeFromDB();   // v5.43: pre-market volume fallback
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();

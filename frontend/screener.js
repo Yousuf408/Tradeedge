@@ -713,6 +713,7 @@ async function loadLTP() {
       body: JSON.stringify({ tokens })
     });
     const d = await r.json();
+    if (d.breadth) TICKER_BREADTH = d.breadth;   // v5.43: Adv/Dec survives after market close
     if (d.results) {
       for (const item of d.results) {
         if (item.ltp) SCREENER_LTP[item.token] = item.ltp;

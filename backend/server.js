@@ -80,7 +80,7 @@ import * as AngelDepth from './brokers/angelone/Angel_Depth.js';
 
 import {
   initAutoTrader, onTickPos, loadOpenPositions, getPositions, getPositionDate,
-  loadVCWatchlist, rebuildVCState, vcOnMinuteCandle
+  loadVCWatchlist, rebuildVCState, vcOnMinuteCandle, getVCStatus
 } from './autoTrader.js';
 
 import { registerAdminRoutes } from './admin.js';
@@ -1092,6 +1092,12 @@ function broadcastChip() {
   sseSend(`data: ${JSON.stringify({ type: 'chip', chips: [...chipList.values()] })}\n\n`);
 }
 
+// v5.43: push VC watchlist/setup state to screener (badge + chip)
+function broadcastVC() {
+  if (!sseClients.size) return;
+  sseSend(`data: ${JSON.stringify({ type: 'vc', vc: getVCStatus() })}\n\n`);
+}
+
 function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
   
@@ -1359,6 +1365,11 @@ app.get('/api/screener/data', auth, (req, res) => {
     cachedTokens,
     results: allCached, stocks: []
   });
+});
+
+// v5.43: VC watchlist + live setup state for screener badge/chip
+app.get('/api/screener/vc', auth, (req, res) => {
+  res.json({ ok: true, ...getVCStatus() });
 });
 
 app.get('/api/screener/chips', auth, (req, res) => {
@@ -2616,7 +2627,8 @@ app.listen(PORT, async () => {
       h: wsTodayHighs.get(String(t)) || [],
       l: wsTodayLows.get(String(t)) || []
     }),
-    getUsers: buildAutoUsers
+    getUsers: buildAutoUsers,
+    onVCChange: () => broadcastVC()
   });
   await loadOpenPositions(getIST().toISOString().split('T')[0]);
   await loadVCWatchlist(getIST().toISOString().split('T')[0]);      // v5.43

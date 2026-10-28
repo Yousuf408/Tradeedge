@@ -211,7 +211,7 @@ async function loadVC() {
     });
     const d = await r.json();
     if (d && d.watch) {
-      SCREENER_VC = { watch: d.watch || {}, state: d.state || {}, date: d.date || null };
+      SCREENER_VC = { watch: d.watch || {}, state: d.state || {}, date: d.date || null, watchDate: d.watchDate || null };
       renderChips();
       renderScreenerTable();
     }
@@ -265,6 +265,15 @@ function countSellCandidates() {
   return n;
 }
 
+function vcWatchLabel() {
+  const wd = SCREENER_VC.watchDate;
+  if (!wd) return 'VC';
+  try {
+    const d = new Date(wd + 'T00:00:00');
+    return `VC ${d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}`;
+  } catch { return 'VC'; }
+}
+
 function renderChips() {
   const el = document.getElementById('stageChips');
   if (!el) return;
@@ -283,7 +292,7 @@ function renderChips() {
       chip('sell_candidates', `📉 Top Shorts (${scCount})`) +
       chip('all', 'All') +
       chip('rsi_chips', '🔒 RSI Chips') +
-      chip('vc_candidates', `🎯 VC Candidates (${vcCount})`);
+      chip('vc_candidates', `🎯 ${vcWatchLabel()} (${vcCount})`);
       
     el.style.display = '';
     return;
@@ -836,7 +845,7 @@ function startSSE() {
         renderScreenerTable();
       }
       else if (msg.type === 'vc' && msg.vc) {
-        SCREENER_VC = { watch: msg.vc.watch || {}, state: msg.vc.state || {}, date: msg.vc.date || null };
+        SCREENER_VC = { watch: msg.vc.watch || {}, state: msg.vc.state || {}, date: msg.vc.date || null, watchDate: msg.vc.watchDate || null };
         renderChips();
         renderScreenerTable();
       }
@@ -981,7 +990,7 @@ function renderScreenerTable() {
       } else if (vcS && vcS.side) {
         vcBadge = `<span title="VC ${vcS.side} setup | trigger ${vcS.trigger} | SL ${vcS.sl}" style="color:${vcS.side === 'BUY' ? 'var(--success)' : 'var(--danger)'};font-size:10px;font-weight:800;margin-left:4px">${vcS.side === 'BUY' ? '▲' : '▼'}</span>`;
       } else if (vcW) {
-        vcBadge = `<span title="VC sideways candidate | range ${vcW.rangePct}% | PDC ${vcW.pdc}" style="color:#6C5CE7;font-size:10px;margin-left:4px">🎯</span>`;
+        vcBadge = `<span title="VC sideways candidate | based on ${SCREENER_VC.watchDate || '-'} | range ${vcW.rangePct}% | PDC ${vcW.pdc}" style="color:#6C5CE7;font-size:10px;margin-left:4px">🎯</span>`;
       }
 
       // ✅ REMOVED PRE-OPEN, 20 EMA, ACTION <td> elements

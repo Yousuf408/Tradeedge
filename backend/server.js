@@ -1,6 +1,16 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.42 (Single session + wait-and-resume backfill)
+   server.js — TradeAlgo Pro backend  |  v5.43 (4 PM auto-historical + EOD breadth + fast safe backfill)
    ============================================================
+   CHANGES vs v5.42 (nothing else touched):
+   11. Volume + RVOL now survive after market close (ltp route + SSE fallback
+       to WS minute-volume sums; 15:31 HLC can no longer zero the volume).
+   12. Backfill speed: per-stock pause 5000→1500ms, 1m→5m gap 1200→400ms
+       (~50 min → ~22 min; pace ≈0.6 req/s vs Angel cap ~3 req/s = safe).
+   13. Auto historical fetch scheduled daily at 16:00 IST (trading days only,
+       skips if a run is in progress) + queue processed in ALPHABETICAL order.
+   14. Market breadth (Adv/Dec) now served on page-load too (/api/screener/ltp
+       returns breadth) + computed once at startup → ticker keeps showing
+       Adv/Dec after market close and after restarts.
    CHANGES vs v5.41 (nothing else touched):
    8. Angel_REST is now the ONLY login in the app (Quote/BS borrow its token).
       server.js imports forceRelogin for the backfill's session recovery.
@@ -1037,9 +1047,13 @@ function broadcastBS(fetchedAt) {
     type: 'bs', fetchedAt,
     bs: Object.fromEntries([...bsCache.entries()].map(([t, v]) => {
       const lev = getLeverage('angelone', t);
+      const wsV = (wsTodayVols.get(t) || []).reduce((a, b) => a + (+b || 0), 0);
+      const volV = (v.volume > 0 ? +v.volume : (wsV > 0 ? wsV : null));
       return [t, {
         buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
-        volume: v.volume, rvol: v.rvol ?? null, rank: v.rank,
+        volume: volV,
+        rvol: volV && avgVolume5D.get(t) ? +(volV / avgVolume5D.get(t)).toFixed(1) : (v.rvol ?? null),
+        rank: v.rank,
         dayOpen: v.dayOpen ?? null,
         rsi: v.rsi ?? null,
         leverage: lev ?? null,
@@ -1468,12 +1482,15 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const prevClose = prevCloseCache.get(token) || null;
     const bs = bsCache.get(token) || null;
     const lev = getLeverage('angelone', token);
+    const wsVol = (wsTodayVols.get(token) || []).reduce((a, b) => a + (+b || 0), 0);
+    const vol = (bs?.volume > 0 ? +bs.volume : (wsVol > 0 ? wsVol : null));
+    const rvol = vol && avgVolume5D.get(token) ? +(vol / avgVolume5D.get(token)).toFixed(1) : (bs?.rvol ?? null);
     return {
       token, ltp, prevClose,
       buyQty: bs?.buyQty ?? null,
       sellQty: bs?.sellQty ?? null,
-      bsVolume: bs?.volume ?? null,
-      rvol: bs?.rvol ?? null,
+      bsVolume: vol,
+      rvol,
       rank: bs?.rank ?? null,
       dayOpen: bs?.dayOpen ?? null,
       rsi: bs?.rsi ?? null,
@@ -1485,7 +1502,7 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     };
   });
 
-  res.json({ ok: true, count: enriched.length, results: enriched });
+  res.json({ ok: true, count: enriched.length, breadth: latestBreadth, results: enriched });
 });
 
 app.post('/api/screener/maxqty', auth, (req, res) => {
@@ -1709,8 +1726,8 @@ async function backfillOneStock(stock, daysBack) {
   const raw1m = await fetchAngelInterval(token, 'ONE_MINUTE', daysBack);
   const by1m = fillMissingMinutes(groupCandlesByDate(raw1m), 1, 555, 929);
 
-  // CHANGE 3: breathing room between the 1m and 5m calls (was 400ms)
-  await new Promise(r => setTimeout(r, 1200));
+  // v5.43: original 400ms gap between 1m and 5m calls (safe at this pace)
+  await new Promise(r => setTimeout(r, 400));
   const raw5m = await fetchAngelInterval(token, 'FIVE_MINUTE', daysBack);
   const by5m = fillMissingMinutes(groupCandlesByDate(raw5m, 4), 5, 559, 929);
 
@@ -1786,12 +1803,13 @@ async function processHistoricalFetch(body) {
   const summary = { ok: 0, failed: 0, skipped: 0, days_saved: 0, total: STOCKS.length };
   const errors = [];
 
-  const DELAY_MS = 5000; 
+  const DELAY_MS = 1500;   // v5.43: was 5000 — total pace ≈0.6 req/s, well under Angel's ~3 req/s cap
   const retryOnly = body?.all !== true && historicalFailed.size > 0;
   const queue = retryOnly
     ? STOCKS.filter(s => historicalFailed.has(String(s.token)))
     : [...STOCKS];
   if (!retryOnly) historicalFailed.clear();
+  queue.sort((a, b) => String(a.sym).localeCompare(String(b.sym)));   // v5.43: alphabetical progress
   
   console.log(`📥 Historical start: ${queue.length} stocks (${retryOnly ? 'retry-failed only' : 'full run'}) | window=${days} working days`);
   let processed = 0;
@@ -1844,6 +1862,7 @@ async function processHistoricalFetch(body) {
           } catch (e2) {
             console.error(`🛑 Session still dead after re-login (${e2.message}). Stopping historical fetch.`);
             historicalFailed.add(String(stock.token));
+            for (const s of queue) historicalFailed.add(String(s.token));   // v5.42: leftovers resume next run
             break;
           }
         }
@@ -1861,6 +1880,7 @@ async function processHistoricalFetch(body) {
           } catch (e2) {
             console.error(`🛑 Rate-limit again on ${stock.sym}: ${e2.message} — STOPPING run to protect the API key. Leftover stocks resume next run.`);
             historicalFailed.add(String(stock.token));
+            for (const s of queue) historicalFailed.add(String(s.token));   // v5.42: leftovers resume next run
             break;
           }
         }
@@ -1973,7 +1993,7 @@ async function fetchDayHLC() {
              day_low=EXCLUDED.day_low,
              day_close=EXCLUDED.day_close,
              prev_close=EXCLUDED.prev_close,
-             volume=COALESCE(EXCLUDED.volume, s.volume),
+             volume=CASE WHEN EXCLUDED.volume > 0 THEN EXCLUDED.volume ELSE s.volume END,
              fetched_at=NOW()`,
           [p.date, token, sym, q.high, q.low, close, q.close, vol]
         );
@@ -2612,6 +2632,24 @@ function scheduleFinalFlush() {
   }, ms);
 }
 
+// v5.43: daily 4 PM IST auto historical fetch (trading days only)
+function scheduleDailyHistorical() {
+  const ms = msUntil(16, 0);
+  console.log(`⏰ Next auto-historical (4 PM) in ${Math.round(ms / 60000)} min`);
+  setTimeout(async () => {
+    const ist = getIST();
+    if (isTradingDay(ist) && !historicalRunning) {
+      historicalRunning = true;
+      console.log('📥 Scheduled 4 PM historical fetch starting (alphabetical order, 5-day window)');
+      processHistoricalFetch({ days: HISTORICAL_DAYS_DEFAULT, all: true })
+        .catch(e => { console.error('🛑 Scheduled historical error:', e.message); historicalRunning = false; });
+    } else {
+      console.log('⏭️ 4 PM historical skipped (weekend/holiday or a run is already in progress)');
+    }
+    scheduleDailyHistorical();
+  }, ms);
+}
+
 function scheduleMorningPreload() {
   const ms = msUntil(9, 0);
   console.log(`⏰ Next morning preload in ${Math.round(ms / 60000)} min`);
@@ -2671,6 +2709,7 @@ app.listen(PORT, async () => {
   await loadChipListFromDB(getIST().toISOString().split('T')[0]);
   await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
   computeBuyersGroups();
+  updateMarketBreadth();   // v5.43: EOD breadth ready for page-loads after market hours
 
   try {
     const quotes = await fetchQuotesForTokens(INDEX_TOKENS);
@@ -2758,6 +2797,7 @@ app.listen(PORT, async () => {
   scheduleDailyHLC();
   scheduleBSAutoFetch();
   scheduleFinalFlush();
+  scheduleDailyHistorical();
   scheduleMorningPreload();
   startMarginRefreshLoop();
   startEntryEngine();

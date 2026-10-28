@@ -2519,6 +2519,26 @@ function scheduleFinalFlush() {
   }, ms);
 }
 
+// v5.43: which day's candles should the VC watchlist use?
+// Before 15:35 → last completed trading day (today still forming).
+// From 15:35 onwards → today itself (candles final) = next day's candidates.
+function getVCWatchDate() {
+  const ist = getIST();
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  const today = ist.toISOString().split('T')[0];
+  if (mins >= 15 * 60 + 35 && isTradingDay(ist)) return today;
+  return getPreviousTradingDay(ist);
+}
+
+function scheduleVCWatchReload() {
+  const ms = msUntil(15, 35);
+  console.log(`⏰ VC watchlist post-close refresh in ${Math.round(ms / 60000)} min`);
+  setTimeout(async () => {
+    await loadVCWatchlist(getIST().toISOString().split('T')[0], getVCWatchDate());
+    scheduleVCWatchReload();
+  }, ms);
+}
+
 // v5.43: daily 4 PM IST auto historical fetch (trading days only)
 function scheduleDailyHistorical() {
   const ms = msUntil(16, 0);
@@ -2555,7 +2575,7 @@ function scheduleMorningPreload() {
     seedRSIStateFromMemory();
     const today = getIST().toISOString().split('T')[0];
     await recomputeAllRSI(today);
-    await loadVCWatchlist(today);      // v5.43: fresh sideways watchlist for the new day
+    await loadVCWatchlist(today, getVCWatchDate());      // v5.43: fresh sideways watchlist for the new day
     await rebuildVCState(today);       // v5.43
     scheduleMorningPreload();
   }, ms);
@@ -2631,7 +2651,7 @@ app.listen(PORT, async () => {
     onVCChange: () => broadcastVC()
   });
   await loadOpenPositions(getIST().toISOString().split('T')[0]);
-  await loadVCWatchlist(getIST().toISOString().split('T')[0]);      // v5.43
+  await loadVCWatchlist(getIST().toISOString().split('T')[0], getVCWatchDate());      // v5.43
   await rebuildVCState(getIST().toISOString().split('T')[0]);       // v5.43
   
   await loadPrevWSClosesFromDB();
@@ -2698,6 +2718,7 @@ app.listen(PORT, async () => {
   scheduleBSAutoFetch();
   scheduleFinalFlush();
   scheduleDailyHistorical();
+  scheduleVCWatchReload();
   scheduleMorningPreload();
   startMarginRefreshLoop();
 

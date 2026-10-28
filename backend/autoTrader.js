@@ -1,11 +1,41 @@
 /* ============================================================
-   autoTrader.js — v2.1 (Dynamic MIX + 1.2% Profit Lock)
+   autoTrader.js — v3.0 (VC "Sideways-PDC" engine + CTC stop)
+   ============================================================
+   NEW vs v2.1 (existing order/exit/paper/square-off logic untouched):
+   - VC ENGINE (replaces old server-side entry engine, which is now OFF by
+     default via ENTRY_ENGINE=vc):
+       1. Pre-market watchlist: previous day's last 30 five-min CLOSES
+          range <= 1.5%  (user's SQL spec)  → loadVCWatchlist()
+       2. 9:15 open vs PDC decides side (open>PDC=BUY, open<PDC=SELL);
+          gap > 3% (env) → stock dropped for the day.
+       3. First 1-min candle (from 9:15-9:16 onwards) that CLOSES on the
+          same side of PDC = signal candle.
+             - candle move from open >= 1%  → entry on signal-candle
+               high (BUY) / low (SELL) break.
+             - candle move < 1%             → entry once LTP grows 1%
+               from open (safer vs fake crosses).
+       4. SL = opposite end of signal candle. NO trailing.
+          At +1% from entry → SL moves to CTC (entry price). That's it.
+       5. One setup + one entry per stock per day. Entries until 14:30
+          (env VC_ENTRY_END_MIN). Restart-safe: rebuildVCState() replays
+          today's stored 1-min arrays.
+   - Positions created by VC carry strat='vc' → managed by the new SL/CTC
+     rules. Older positions (strat undefined) keep the OLD 1.2% lock +
+     trail management until they exit. Nothing else changed.
    ============================================================ */
 
 const LOCK_TRIGGER_PCT = Number(process.env.AT_LOCK_TRIGGER_PCT ?? 1.2);
 const LOCK_PROFIT_PCT  = Number(process.env.AT_LOCK_PROFIT_PCT ?? 1.0);
 const TRAIL_PCT        = Number(process.env.AT_TRAIL_PCT ?? 0.2);
 const MAX_ENTRIES_PER_USER = Number(process.env.MAX_ENTRIES || 10);
+
+/* ---- VC engine config (all switchable from Render env) ---- */
+const VC_ENABLED        = String(process.env.VC_ENGINE ?? 'true') === 'true';
+const VC_RANGE_MAX_PCT  = Number(process.env.VC_RANGE_MAX_PCT ?? 1.5);
+const VC_GAP_MAX_PCT    = Number(process.env.VC_GAP_MAX_PCT ?? 3.0);
+const VC_MIN_CANDLE_PCT = Number(process.env.VC_MIN_CANDLE_PCT ?? 1.0);
+const VC_CTC_PCT        = Number(process.env.VC_CTC_PCT ?? 1.0);
+const VC_ENTRY_END_MIN  = Number(process.env.VC_ENTRY_END_MIN ?? 14 * 60 + 30);
 
 let db = null;
 let getJwt = null;
@@ -14,12 +44,20 @@ let clientCode = null;
 let symByToken = {};
 let getLtp = () => null;
 let getLev = null;
+let getDayOpen = () => null;
+let getTodayMinutes = () => null;
+let getUsers = async () => [];
 let live = false;
 
 const positions = new Map();
 const liveOrdered = new Set();
 let posDate = null;
 let sqDoneDate = null;
+
+/* ---- VC in-memory state (no DB per tick) ---- */
+const vcWatch = new Map();   // token -> { sym, pdc, rangePct }
+const vcState = new Map();   // token -> setup state (see vcOnMinuteCandle)
+let vcDate = null;
 
 const getIST = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 const todayIST = () => getIST().toISOString().split('T')[0];
@@ -33,8 +71,11 @@ export function initAutoTrader(deps) {
   symByToken = deps.symByToken || {};
   getLtp = deps.getLtp || (() => null);
   getLev = deps.getLeverage || null;
+  getDayOpen = deps.getDayOpen || (() => null);
+  getTodayMinutes = deps.getTodayMinutes || (() => null);
+  getUsers = deps.getUsers || (async () => []);
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
-  console.log(`🤖 AutoTrader v2.1 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | Dynamic MIX Enabled`);
+  console.log(`🤖 AutoTrader v3.0 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | VC engine: ${VC_ENABLED ? 'ON' : 'OFF'} | Dynamic MIX Enabled`);
   startSquareOffWatch();
 }
 
@@ -62,14 +103,224 @@ async function placeOrder({ token, sym, side, qty }) {
   return j.data?.orderid || null;
 }
 
-/* ---------- ENTRY: scan ke baad, per-user positions ---------- */
+/* ============================================================
+   VC ENGINE — watchlist (pre-market)
+   ============================================================ */
+export async function loadVCWatchlist(date) {
+  if (!db || !VC_ENABLED) return;
+  try {
+    const { rows } = await db.query(
+      `SELECT DISTINCT ON (token) token, sym, day_close, ws_5min_close
+       FROM strategy_bs_snapshot
+       WHERE strategy_id='momentum' AND ws_5min_close IS NOT NULL
+         AND array_length(ws_5min_close,1) >= 30 AND date < $1
+       ORDER BY token, date DESC`,
+      [date]
+    );
+    vcWatch.clear();
+    for (const r of rows) {
+      const arr = r.ws_5min_close.map(Number).slice(-30);
+      const hi = Math.max(...arr);
+      const lo = Math.min(...arr);
+      if (!(lo > 0) || !(r.day_close > 0)) continue;
+      const rangePct = (hi - lo) / lo * 100;
+      if (rangePct <= VC_RANGE_MAX_PCT) {
+        vcWatch.set(String(r.token), { sym: r.sym, pdc: +r.day_close, rangePct: +rangePct.toFixed(2) });
+      }
+    }
+    vcDate = date;
+    vcState.clear();
+    console.log(`🧿 VC watchlist: ${vcWatch.size} sideways stocks for ${date} (last-30 5m range ≤ ${VC_RANGE_MAX_PCT}%)`);
+  } catch (e) {
+    console.error('🧿 VC watchlist load failed:', e.message);
+  }
+}
+
+/* ============================================================
+   VC ENGINE — signal candle (called on every 1-min candle close)
+   ============================================================ */
+export function vcOnMinuteCandle(token, c) {
+  if (!VC_ENABLED || !c) return;
+  const tk = String(token);
+  if (vcDate !== todayIST()) return;
+  const w = vcWatch.get(tk);
+  if (!w) return;
+  if (vcState.has(tk)) return;                 // first cross wins, one setup per day
+  if (!(c.minuteKey >= '09:15')) return;       // ignore anything before first candle
+
+  const open = getDayOpen(tk);
+  if (!open || open <= 0) return;
+  const pdc = w.pdc;
+
+  const gap = Math.abs(open - pdc) / pdc * 100;
+  if (gap > VC_GAP_MAX_PCT) {
+    vcState.set(tk, { done: true, why: 'gap' });
+    return;
+  }
+  const side = open > pdc ? 'BUY' : (open < pdc ? 'SELL' : null);
+  if (!side) return;
+
+  const confirmed = side === 'BUY' ? c.close > pdc : c.close < pdc;
+  if (!confirmed) return;                      // wait for a candle that closes on our side
+
+  const candleOpen = (c.open > 0) ? c.open : open;   // v3.0.1: 1% check = candle's OWN open vs close
+  const movePct = Math.abs(c.close - candleOpen) / candleOpen * 100;
+  const mode = movePct >= VC_MIN_CANDLE_PCT ? 'candle' : 'growth';
+  const trigger = mode === 'candle'
+    ? (side === 'BUY' ? c.high : c.low)
+    : +(side === 'BUY' ? open * 1.01 : open * 0.99).toFixed(2);
+  const sl = side === 'BUY' ? c.low : c.high;
+
+  vcState.set(tk, { sym: w.sym, side, mode, trigger, sl0: sl, entered: false, open });
+  console.log(`🧿 VC setup ${w.sym} ${side} | candle ${c.minuteKey} close ${c.close} vs PDC ${pdc} | move ${movePct.toFixed(2)}% → mode=${mode} | trigger=${trigger} | SL=${sl}`);
+}
+
+/* ============================================================
+   VC ENGINE — tick trigger (called from onTickPos for every tick)
+   ============================================================ */
+function vcOnTick(tk, ltp) {
+  if (!VC_ENABLED) return;
+  const st = vcState.get(tk);
+  if (!st || st.entered || st.done) return;
+  const ist = getIST();
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  if (mins < 9 * 60 + 15 || mins >= VC_ENTRY_END_MIN) return;
+  if (!Number.isFinite(ltp) || ltp <= 0) return;
+
+  const hit = st.side === 'BUY' ? ltp >= st.trigger : ltp <= st.trigger;
+  if (!hit) return;
+  st.entered = true;
+  console.log(`🎯 VC TRIGGER ${st.sym} ${st.side} @${ltp} | trigger=${st.trigger} mode=${st.mode}`);
+  vcPlaceEntries(tk, st, ltp).catch(e => console.error('🤖 VC entry error:', e.message));
+}
+
+async function vcPlaceEntries(tk, st, ltp) {
+  if (posDate !== todayIST()) {
+    positions.clear();
+    liveOrdered.clear();
+    posDate = todayIST();
+  }
+  const users = await getUsers();
+  for (const u of users) {
+    const userMode = u.sideMode || 'MIX';
+    if (userMode !== 'MIX' && userMode !== st.side) continue;
+
+    let userEntryCount = 0;
+    for (const p of positions.values()) if (p.userId === u.userId) userEntryCount++;
+    if (userEntryCount >= MAX_ENTRIES_PER_USER) continue;
+
+    let already = false;
+    for (const p of positions.values()) {
+      if (p.userId === u.userId && p.token === tk && p.status === 'open') { already = true; break; }
+    }
+    if (already) continue;
+
+    const key = pkey(u.userId, tk, st.side);
+    if (positions.has(key)) continue;
+
+    const entryLtp = getLtp(tk) || ltp;
+    if (!entryLtp || entryLtp <= 0) continue;
+    const lev = getLev ? getLev('angelone', tk) : null;
+    const qty = (lev && lev > 0)
+      ? Math.floor((u.capital * lev) / entryLtp)
+      : Math.floor(u.capital / (entryLtp * 0.01));
+    if (qty < 1) continue;
+
+    const pos = {
+      userId: u.userId, token: tk, sym: st.sym || symByToken[tk] || '?', qty,
+      side: st.side,
+      entry: +entryLtp.toFixed(2),
+      sl: +st.sl0.toFixed(2),
+      stage: 0,
+      peak: +entryLtp.toFixed(2),
+      status: 'open', reason: null, exitPrice: null,
+      entryAt: new Date().toISOString(), exitAt: null,
+      strat: 'vc'
+    };
+    positions.set(key, pos);
+
+    const orderKey = `${st.side}:${tk}`;
+    if (live && !liveOrdered.has(orderKey)) {
+      liveOrdered.add(orderKey);
+      try {
+        const oid = await placeOrder({ token: tk, sym: pos.sym, side: pos.side, qty: pos.qty });
+        console.log(`🤖 VC ${pos.side} ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} order=${oid}`);
+      } catch (e) {
+        console.error(`🤖 VC ${pos.side} failed ${pos.sym}: ${e.message}`);
+      }
+    } else if (!live) {
+      console.log(`🤖 [PAPER] VC ${pos.side} ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} user=${u.userId}`);
+    }
+    savePos(pos, posDate).catch(() => {});
+  }
+}
+
+/* ============================================================
+   VC ENGINE — restart rebuild (replay today's stored 1-min arrays)
+   ============================================================ */
+export async function rebuildVCState(date) {
+  if (!VC_ENABLED || !getTodayMinutes) return;
+  vcDate = date;
+  vcState.clear();
+  let setups = 0, entered = 0;
+
+  for (const [tk, w] of vcWatch) {
+    const m = getTodayMinutes(tk);
+    if (!m || !m.c || !m.c.length) continue;
+    const open = getDayOpen(tk);
+    if (!open || open <= 0) continue;
+
+    const gap = Math.abs(open - w.pdc) / w.pdc * 100;
+    if (gap > VC_GAP_MAX_PCT) { vcState.set(tk, { done: true, why: 'gap' }); continue; }
+    const side = open > w.pdc ? 'BUY' : (open < w.pdc ? 'SELL' : null);
+    if (!side) continue;
+
+    let st = null, idx = -1;
+    for (let i = 0; i < m.c.length; i++) {
+      const ok = side === 'BUY' ? m.c[i] > w.pdc : m.c[i] < w.pdc;
+      if (!ok) continue;
+      const high = m.h?.[i] ?? m.c[i];
+      const low  = m.l?.[i] ?? m.c[i];
+      const cOpen0 = i > 0 ? m.c[i - 1] : open;      // v3.0.1: candle's own open (prev close; day-open for 1st)
+      const movePct = Math.abs(m.c[i] - cOpen0) / cOpen0 * 100;
+      const mode = movePct >= VC_MIN_CANDLE_PCT ? 'candle' : 'growth';
+      st = {
+        sym: w.sym, side, mode, entered: false, open,
+        trigger: mode === 'candle' ? (side === 'BUY' ? high : low) : +(side === 'BUY' ? open * 1.01 : open * 0.99).toFixed(2),
+        sl0: side === 'BUY' ? low : high
+      };
+      idx = i;
+      break;
+    }
+    if (!st) continue;
+
+    for (let i = idx + 1; i < m.c.length; i++) {
+      const hi = m.h?.[i] ?? m.c[i];
+      const lo = m.l?.[i] ?? m.c[i];
+      if (side === 'BUY' ? hi >= st.trigger : lo <= st.trigger) { st.entered = true; break; }
+    }
+    if (!st.entered) {
+      const ltp = getLtp(tk);
+      if (ltp && (side === 'BUY' ? ltp >= st.trigger : ltp <= st.trigger)) st.entered = true;
+    }
+    vcState.set(tk, st);
+    setups++;
+    if (st.entered) entered++;
+    for (const pos of positions.values()) {
+      if (pos.token === tk && pos.status === 'open') pos.strat = 'vc';   // restore mgmt rules after restart
+    }
+  }
+  console.log(`🧿 VC state rebuilt: ${setups} setups, ${entered} already triggered`);
+}
+
+/* ---------- ENTRY (legacy scan handoff — used only when ENTRY_ENGINE=old) ---------- */
 export async function onEntryScan(cands, date, users) {
   if (posDate !== date) {
     positions.clear();
     liveOrdered.clear();
     posDate = date;
   }
-  
+
   for (const u of users) {
     const userMode = u.sideMode || 'MIX';
 
@@ -94,7 +345,7 @@ export async function onEntryScan(cands, date, users) {
 
     for (const c of selectedCands) {
       const token = String(c.token);
-      
+
       // Ensure same day same stock pe BUY/SELL dono block rahe
       let alreadyHasToken = false;
       for (const p of positions.values()) {
@@ -103,11 +354,11 @@ export async function onEntryScan(cands, date, users) {
           break;
         }
       }
-      if (alreadyHasToken) continue; 
+      if (alreadyHasToken) continue;
 
       const key = pkey(u.userId, token, c.side);
-      if (positions.has(key)) continue; 
-      
+      if (positions.has(key)) continue;
+
       const ltp = getLtp(token);
       if (!ltp || ltp <= 0) continue;
       const lev = getLev ? getLev('angelone', token) : null;
@@ -118,24 +369,24 @@ export async function onEntryScan(cands, date, users) {
 
       const isShort = c.side === 'SELL';
       const dayOpen = (c.dayOpen != null && +c.dayOpen > 0) ? +c.dayOpen : null;
-      
-      const sl = dayOpen != null 
-        ? +dayOpen.toFixed(2) 
+
+      const sl = dayOpen != null
+        ? +dayOpen.toFixed(2)
         : (isShort ? +(ltp * 1.01).toFixed(2) : +(ltp * 0.99).toFixed(2));
 
       const pos = {
         userId: u.userId, token, sym: c.sym || symByToken[token] || '?', qty,
         side: c.side,
         entry: +ltp.toFixed(2),
-        sl, 
-        stage: 0, 
+        sl,
+        stage: 0,
         peak: +ltp.toFixed(2),
         status: 'open', reason: null, exitPrice: null,
         entryAt: new Date().toISOString(), exitAt: null
       };
       positions.set(key, pos);
-      
-      if (dayOpen == null) console.warn(`🤖 ⚠️ ${pos.sym}: dayOpen missing → SL fallback`);
+
+      if (dayOpen == null) console.warn(`🤖 ️ ${pos.sym}: dayOpen missing → SL fallback`);
 
       const orderKey = `${c.side}:${token}`;
       if (live && !liveOrdered.has(orderKey)) {
@@ -157,20 +408,48 @@ export async function onEntryScan(cands, date, users) {
 /* ---------- TICK MONITOR ---------- */
 export function onTickPos(token, ltp) {
   const tk = String(token);
+
+  vcOnTick(tk, ltp);   // v3.0: VC entry trigger check (lightweight, in-memory)
+
   for (const [key, pos] of positions) {
     if (pos.token !== tk || pos.status !== 'open') continue;
     let changed = false;
 
+    /* ---- v3.0: VC positions — candle SL → CTC at +1%, NO trail ---- */
+    if (pos.strat === 'vc') {
+      if (pos.stage === 0) {
+        const ctcHit = pos.side === 'BUY'
+          ? ltp >= pos.entry * (1 + VC_CTC_PCT / 100)
+          : ltp <= pos.entry * (1 - VC_CTC_PCT / 100);
+        if (ctcHit) {
+          pos.stage = 1;
+          pos.sl = pos.side === 'BUY'
+            ? Math.max(pos.sl, +pos.entry.toFixed(2))
+            : Math.min(pos.sl, +pos.entry.toFixed(2));
+          changed = true;
+          console.log(`🤖 VC ${pos.sym}: +${VC_CTC_PCT}% reached → SL to CTC @${pos.sl}`);
+        }
+      }
+      const hitSL = pos.side === 'BUY' ? ltp <= pos.sl : ltp >= pos.sl;
+      if (hitSL) {
+        exitPosition(pos, ltp, pos.stage >= 1 ? 'CTC' : 'SL');
+        continue;
+      }
+      if (changed) savePos(pos, posDate).catch(() => {});
+      continue;
+    }
+
+    /* ---- legacy management (positions without strat) ---- */
     if (pos.side === 'BUY') {
       // 1. Trigger hit (1.2%)
       if (pos.stage === 0 && ltp >= pos.entry * (1 + LOCK_TRIGGER_PCT / 100)) {
         pos.stage = 2; // Stage 2 = Locked profit
         const lockedSL = +(pos.entry * (1 + LOCK_PROFIT_PCT / 100)).toFixed(2);
-        if (lockedSL > pos.sl) pos.sl = lockedSL; 
+        if (lockedSL > pos.sl) pos.sl = lockedSL;
         pos.peak = ltp;
         changed = true;
       }
-      
+
       // 2. Trailing (If Stage >= 2)
       if (pos.stage >= 2) {
         if (ltp > pos.peak) pos.peak = ltp;
@@ -187,13 +466,13 @@ export function onTickPos(token, ltp) {
     } else {
       // 1. Trigger hit (1.2%)
       if (pos.stage === 0 && ltp <= pos.entry * (1 - LOCK_TRIGGER_PCT / 100)) {
-        pos.stage = 2; 
+        pos.stage = 2;
         const lockedSL = +(pos.entry * (1 - LOCK_PROFIT_PCT / 100)).toFixed(2);
-        if (lockedSL < pos.sl) pos.sl = lockedSL; 
+        if (lockedSL < pos.sl) pos.sl = lockedSL;
         pos.peak = ltp;
         changed = true;
       }
-      
+
       // 2. Trailing (If Stage >= 2)
       if (pos.stage >= 2) {
         if (ltp < pos.peak) pos.peak = ltp;
@@ -219,10 +498,9 @@ async function exitPosition(pos, price, reason) {
   pos.reason = reason;
   pos.exitPrice = +price.toFixed(2);
   pos.exitAt = new Date().toISOString();
-  
+
   const exitSide = pos.side === 'BUY' ? 'SELL' : 'BUY';
   const exitKey = `EXIT:${pos.side}:${pos.token}`;
-
   if (live && !liveOrdered.has(exitKey)) {
     liveOrdered.add(exitKey);
     try {

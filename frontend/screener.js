@@ -13,6 +13,7 @@ let SCREENER_RSI = {};
 let SCREENER_LEVERAGE = {};
 let SCREENER_MARGIN_PS = {};
 let SCREENER_CHIPS = [];
+let SCREENER_VC = { watch: {}, state: {}, date: null };   // v5.43: VC candidates badge/chip
 let SCREENER_LASTUPD = {};
 let SCREENER_VWAP = {};
 let SCREENER_RSI_FIRST = {};
@@ -74,6 +75,7 @@ async function initScreener() {
   await loadStockList();
   await loadLTP();
   await loadChips();
+  await loadVC();
   SCREENER_INIT_DONE = true;
   startSSE();
 }
@@ -201,6 +203,21 @@ async function loadChips() {
   } catch (e) { console.error('Chips load failed:', e); }
 }
 
+// v5.43: VC sideways candidates + live setup state
+async function loadVC() {
+  try {
+    const r = await fetch(API + '/api/screener/vc', {
+      headers: { Authorization: 'Bearer ' + getToken() }
+    });
+    const d = await r.json();
+    if (d && d.watch) {
+      SCREENER_VC = { watch: d.watch || {}, state: d.state || {}, date: d.date || null };
+      renderChips();
+      renderScreenerTable();
+    }
+  } catch (e) { console.error('VC load failed:', e); }
+}
+
 /* ============================================================
    SECTION 2.1 — FILTERS + CHIPS
    ============================================================ */
@@ -213,6 +230,9 @@ function setMomentumFilter(key) {
   } else if (key === 'sell_candidates') {
     SCREENER_SORT_BY = 'change';
     SCREENER_SORT_DIR = 'asc';   
+  } else if (key === 'vc_candidates') {
+    SCREENER_SORT_BY = 'vc_range';
+    SCREENER_SORT_DIR = 'asc';
   } else {
     SCREENER_SORT_BY = 'change';
     SCREENER_SORT_DIR = 'desc';
@@ -256,12 +276,14 @@ function renderChips() {
     };
     const ogCount = countOpenGainStocks();
     const scCount = countSellCandidates();
+    const vcCount = Object.keys(SCREENER_VC.watch || {}).length;
     
     el.innerHTML =
       chip('open_gain', `🏆 Top Performing (${ogCount})`) +
       chip('sell_candidates', `📉 Top Shorts (${scCount})`) +
       chip('all', 'All') +
-      chip('rsi_chips', '🔒 RSI Chips');
+      chip('rsi_chips', '🔒 RSI Chips') +
+      chip('vc_candidates', `🎯 VC Candidates (${vcCount})`);
       
     el.style.display = '';
     return;
@@ -302,6 +324,7 @@ function getSortValue(stock, field) {
   if (field === 'ltp') return SCREENER_LTP[stock.token] ?? -Infinity;
   if (field === 'rsi') return SCREENER_RSI[stock.token] ?? -Infinity;
   if (field === 'rvol') return SCREENER_BS[stock.token]?.rvol ?? -Infinity;
+  if (field === 'vc_range') return SCREENER_VC.watch[String(stock.token)]?.rangePct ?? 999;
   return 0;
 }
 
@@ -812,6 +835,11 @@ function startSSE() {
         SCREENER_CHIPS = msg.chips;
         renderScreenerTable();
       }
+      else if (msg.type === 'vc' && msg.vc) {
+        SCREENER_VC = { watch: msg.vc.watch || {}, state: msg.vc.state || {}, date: msg.vc.date || null };
+        renderChips();
+        renderScreenerTable();
+      }
     } catch {}
   };
 
@@ -867,6 +895,8 @@ function renderScreenerTable() {
       filtered = filtered.filter(s => passesOpenGain(s.token));
     } else if (SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
       filtered = filtered.filter(s => passesSellCandidate(s.token));
+    } else if (SCREENER_MOMENTUM_FILTER === 'vc_candidates') {
+      filtered = filtered.filter(s => SCREENER_VC.watch[String(s.token)]);
     } else if (SCREENER_MOMENTUM_FILTER === 'rsi_chips') {
       const chipTokens = new Set(SCREENER_CHIPS.map(c => String(c.token)));
       filtered = filtered.filter(s => chipTokens.has(String(s.token)));
@@ -895,6 +925,9 @@ function renderScreenerTable() {
       if (SCREENER_MOMENTUM_FILTER === 'rsi_chips') {
         emptyMsg = `🔒 No RSI chips locked today.<br>
             <span style="font-size:11px">Chips lock at 9:15 (top-10 rank · gap ≤3% · RSI ≥70)</span>`;
+      } else if (SCREENER_MOMENTUM_FILTER === 'vc_candidates') {
+        emptyMsg = `🎯 No sideways candidates today.<br>
+            <span style="font-size:11px">Watchlist = yesterday's last-30 5-min closes within 1.5% range</span>`;
       } else if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
         emptyMsg = `🏆 Abhi koi stock DAY OPEN se <b>+${OPEN_GAIN_MIN_PCT.toFixed(2)}%</b> (change% positive, gap-up < ${OPEN_GAIN_MAX_GAP_PCT}%) nahi hai.<br>
             <span style="font-size:11px">Live ticks pe har 2 second auto-refresh</span>`;
@@ -939,10 +972,22 @@ function renderScreenerTable() {
 
       const rankNum = (isSellTab ? SELL_CANDIDATE_RANK : OPEN_GAIN_RANK)[String(s.token)];
 
+      // v5.43: VC badge — 🎯 candidate | ▲/▼ live setup | ✓ entered
+      const vcW = SCREENER_VC.watch[String(s.token)];
+      const vcS = SCREENER_VC.state[String(s.token)];
+      let vcBadge = '';
+      if (vcS && vcS.entered) {
+        vcBadge = '<span title="VC: entered today" style="color:var(--text-muted);font-size:10px;margin-left:4px">✓</span>';
+      } else if (vcS && vcS.side) {
+        vcBadge = `<span title="VC ${vcS.side} setup | trigger ${vcS.trigger} | SL ${vcS.sl}" style="color:${vcS.side === 'BUY' ? 'var(--success)' : 'var(--danger)'};font-size:10px;font-weight:800;margin-left:4px">${vcS.side === 'BUY' ? '▲' : '▼'}</span>`;
+      } else if (vcW) {
+        vcBadge = `<span title="VC sideways candidate | range ${vcW.rangePct}% | PDC ${vcW.pdc}" style="color:#6C5CE7;font-size:10px;margin-left:4px">🎯</span>`;
+      }
+
       // ✅ REMOVED PRE-OPEN, 20 EMA, ACTION <td> elements
       return `<tr class="${rowClass}" data-token="${s.token}">
         ${showRankCol ? `<td style="font-weight:800;color:${isSellTab ? 'var(--danger)' : '#6C5CE7'};font-size:12px;text-align:center">${rankNum ?? '—'}</td>` : ''}
-        <td><span class="sym">${s.sym}</span><span class="tok">${s.token}</span></td>
+        <td><span class="sym">${s.sym}</span>${vcBadge}<span class="tok">${s.token}</span></td>
         <td style="white-space:nowrap">
           <span class="cell-primary ltp-cell">${ltp ? '₹' + (+ltp).toFixed(2) : '—'}</span>
           <span class="cell-sub change-cell">${changeLine}</span>

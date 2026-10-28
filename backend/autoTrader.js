@@ -20,13 +20,11 @@
           (env VC_ENTRY_END_MIN). Restart-safe: rebuildVCState() replays
           today's stored 1-min arrays.
    - Positions created by VC carry strat='vc' → managed by the new SL/CTC
-     rules. Older positions (strat undefined) keep the OLD 1.2% lock +
-     trail management until they exit. Nothing else changed.
+     rules. Old v2.1 entry/SL/trail code has been fully removed from this
+     file and archived in DEAD_CODE_old_entry_engine.js (reference only).
    ============================================================ */
 
-const LOCK_TRIGGER_PCT = Number(process.env.AT_LOCK_TRIGGER_PCT ?? 1.2);
-const LOCK_PROFIT_PCT  = Number(process.env.AT_LOCK_PROFIT_PCT ?? 1.0);
-const TRAIL_PCT        = Number(process.env.AT_TRAIL_PCT ?? 0.2);
+/* ===== (legacy constants above used ONLY by legacy mgmt block below) ===== */
 const MAX_ENTRIES_PER_USER = Number(process.env.MAX_ENTRIES || 10);
 
 /* ---- VC engine config (all switchable from Render env) ---- */
@@ -313,99 +311,6 @@ export async function rebuildVCState(date) {
   console.log(`🧿 VC state rebuilt: ${setups} setups, ${entered} already triggered`);
 }
 
-/* ---------- ENTRY (legacy scan handoff — used only when ENTRY_ENGINE=old) ---------- */
-export async function onEntryScan(cands, date, users) {
-  if (posDate !== date) {
-    positions.clear();
-    liveOrdered.clear();
-    posDate = date;
-  }
-
-  for (const u of users) {
-    const userMode = u.sideMode || 'MIX';
-
-    let userEntryCount = 0;
-    for (const p of positions.values()) {
-      if (p.userId === u.userId) userEntryCount++;
-    }
-    if (userEntryCount >= MAX_ENTRIES_PER_USER) continue;
-
-    // Filter by user preference (if they selected strict BUY or SELL)
-    let userCands = cands.filter(c => userMode === 'MIX' || c.side === userMode);
-
-    // ✅ DYNAMIC MIX LOGIC
-    // Sort all candidates (both Buy & Sell) by absolute momentum strength
-    // Highest OpenGainPct (whether + or -) gets priority.
-    userCands.sort((a, b) => Math.abs(b.openGainPct || 0) - Math.abs(a.openGainPct || 0));
-
-    let selectedCands = userCands.slice(0, MAX_ENTRIES_PER_USER);
-
-    const availableSlots = MAX_ENTRIES_PER_USER - userEntryCount;
-    selectedCands = selectedCands.slice(0, availableSlots);
-
-    for (const c of selectedCands) {
-      const token = String(c.token);
-
-      // Ensure same day same stock pe BUY/SELL dono block rahe
-      let alreadyHasToken = false;
-      for (const p of positions.values()) {
-        if (p.userId === u.userId && p.token === token && p.status === 'open') {
-          alreadyHasToken = true;
-          break;
-        }
-      }
-      if (alreadyHasToken) continue;
-
-      const key = pkey(u.userId, token, c.side);
-      if (positions.has(key)) continue;
-
-      const ltp = getLtp(token);
-      if (!ltp || ltp <= 0) continue;
-      const lev = getLev ? getLev('angelone', token) : null;
-      const qty = (lev && lev > 0)
-        ? Math.floor((u.capital * lev) / ltp)
-        : Math.floor(u.capital / (ltp * 0.01));
-      if (qty < 1) continue;
-
-      const isShort = c.side === 'SELL';
-      const dayOpen = (c.dayOpen != null && +c.dayOpen > 0) ? +c.dayOpen : null;
-
-      const sl = dayOpen != null
-        ? +dayOpen.toFixed(2)
-        : (isShort ? +(ltp * 1.01).toFixed(2) : +(ltp * 0.99).toFixed(2));
-
-      const pos = {
-        userId: u.userId, token, sym: c.sym || symByToken[token] || '?', qty,
-        side: c.side,
-        entry: +ltp.toFixed(2),
-        sl,
-        stage: 0,
-        peak: +ltp.toFixed(2),
-        status: 'open', reason: null, exitPrice: null,
-        entryAt: new Date().toISOString(), exitAt: null
-      };
-      positions.set(key, pos);
-
-      if (dayOpen == null) console.warn(`🤖 ️ ${pos.sym}: dayOpen missing → SL fallback`);
-
-      const orderKey = `${c.side}:${token}`;
-      if (live && !liveOrdered.has(orderKey)) {
-        liveOrdered.add(orderKey);
-        try {
-          const oid = await placeOrder({ token, sym: pos.sym, side: pos.side, qty: pos.qty });
-          console.log(`🤖 ${pos.side} ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} order=${oid}`);
-        } catch (e) {
-          console.error(`🤖 ${pos.side} failed ${pos.sym}: ${e.message}`);
-        }
-      } else if (!live) {
-        console.log(`🤖 [PAPER] ${pos.side} ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} user=${u.userId}`);
-      }
-      savePos(pos, date).catch(() => {});
-    }
-  }
-}
-
-/* ---------- TICK MONITOR ---------- */
 export function onTickPos(token, ltp) {
   const tk = String(token);
 
@@ -440,53 +345,6 @@ export function onTickPos(token, ltp) {
     }
 
     /* ---- legacy management (positions without strat) ---- */
-    if (pos.side === 'BUY') {
-      // 1. Trigger hit (1.2%)
-      if (pos.stage === 0 && ltp >= pos.entry * (1 + LOCK_TRIGGER_PCT / 100)) {
-        pos.stage = 2; // Stage 2 = Locked profit
-        const lockedSL = +(pos.entry * (1 + LOCK_PROFIT_PCT / 100)).toFixed(2);
-        if (lockedSL > pos.sl) pos.sl = lockedSL;
-        pos.peak = ltp;
-        changed = true;
-      }
-
-      // 2. Trailing (If Stage >= 2)
-      if (pos.stage >= 2) {
-        if (ltp > pos.peak) pos.peak = ltp;
-        const trail = +(pos.peak * (1 - TRAIL_PCT / 100)).toFixed(2);
-        if (trail > pos.sl) { pos.sl = trail; changed = true; }
-      }
-
-      // 3. Exit Check
-      if (ltp <= pos.sl) {
-        const reason = pos.stage >= 2 ? 'PROFIT_TRAIL' : 'SL';
-        exitPosition(pos, ltp, reason);
-        continue;
-      }
-    } else {
-      // 1. Trigger hit (1.2%)
-      if (pos.stage === 0 && ltp <= pos.entry * (1 - LOCK_TRIGGER_PCT / 100)) {
-        pos.stage = 2;
-        const lockedSL = +(pos.entry * (1 - LOCK_PROFIT_PCT / 100)).toFixed(2);
-        if (lockedSL < pos.sl) pos.sl = lockedSL;
-        pos.peak = ltp;
-        changed = true;
-      }
-
-      // 2. Trailing (If Stage >= 2)
-      if (pos.stage >= 2) {
-        if (ltp < pos.peak) pos.peak = ltp;
-        const trail = +(pos.peak * (1 + TRAIL_PCT / 100)).toFixed(2);
-        if (trail < pos.sl) { pos.sl = trail; changed = true; }
-      }
-
-      // 3. Exit Check
-      if (ltp >= pos.sl) {
-        const reason = pos.stage >= 2 ? 'PROFIT_TRAIL' : 'SL';
-        exitPosition(pos, ltp, reason);
-        continue;
-      }
-    }
 
     if (changed) savePos(pos, posDate).catch(() => {});
   }

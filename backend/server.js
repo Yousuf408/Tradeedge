@@ -79,7 +79,8 @@ import { startDepthWS, resubscribeDepth, getDepthStatus } from './brokers/angelo
 import * as AngelDepth from './brokers/angelone/Angel_Depth.js';
 
 import {
-  initAutoTrader, onEntryScan, onTickPos, loadOpenPositions, getPositions, getPositionDate
+  initAutoTrader, onEntryScan, onTickPos, loadOpenPositions, getPositions, getPositionDate,
+  loadVCWatchlist, rebuildVCState, vcOnMinuteCandle
 } from './autoTrader.js';
 
 import { registerAdminRoutes } from './admin.js';
@@ -881,6 +882,10 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
       const arrH = wsTodayHighs.get(tk) || []; arrH.push(h); wsTodayHighs.set(tk, arrH);
       const arrL = wsTodayLows.get(tk) || []; arrL.push(l); wsTodayLows.set(tk, arrL);
       
+      // v5.43: feed the closed 1-min candle to the VC engine (candle open = prev close; day-open for 1st candle)
+      const cOpen = i > 0 ? closes[i - 1] : (bsCache.get(tk)?.dayOpen ?? closes[i]);
+      vcOnMinuteCandle(tk, { high: h, low: l, close: closes[i], open: cOpen, minuteKey: prevKey });
+
       currentMinHighs.delete(tk);
       currentMinLows.delete(tk);
     }
@@ -2286,6 +2291,17 @@ async function buildChipList(date) {
 }
 
 const MAX_ENTRIES = Number(process.env.MAX_ENTRIES || 10);
+
+// v5.43: shared users builder (old scan + VC engine both use it)
+async function buildAutoUsers() {
+  const { rows: dbUsers } = await db.query(`SELECT id, username, side_mode FROM users`);
+  const users = [...userCapital.entries()].map(([userId, capital]) => {
+    const dbU = dbUsers.find(u => u.id === userId || u.username === userId);
+    return { userId, capital, sideMode: dbU?.side_mode || 'MIX' };
+  });
+  if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000), sideMode: 'MIX' });
+  return users;
+}
 const ENTRY_OPEN_GAIN_PCT = Number(process.env.ENTRY_OPEN_GAIN_PCT || 1.0);
 const ENTRY_MAX_GAIN_PCT = Number(process.env.ENTRY_MAX_GAIN_PCT || 3.0);
 const ENTRY_GAP_MAX_PCT = Number(process.env.ENTRY_GAP_MAX_PCT || 3.0);
@@ -2300,6 +2316,8 @@ let entryCount = 0;
 async function runEntryScan(date) {
   try {
     if (!date) return;
+    // v5.43: old PDH/PDL entry engine REPLACED by VC engine (set ENTRY_ENGINE=old to restore)
+    if (String(process.env.ENTRY_ENGINE || 'vc') === 'vc') return;
     if (entryDay !== date) {
       entryDay = date;
       entryTriggered.clear();
@@ -2686,6 +2704,8 @@ function scheduleMorningPreload() {
     seedRSIStateFromMemory();
     const today = getIST().toISOString().split('T')[0];
     await recomputeAllRSI(today);
+    await loadVCWatchlist(today);      // v5.43: fresh sideways watchlist for the new day
+    await rebuildVCState(today);       // v5.43
     scheduleMorningPreload();
   }, ms);
 }
@@ -2749,9 +2769,18 @@ app.listen(PORT, async () => {
     symByToken: SYM_BY_TOKEN,
     getLtp: getCachedLTP,
     getLeverage: (broker, token) => getLeverage(broker, token),
-    perTrade: Number(process.env.AUTO_PER_TRADE || 25000)
+    perTrade: Number(process.env.AUTO_PER_TRADE || 25000),
+    getDayOpen: (t) => bsCache.get(String(t))?.dayOpen ?? null,
+    getTodayMinutes: (t) => ({
+      c: wsTodayCloses.get(String(t)) || [],
+      h: wsTodayHighs.get(String(t)) || [],
+      l: wsTodayLows.get(String(t)) || []
+    }),
+    getUsers: buildAutoUsers
   });
   await loadOpenPositions(getIST().toISOString().split('T')[0]);
+  await loadVCWatchlist(getIST().toISOString().split('T')[0]);      // v5.43
+  await rebuildVCState(getIST().toISOString().split('T')[0]);       // v5.43
   
   await loadPrevWSClosesFromDB();
   await loadTodayWSClosesFromDB();

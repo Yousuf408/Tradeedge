@@ -45,6 +45,7 @@ let getLev = null;
 let getDayOpen = () => null;
 let getTodayMinutes = () => null;
 let getUsers = async () => [];
+let onVCChange = null;
 let live = false;
 
 const positions = new Map();
@@ -72,10 +73,13 @@ export function initAutoTrader(deps) {
   getDayOpen = deps.getDayOpen || (() => null);
   getTodayMinutes = deps.getTodayMinutes || (() => null);
   getUsers = deps.getUsers || (async () => []);
+  onVCChange = deps.onVCChange || null;
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
   console.log(`🤖 AutoTrader v3.0 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | VC engine: ${VC_ENABLED ? 'ON' : 'OFF'} | Dynamic MIX Enabled`);
   startSquareOffWatch();
 }
+
+function vcNotify() { if (onVCChange) { try { onVCChange(); } catch {} } }
 
 /* ---------- Angel placeOrder (MARKET, INTRADAY) ---------- */
 async function placeOrder({ token, sym, side, qty }) {
@@ -129,6 +133,7 @@ export async function loadVCWatchlist(date) {
     vcDate = date;
     vcState.clear();
     console.log(`🧿 VC watchlist: ${vcWatch.size} sideways stocks for ${date} (last-30 5m range ≤ ${VC_RANGE_MAX_PCT}%)`);
+    vcNotify();
   } catch (e) {
     console.error('🧿 VC watchlist load failed:', e.message);
   }
@@ -171,6 +176,7 @@ export function vcOnMinuteCandle(token, c) {
 
   vcState.set(tk, { sym: w.sym, side, mode, trigger, sl0: sl, entered: false, open });
   console.log(`🧿 VC setup ${w.sym} ${side} | candle ${c.minuteKey} close ${c.close} vs PDC ${pdc} | move ${movePct.toFixed(2)}% → mode=${mode} | trigger=${trigger} | SL=${sl}`);
+  vcNotify();
 }
 
 /* ============================================================
@@ -189,6 +195,7 @@ function vcOnTick(tk, ltp) {
   if (!hit) return;
   st.entered = true;
   console.log(`🎯 VC TRIGGER ${st.sym} ${st.side} @${ltp} | trigger=${st.trigger} mode=${st.mode}`);
+  vcNotify();
   vcPlaceEntries(tk, st, ltp).catch(e => console.error('🤖 VC entry error:', e.message));
 }
 
@@ -309,6 +316,20 @@ export async function rebuildVCState(date) {
     }
   }
   console.log(`🧿 VC state rebuilt: ${setups} setups, ${entered} already triggered`);
+  vcNotify();
+}
+
+/* ---------- VC status for screener UI (badge + chip) ---------- */
+export function getVCStatus() {
+  const watch = {};
+  for (const [t, w] of vcWatch) watch[t] = { sym: w.sym, pdc: w.pdc, rangePct: w.rangePct };
+  const state = {};
+  for (const [t, st] of vcState) {
+    state[t] = st.done
+      ? { done: true, why: st.why || 'gap' }
+      : { side: st.side, mode: st.mode, trigger: st.trigger, sl: st.sl0, entered: !!st.entered };
+  }
+  return { date: vcDate, watch, state };
 }
 
 export function onTickPos(token, ltp) {

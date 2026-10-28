@@ -57,6 +57,7 @@ let sqDoneDate = null;
 const vcWatch = new Map();   // token -> { sym, pdc, rangePct }
 const vcState = new Map();   // token -> setup state (see vcOnMinuteCandle)
 let vcDate = null;
+let vcWatchDateUsed = null;  // v3.0.3: which day's candles the watchlist was built from
 
 const getIST = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 const todayIST = () => getIST().toISOString().split('T')[0];
@@ -108,16 +109,16 @@ async function placeOrder({ token, sym, side, qty }) {
 /* ============================================================
    VC ENGINE — watchlist (pre-market)
    ============================================================ */
-export async function loadVCWatchlist(date) {
+export async function loadVCWatchlist(date, watchDate) {
   if (!db || !VC_ENABLED) return;
   try {
+    // v3.0.2: pin ONE date (previous trading day) for ALL stocks — exact match with user's SQL
     const { rows } = await db.query(
-      `SELECT DISTINCT ON (token) token, sym, day_close, ws_5min_close
+      `SELECT token, sym, day_close, ws_5min_close
        FROM strategy_bs_snapshot
-       WHERE strategy_id='momentum' AND ws_5min_close IS NOT NULL
-         AND array_length(ws_5min_close,1) >= 30 AND date < $1
-       ORDER BY token, date DESC`,
-      [date]
+       WHERE strategy_id='momentum' AND date = $2
+         AND ws_5min_close IS NOT NULL AND array_length(ws_5min_close,1) >= 30`,
+      [date, watchDate]
     );
     vcWatch.clear();
     for (const r of rows) {
@@ -131,8 +132,9 @@ export async function loadVCWatchlist(date) {
       }
     }
     vcDate = date;
+    vcWatchDateUsed = watchDate;
     vcState.clear();
-    console.log(`🧿 VC watchlist: ${vcWatch.size} sideways stocks for ${date} (last-30 5m range ≤ ${VC_RANGE_MAX_PCT}%)`);
+    console.log(`🧿 VC watchlist: ${vcWatch.size} sideways stocks for ${date} (built from ${watchDate} candles, last-30 5m range ≤ ${VC_RANGE_MAX_PCT}%)`);
     vcNotify();
   } catch (e) {
     console.error('🧿 VC watchlist load failed:', e.message);
@@ -329,7 +331,7 @@ export function getVCStatus() {
       ? { done: true, why: st.why || 'gap' }
       : { side: st.side, mode: st.mode, trigger: st.trigger, sl: st.sl0, entered: !!st.entered };
   }
-  return { date: vcDate, watch, state };
+  return { date: vcDate, watchDate: vcWatchDateUsed, watch, state };
 }
 
 export function onTickPos(token, ltp) {

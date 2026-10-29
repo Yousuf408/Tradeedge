@@ -1,6 +1,14 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.43 (4 PM auto-historical + EOD breadth + fast safe backfill)
+   server.js — TradeAlgo Pro backend  |  v5.43
    ============================================================ */
+
+// === GLOBAL ERROR HANDLERS (Prevents crashes) ===
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ Unhandled Rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught Exception:', err.message);
+});
 
 import express from 'express';
 import cors from 'cors';
@@ -71,13 +79,20 @@ const app = express();
 app.use(express.json());
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 
-// === CHANGE 1: pool timeouts + max 10 (was max:20, no connect timeout) ===
+// === UPDATED POOL CONFIG WITH ERROR HANDLER ===
 const db = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
   max: 10,
   connectionTimeoutMillis: 15000,
-  idleTimeoutMillis: 30000
+  idleTimeoutMillis: 30000,
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 5000
+});
+
+// This prevents the app from crashing if the DB drops a connection
+db.on('error', (err) => {
+  console.error('💥 DB pool error:', err.message);
 });
 
 const SECRET = process.env.JWT_SECRET;
@@ -532,7 +547,6 @@ async function recomputeAllRSI(date) {
   } catch (e) { console.error('recomputeAllRSI failed:', e.message); }
 }
 
-// === CHANGE 2: added `AND date >= CURRENT_DATE - 8` ===
 async function loadPrevWSClosesFromDB() {
   try {
     const activeTokens = STOCKS.map(s => String(s.token));
@@ -686,7 +700,6 @@ async function updateRSIFromWS(date, prevKey) {
   } catch (e) { console.error('WS RSI update failed:', e.message); }
 }
 
-// === CHANGE 3: added `AND date >= CURRENT_DATE - 8` ===
 async function recomputeRSIFromWS(date) {
   try {
     const activeTokens = STOCKS.map(s => String(s.token));
@@ -1023,7 +1036,7 @@ function broadcastLTP(token, ltp) {
     ssePendingRsi.clear();
     ssePendingPrevClose.clear();
     sseSend(payload);
-  }, 20);
+  }, 50);
 }
 
 function broadcastBS(fetchedAt) {
@@ -1084,9 +1097,6 @@ function handleTick(token, ltp, tickMs, extra) {
 
   if (INDEX_TOKENS.includes(String(token))) {
     setCachedLTP(token, ltp);
-    if (extra && Number.isFinite(extra.close) && extra.close > 0) {
-      prevCloseCache.set(token, +extra.close.toFixed(2)); 
-    }
     broadcastLTP(token, ltp);
     return;
   }

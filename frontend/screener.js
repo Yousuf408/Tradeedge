@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.8.2 (RVOL UI + Columns Removed + Background Fetch Fix)
+   SCREENER.JS  — v4.8.3 (5-Min Historical Fetch with Progress Bar)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -111,7 +111,6 @@ function renderStrategyControls() {
     <button id="fetchBSBtn" class="btn btn-primary" ${btnStyle} onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
     <button id="fetchHistoricalBtn" class="btn btn-outline" ${btnStyle} onclick="startHistoricalFetch()">📥 Fetch Historical</button>
     <button id="fetchEODBtn" class="btn btn-outline" ${btnStyle} onclick="startEODClosesFetch()">⚙️ Fetch EOD Closes</button>`;
-  // ✅ REMOVED: fetchPreopenBtn
 
   controls.innerHTML = `
     ${strategyButtons}
@@ -506,7 +505,7 @@ function updateLTPCells(ticks, vwaps, rsis) {
     const row = rowMap[token];
     if (!row) continue;
 
-       const ltpEl = row.querySelector('.ltp-cell');
+    const ltpEl = row.querySelector('.ltp-cell');
     if (ltpEl && ltpEl.textContent !== '₹' + (+price).toFixed(2)) {
       ltpEl.textContent = '₹' + (+price).toFixed(2);
     }
@@ -672,24 +671,22 @@ async function startEODClosesFetch() {
 }
 
 /* ============================================================
-   SECTION 5.6 — FETCH HISTORICAL (Background Process)
+   SECTION 5.6 — FETCH HISTORICAL (5-min only, with progress bar)
    ============================================================ */
 async function startHistoricalFetch() {
   const btn = document.getElementById('fetchHistoricalBtn');
   if (!btn) return;
   if (HISTORICAL_FETCHING) return;
 
-  const ok = confirm(
-    '📥 Fetch Historical (Angel REST)\n\n' +
-    'Ye background mein chalega (approx 20-25 minutes) taaki server timeout na ho.\n' +
-    'Aap progress check karne ke liye apna Node.js terminal (server console) dekhein.\n\n' +
-    'Continue?'
-  );
+  const ok = confirm('📥 Fetch Historical (5-min candles only)\n\nThis will run in the background and download only the 5-minute arrays to save database space. Continue?');
   if (!ok) return;
 
   HISTORICAL_FETCHING = true;
   btn.disabled = true;
-  btn.textContent = '⏳ Historical fetch... (Background)';
+  btn.textContent = '⏳ Fetching...';
+  
+  const pb = document.getElementById('progressBar');
+  if (pb) pb.style.display = 'block'; // Show progress bar
 
   try {
     const r = await fetch(API + '/api/admin/fetch-historical', {
@@ -698,25 +695,49 @@ async function startHistoricalFetch() {
       body: JSON.stringify({ days: 5 })
     });
     
-    // ✅ Safe JSON parsing
     let d = {};
     try { d = await r.json(); } catch(e) { d = { error: 'Server timeout or invalid response' }; }
 
     if (!r.ok) {
       showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
-    } else {
-      showToast('✅ Fetch Started', 'Background process running. Check Node.js terminal.');
+      HISTORICAL_FETCHING = false; 
+      btn.disabled = false; 
+      btn.textContent = '📥 Fetch Historical';
+      if (pb) pb.style.display = 'none';
+      return;
     }
+
+    showToast('✅ Fetch Started', 'Background process running. Watch progress bar.');
+
+    // Start polling progress every 2 seconds
+    const poll = setInterval(async () => {
+      try {
+        const pr = await fetch(API + '/api/admin/fetch-progress', {
+          headers: { Authorization: 'Bearer ' + getToken() }
+        }).then(res => res.json());
+
+        if (pr.running) {
+          updateProgress(pr.done, pr.total);
+          btn.textContent = `⏳ Fetching ${pr.current || ''} (${pr.done}/${pr.total})`;
+        } else {
+          clearInterval(poll);
+          HISTORICAL_FETCHING = false;
+          btn.disabled = false;
+          btn.textContent = '📥 Fetch Historical';
+          updateProgress(pr.total || 1, pr.total || 1); // 100%
+          showToast('🎉 Fetch Complete', 'All 5-min candles updated.');
+          setTimeout(() => { if (pb) pb.style.display = 'none'; }, 3000);
+        }
+      } catch (e) { console.error('Progress poll failed:', e); }
+    }, 2000);
+
   } catch (e) {
     showToast('⚠️ Network Error', 'Server is not reachable.');
-  }
-
-  // Button ko 15 sec baad wapas enable karein
-  setTimeout(() => {
-    HISTORICAL_FETCHING = false;
-    btn.disabled = false;
+    HISTORICAL_FETCHING = false; 
+    btn.disabled = false; 
     btn.textContent = '📥 Fetch Historical';
-  }, 15000); 
+    if (pb) pb.style.display = 'none';
+  }
 }
 
 function updateProgress(done, total) {

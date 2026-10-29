@@ -557,7 +557,7 @@ async function loadPrevWSClosesFromDB() {
        WHERE strategy_id='momentum' AND ws_1min_close IS NOT NULL
          AND array_length(ws_1min_close, 1) > 0
          AND token = ANY($1) AND date < $2
-         AND date >= CURRENT_DATE - 8
+         AND date >= CURRENT_DATE - 2
        ORDER BY date ASC`,
       [activeTokens, today]
     );

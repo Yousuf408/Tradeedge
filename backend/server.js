@@ -1023,7 +1023,7 @@ function broadcastLTP(token, ltp) {
     ssePendingRsi.clear();
     ssePendingPrevClose.clear();
     sseSend(payload);
-  }, 100);
+  }, 20);
 }
 
 function broadcastBS(fetchedAt) {

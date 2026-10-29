@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.43
+   server.js — TradeAlgo Pro backend  |  v5.44 (5-min Historical Fetch + Progress API)
    ============================================================ */
 
 // === GLOBAL ERROR HANDLERS (Prevents crashes) ===
@@ -79,7 +79,6 @@ const app = express();
 app.use(express.json());
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 
-// === UPDATED POOL CONFIG WITH ERROR HANDLER ===
 const db = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -90,7 +89,6 @@ const db = new pg.Pool({
   keepAliveInitialDelayMillis: 5000
 });
 
-// This prevents the app from crashing if the DB drops a connection
 db.on('error', (err) => {
   console.error('💥 DB pool error:', err.message);
 });
@@ -1589,12 +1587,17 @@ app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 7.2 — HISTORICAL BACKFILL
+   SECTION 7.2 — HISTORICAL BACKFILL (5-MIN ONLY)
    ============================================================ */
 const HISTORICAL_DAYS_DEFAULT = 5;
 const ANGEL_HISTORICAL_URL = 'https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData';
 let historicalRunning = false;
+let historicalProgress = { running: false, total: 0, done: 0, current: '' };
 const historicalFailed = new Set();
+
+app.get('/api/admin/fetch-progress', auth, (req, res) => {
+  res.json(historicalProgress);
+});
 
 async function getAnyAngelJwt() {
   if (getSessionStatusREST()?.loggedIn && getJwtREST?.()) return getJwtREST();
@@ -1719,37 +1722,29 @@ async function backfillOneStock(stock, daysBack) {
   const sym = stock.sym;
   const token = String(stock.token);
 
-  const raw1m = await fetchAngelInterval(token, 'ONE_MINUTE', daysBack);
-  const by1m = fillMissingMinutes(groupCandlesByDate(raw1m), 1, 555, 929);
-
-  await new Promise(r => setTimeout(r, 400));
+  // ONLY fetch 5-minute interval now
   const raw5m = await fetchAngelInterval(token, 'FIVE_MINUTE', daysBack);
   const by5m = fillMissingMinutes(groupCandlesByDate(raw5m, 4), 5, 559, 929);
 
-  const dates = Object.keys(by1m).sort().slice(-daysBack);
+  const dates = Object.keys(by5m).sort().slice(-daysBack);
   let saved = 0;
 
   for (const date of dates) {
-    const d1 = by1m[date];
-    const d5 = by5m[date] || { closes: [], ts: [], vols: [] };
-    if (d1.closes.length < 20) continue;
+    const d5 = by5m[date];
+    if (!d5 || d5.closes.length < 15) continue; // Need at least 15 5-min candles for RSI
 
-    const rsi = computeRSIWilder(d1.closes);
+    // Calculate RSI from 5-minute closes
+    const rsi = computeRSIWilder(d5.closes);
 
     await db.query(
       `INSERT INTO strategy_bs_snapshot
          (date, sym, token, strategy_id,
-          ws_1min_close, ws_1min_ts, ws_1min_volume,
           ws_5min_close, ws_5min_ts, ws_5min_volume,
           rsi, fetched_at)
        VALUES ($1, $2, $3, 'momentum',
                $4::numeric[], $5::timestamptz[], $6::numeric[],
-               $7::numeric[], $8::timestamptz[], $9::numeric[],
-               $10, NOW())
+               $7, NOW())
        ON CONFLICT (date, token, strategy_id) DO UPDATE SET
-         ws_1min_close  = EXCLUDED.ws_1min_close,
-         ws_1min_ts     = EXCLUDED.ws_1min_ts,
-         ws_1min_volume = EXCLUDED.ws_1min_volume,
          ws_5min_close  = EXCLUDED.ws_5min_close,
          ws_5min_ts     = EXCLUDED.ws_5min_ts,
          ws_5min_volume = EXCLUDED.ws_5min_volume,
@@ -1757,7 +1752,6 @@ async function backfillOneStock(stock, daysBack) {
          fetched_at     = NOW()`,
       [
         date, sym, token,
-        d1.closes, d1.ts, d1.vols,
         d5.closes, d5.ts, d5.vols,
         rsi != null ? +rsi.toFixed(2) : null
       ]
@@ -1802,7 +1796,9 @@ async function processHistoricalFetch(body) {
   if (!retryOnly) historicalFailed.clear();
   queue.sort((a, b) => String(a.sym).localeCompare(String(b.sym)));
   
-  console.log(`📥 Historical start: ${queue.length} stocks (${retryOnly ? 'retry-failed only' : 'full run'}) | window=${days} working days`);
+  historicalProgress = { running: true, total: queue.length, done: 0, current: '' };
+  
+  console.log(`📥 Historical start: ${queue.length} stocks (${retryOnly ? 'retry-failed only' : 'full run'}) | window=${days} working days | 5-MIN ONLY`);
   let processed = 0;
 
   try {
@@ -1815,6 +1811,7 @@ async function processHistoricalFetch(body) {
 
     while (queue.length) {
       const stock = queue.shift();
+      historicalProgress.current = stock.sym;
 
       if (!getSessionStatusREST()?.loggedIn) {
         try {
@@ -1883,7 +1880,10 @@ async function processHistoricalFetch(body) {
           }
         }
       }
+      
       processed++;
+      historicalProgress.done = processed;
+
       if (processed % 25 === 0) {
         console.log(`📥 Historical: ${processed}/${STOCKS.length} | ok=${summary.ok} fail=${summary.failed}`);
       }
@@ -1913,6 +1913,7 @@ async function processHistoricalFetch(body) {
     console.error('Historical fetch error:', e);
   } finally {
     historicalRunning = false;
+    historicalProgress.running = false;
     try {
       if (lockClient) {
         await lockClient.query('SELECT pg_advisory_unlock(7451)').catch(() => {});
@@ -2491,8 +2492,8 @@ function scheduleDailyHistorical() {
     const ist = getIST();
     if (isTradingDay(ist) && !historicalRunning) {
       historicalRunning = true;
-      console.log('📥 Scheduled 4 PM historical fetch starting (alphabetical order, 5-day window)');
-      processHistoricalFetch({ days: HISTORICAL_DAYS_DEFAULT, all: true })
+      console.log('📥 Scheduled 4 PM historical fetch starting (alphabetical order, 5-day window, 5-min only)');
+      processHistoricalFetch({ days: HISTORICAL_DAYS_DEFAULT })
         .catch(e => { console.error('🛑 Scheduled historical error:', e.message); historicalRunning = false; });
     } else {
       console.log('⏭️ 4 PM historical skipped (weekend/holiday or a run is already in progress)');

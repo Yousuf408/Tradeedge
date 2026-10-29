@@ -506,8 +506,10 @@ function updateLTPCells(ticks, vwaps, rsis) {
     const row = rowMap[token];
     if (!row) continue;
 
-    const ltpEl = row.querySelector('.ltp-cell');
-    if (ltpEl) ltpEl.textContent = '₹' + (+price).toFixed(2);
+       const ltpEl = row.querySelector('.ltp-cell');
+    if (ltpEl && ltpEl.textContent !== '₹' + (+price).toFixed(2)) {
+      ltpEl.textContent = '₹' + (+price).toFixed(2);
+    }
 
     const chgEl = row.querySelector('.change-cell');
     if (chgEl) {

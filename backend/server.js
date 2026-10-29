@@ -1,38 +1,5 @@
 /* ============================================================
    server.js — TradeAlgo Pro backend  |  v5.43 (4 PM auto-historical + EOD breadth + fast safe backfill)
-   ============================================================
-   CHANGES vs v5.42 (nothing else touched):
-   11. Volume + RVOL now survive after market close (ltp route + SSE fallback
-       to WS minute-volume sums; 15:31 HLC can no longer zero the volume).
-   12. Backfill speed: per-stock pause 5000→1500ms, 1m→5m gap 1200→400ms
-       (~50 min → ~22 min; pace ≈0.6 req/s vs Angel cap ~3 req/s = safe).
-   13. Auto historical fetch scheduled daily at 16:00 IST (trading days only,
-       skips if a run is in progress) + queue processed in ALPHABETICAL order.
-   14. Market breadth (Adv/Dec) now served on page-load too (/api/screener/ltp
-       returns breadth) + computed once at startup → ticker keeps showing
-       Adv/Dec after market close and after restarts.
-   CHANGES vs v5.41 (nothing else touched):
-   8. Angel_REST is now the ONLY login in the app (Quote/BS borrow its token).
-      server.js imports forceRelogin for the backfill's session recovery.
-   9. Historical backfill now CLASSIFIES refusals:
-      - AB1010/session dead → force re-login once → retry once → else stop.
-      - AB1021/429/403 rate  → wait 60s → ONE retry (2nd & last attempt) →
-        still limited = STOP the run immediately (leftover stocks resume on
-        the next manual run). Max 2 attempts per stock, never a retry loop.
-   10. Every refusal now logs Angel's exact message + error code.
-   CHANGES vs v5.40 (nothing else touched):
-   1. getAnyAngelJwt() → async; re-logins when the session dies; ANGEL_JWT env kept
-      only as an emergency spare (never the main path).
-   2. 401/403/429 + "too many requests" are now all treated as fatal → the backfill
-      queue STOPS instead of retrying into the rate-limit wall.
-   3. Pause between the 1-minute and 5-minute historical calls: 400ms → 1200ms.
-   4. Mid-run session guard: re-login if the session dies + scheduled re-login
-      every 100 stocks.
-   5. stopDepthWS() was called but never imported → now called safely via a
-      namespace import (no crash if Angel_Depth.js doesn't export it).
-   6. Advisory lock is now session-level and held for the whole run
-      (the old pg_try_advisory_xact_lock died with the ROLLBACK → protected nothing).
-   7. HISTORICAL_DAYS_DEFAULT: 10 → 5 (last 5 working days).
    ============================================================ */
 
 import express from 'express';
@@ -75,7 +42,6 @@ import {
 
 import { startWS, stopWS, getWSStatus } from './brokers/angelone/Angel_WS.js';
 import { startDepthWS, resubscribeDepth, getDepthStatus } from './brokers/angelone/Angel_Depth.js';
-// CHANGE 5: namespace import so we can call stopDepthWS() safely if it exists
 import * as AngelDepth from './brokers/angelone/Angel_Depth.js';
 
 import {
@@ -105,10 +71,12 @@ const app = express();
 app.use(express.json());
 app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
 
+// === CHANGE 1: pool timeouts + max 10 (was max:20, no connect timeout) ===
 const db = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 20,
+  max: 10,
+  connectionTimeoutMillis: 15000,
   idleTimeoutMillis: 30000
 });
 
@@ -211,7 +179,7 @@ const prevCloseCache = new Map();
 const prevHighCache = new Map();
 const prevLowCache = new Map();
 const avgVolume5D = new Map();
-const lastEodVolume = new Map();   // v5.43: last known EOD volume per token (pre-market fallback)
+const lastEodVolume = new Map();
 
 async function loadLastEodVolumeFromDB() {
   try {
@@ -233,7 +201,6 @@ async function loadPrevCloseFromDB() {
     const activeTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
     const latestDate = getIST().toISOString().split('T')[0];
 
-    // 1. Fetch from DB
     const { rows } = await db.query(
       `SELECT DISTINCT ON (token) token, prev_close
        FROM strategy_bs_snapshot
@@ -247,11 +214,9 @@ async function loadPrevCloseFromDB() {
     for (const r of rows) prevCloseCache.set(String(r.token), +r.prev_close);
     console.log(`💾 prevClose (BS source): ${rows.length} tokens`);
 
-    // 2. ✅ FALLBACK: Fetch from Quote API if DB is empty (e.g., 9:15 AM)
     if (rows.length < activeTokens.length) {
       console.log(`🔄 Fetching prevClose via Quote API fallback for missing tokens...`);
       const missingTokens = activeTokens.filter(t => !prevCloseCache.has(String(t)));
-      
       try {
         const quotes = await fetchQuotesForTokens(missingTokens);
         if (quotes && quotes.length > 0) {
@@ -272,7 +237,6 @@ async function loadPrevCloseFromDB() {
       }
     }
 
-    // 3. Load PDH/PDL
     const prevDate = getPreviousTradingDay(getIST());
     const { rows: hlRows } = await db.query(
       `SELECT token, day_high, day_low
@@ -568,6 +532,7 @@ async function recomputeAllRSI(date) {
   } catch (e) { console.error('recomputeAllRSI failed:', e.message); }
 }
 
+// === CHANGE 2: added `AND date >= CURRENT_DATE - 8` ===
 async function loadPrevWSClosesFromDB() {
   try {
     const activeTokens = STOCKS.map(s => String(s.token));
@@ -578,6 +543,7 @@ async function loadPrevWSClosesFromDB() {
        WHERE strategy_id='momentum' AND ws_1min_close IS NOT NULL
          AND array_length(ws_1min_close, 1) > 0
          AND token = ANY($1) AND date < $2
+         AND date >= CURRENT_DATE - 8
        ORDER BY date ASC`,
       [activeTokens, today]
     );
@@ -720,6 +686,7 @@ async function updateRSIFromWS(date, prevKey) {
   } catch (e) { console.error('WS RSI update failed:', e.message); }
 }
 
+// === CHANGE 3: added `AND date >= CURRENT_DATE - 8` ===
 async function recomputeRSIFromWS(date) {
   try {
     const activeTokens = STOCKS.map(s => String(s.token));
@@ -728,6 +695,7 @@ async function recomputeRSIFromWS(date) {
        WHERE strategy_id='momentum' AND ws_1min_close IS NOT NULL
          AND array_length(ws_1min_close, 1) > 0
          AND token = ANY($1) AND date < $2
+         AND date >= CURRENT_DATE - 8
        ORDER BY date ASC`,
       [activeTokens, date]
     );
@@ -805,7 +773,7 @@ const minVolRing = new Map();
 let wsMinuteKey = null;
 
 async function flushWSMinuteClose(prevKey, prevTs, date) {
-  const tokens = [], closes = [], minVols = [], minRvols = []; // ✅ Store RVOLs
+  const tokens = [], closes = [], minVols = [], minRvols = [];
   
   for (const s of STOCKS) {
     const token = String(s.token);
@@ -814,7 +782,6 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     if (close == null) close = bsCache.get(token)?.ltp ?? null;
     if (!Number.isFinite(close) || close <= 0) continue;
 
-    // 1. Calculate Minute Volume Delta
     const cumRaw = lastWsVolume.get(token) ?? bsCache.get(token)?.volume ?? null;
     const cum = (cumRaw != null && cumRaw > 0) ? cumRaw : null;
     const prev = prevCumVol.get(token) ?? null;
@@ -822,7 +789,6 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     if (cum != null && prev != null && cum >= prev) mv = cum - prev;
     if (cum != null) prevCumVol.set(token, cum);
 
-    // 2. Calculate Exact RVOL using Cumulative Volume
     const histAvg = avgVolume5D.get(token) || 0;
     const officialCumVol = cum || bsCache.get(token)?.volume || 0;
     const rvol = histAvg > 0 ? +(officialCumVol / histAvg).toFixed(2) : 0;
@@ -830,7 +796,7 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     tokens.push(token);
     closes.push(close);
     minVols.push(mv);
-    minRvols.push(rvol); // ✅ Push exact RVOL
+    minRvols.push(rvol);
 
     const ring = minVolRing.get(token) || [];
     ring.push(mv);
@@ -850,7 +816,7 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
            ws_1min_ts     = COALESCE(s.ws_1min_ts,     ARRAY[]::timestamptz[]) || v.t,
            ws_1min_volume = COALESCE(s.ws_1min_volume, ARRAY[]::numeric[]) || v.vol,
            ws_1min_vwap   = COALESCE(s.ws_1min_vwap,   ARRAY[]::numeric[]) || v.w,
-           ws_1min_rvol   = COALESCE(s.ws_1min_rvol,   ARRAY[]::numeric[]) || v.rvol -- ✅ RVOL Update
+           ws_1min_rvol   = COALESCE(s.ws_1min_rvol,   ARRAY[]::numeric[]) || v.rvol
        FROM unnest($1::text[], $2::numeric[], $3::timestamptz[], $4::numeric[], $5::numeric[], $6::numeric[]) AS v(token, c, t, vol, w, rvol)
        WHERE s.date = $7 AND s.token = v.token AND s.strategy_id = 'momentum'`,
       [tokens, closes, tss, minVols, vwaps, minRvols, date]
@@ -876,13 +842,11 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
       va.push(minVols[i]);
       wsTodayVols.set(tk, va);
 
-      // ✅ Track Highs/Lows
       const h = currentMinHighs.get(tk) ?? closes[i];
       const l = currentMinLows.get(tk) ?? closes[i];
       const arrH = wsTodayHighs.get(tk) || []; arrH.push(h); wsTodayHighs.set(tk, arrH);
       const arrL = wsTodayLows.get(tk) || []; arrL.push(l); wsTodayLows.set(tk, arrL);
       
-      // v5.43: feed the closed 1-min candle to the VC engine (candle open = prev close; day-open for 1st candle)
       const cOpen = i > 0 ? closes[i - 1] : (bsCache.get(tk)?.dayOpen ?? closes[i]);
       vcOnMinuteCandle(tk, { high: h, low: l, close: closes[i], open: cOpen, minuteKey: prevKey });
 
@@ -1092,7 +1056,6 @@ function broadcastChip() {
   sseSend(`data: ${JSON.stringify({ type: 'chip', chips: [...chipList.values()] })}\n\n`);
 }
 
-// v5.43: push VC watchlist/setup state to screener (badge + chip)
 function broadcastVC() {
   if (!sseClients.size) return;
   sseSend(`data: ${JSON.stringify({ type: 'vc', vc: getVCStatus() })}\n\n`);
@@ -1102,7 +1065,6 @@ function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
   
   const tk = String(token);
-  // ✅ Update current minute Highs/Lows
   if (!currentMinHighs.has(tk) || ltp > currentMinHighs.get(tk)) currentMinHighs.set(tk, ltp);
   if (!currentMinLows.has(tk) || ltp < currentMinLows.get(tk)) currentMinLows.set(tk, ltp);
 
@@ -1276,9 +1238,6 @@ function startDepthLive(feedToken) {
       if (!st.connected || silentMs > 90000) {
         depthRestarts++;
         console.warn(`🧿 Depth WATCHDOG: restart #${depthRestarts} (connected=${st.connected}, silent=${Math.round(silentMs / 1000)}s)`);
-        // CHANGE 5: stopDepthWS was never imported in v5.40 → ReferenceError swallowed
-        // by the try{}. Now called safely; if Angel_Depth.js doesn't export it we
-        // log a warning and behave exactly like before (no crash).
         try {
           if (typeof AngelDepth.stopDepthWS === 'function') AngelDepth.stopDepthWS();
           else console.warn('🧿 stopDepthWS not exported by Angel_Depth.js — skipping clean stop');
@@ -1367,7 +1326,6 @@ app.get('/api/screener/data', auth, (req, res) => {
   });
 });
 
-// v5.43: VC watchlist + live setup state for screener badge/chip
 app.get('/api/screener/vc', auth, (req, res) => {
   res.json({ ok: true, ...getVCStatus() });
 });
@@ -1441,7 +1399,6 @@ app.get('/api/auto/positions', auth, async (req, res) => {
     const date = req.query.date || getIST().toISOString().split('T')[0];
     const uid = req.user?.id || req.user?.username || 'admin';
     
-    // ✅ FIX: Removed t1, t2 from query
     const { rows } = await db.query(
       `SELECT date::text AS date, token, sym, qty, entry, sl, stage, peak, side,
               status, exit_price, exit_reason, entry_at, exit_at
@@ -1459,7 +1416,7 @@ app.get('/api/auto/positions', auth, async (req, res) => {
       const pnlPct = +(((pnl / (r.entry * r.qty)) * 100)).toFixed(2);
       return {
         date: r.date, token: String(r.token), sym: r.sym, qty: +r.qty, side: r.side || 'BUY',
-        entry: +r.entry, sl: +r.sl, t1: null, t2: null, // ✅ FIX: Null values for UI
+        entry: +r.entry, sl: +r.sl, t1: null, t2: null,
         stage: lp ? lp.stage : +r.stage,
         slLive: lp ? lp.sl : +r.sl,
         peak: lp ? lp.peak : (r.peak != null ? +r.peak : null),
@@ -1624,15 +1581,11 @@ app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
 /* ============================================================
    SECTION 7.2 — HISTORICAL BACKFILL
    ============================================================ */
-// CHANGE 7: last 5 working days instead of 10 (≈60% less data per request)
 const HISTORICAL_DAYS_DEFAULT = 5;
 const ANGEL_HISTORICAL_URL = 'https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData';
 let historicalRunning = false;
 const historicalFailed = new Set();
 
-// CHANGE 1: async + auto re-login. The live session token is always preferred;
-// a fresh login happens if the session died; ANGEL_JWT from .env stays ONLY as
-// an emergency spare (last resort), never the main path.
 async function getAnyAngelJwt() {
   if (getSessionStatusREST()?.loggedIn && getJwtREST?.()) return getJwtREST();
   try {
@@ -1675,7 +1628,6 @@ async function fetchAngelInterval(token, interval, daysBack) {
         todate: `${toDate} 15:30`
       })
     });
-    // v5.42: 401/403/429 = refusal; capture Angel's exact code+message for logs & classification
     if (r.status === 401 || r.status === 403 || r.status === 429) {
       let m = `HTTP ${r.status}`;
       try {
@@ -1760,7 +1712,6 @@ async function backfillOneStock(stock, daysBack) {
   const raw1m = await fetchAngelInterval(token, 'ONE_MINUTE', daysBack);
   const by1m = fillMissingMinutes(groupCandlesByDate(raw1m), 1, 555, 929);
 
-  // v5.43: original 400ms gap between 1m and 5m calls (safe at this pace)
   await new Promise(r => setTimeout(r, 400));
   const raw5m = await fetchAngelInterval(token, 'FIVE_MINUTE', daysBack);
   const by5m = fillMissingMinutes(groupCandlesByDate(raw5m, 4), 5, 559, 929);
@@ -1806,7 +1757,6 @@ async function backfillOneStock(stock, daysBack) {
   return { sym, days_saved: saved, dates };
 }
 
-// v5.42: classify Angel's refusals (messages now carry the exact AB code)
 const sleepMs = ms => new Promise(r => setTimeout(r, ms));
 const isSessionError = e => /401|ab1010|invalid session|session.{0,20}expired|please re-?login/i.test(e?.message || '');
 const isRateError = e => /429|ab1021|too many requests|rate limit/i.test(e?.message || '');
@@ -1815,9 +1765,6 @@ async function processHistoricalFetch(body) {
   let lockClient = null;
   try {
     lockClient = await db.connect();
-    // CHANGE 6: session-level lock held for the WHOLE run.
-    // (v5.40 used pg_try_advisory_xact_lock inside a BEGIN that was never
-    //  committed → the lock died with the final ROLLBACK → protected nothing.)
     const lk = await lockClient.query('SELECT pg_try_advisory_lock(7451) AS got');
     if (!lk.rows[0]?.got) {
       lockClient.release();
@@ -1837,13 +1784,13 @@ async function processHistoricalFetch(body) {
   const summary = { ok: 0, failed: 0, skipped: 0, days_saved: 0, total: STOCKS.length };
   const errors = [];
 
-  const DELAY_MS = 1500;   // v5.43: was 5000 — total pace ≈0.6 req/s, well under Angel's ~3 req/s cap
+  const DELAY_MS = 1500;
   const retryOnly = body?.all !== true && historicalFailed.size > 0;
   const queue = retryOnly
     ? STOCKS.filter(s => historicalFailed.has(String(s.token)))
     : [...STOCKS];
   if (!retryOnly) historicalFailed.clear();
-  queue.sort((a, b) => String(a.sym).localeCompare(String(b.sym)));   // v5.43: alphabetical progress
+  queue.sort((a, b) => String(a.sym).localeCompare(String(b.sym)));
   
   console.log(`📥 Historical start: ${queue.length} stocks (${retryOnly ? 'retry-failed only' : 'full run'}) | window=${days} working days`);
   let processed = 0;
@@ -1859,14 +1806,12 @@ async function processHistoricalFetch(body) {
     while (queue.length) {
       const stock = queue.shift();
 
-      // CHANGE 4a: if the session died, bring it back BEFORE the next stock
       if (!getSessionStatusREST()?.loggedIn) {
         try {
           await loginREST();
           console.log('🔑 Session refreshed mid-run (token had died)');
         } catch (e) { console.error('🔑 Mid-run re-login failed:', e.message); }
       }
-      // CHANGE 4b: belt & braces — full re-login every 100 stocks
       if (processed > 0 && processed % 100 === 0) {
         try {
           await loginREST();
@@ -1884,7 +1829,6 @@ async function processHistoricalFetch(body) {
         }
         historicalFailed.delete(String(stock.token));
       } catch (e) {
-        // v5.42 BRANCH 1 — SESSION dead: force re-login once, retry once, else stop
         if (isSessionError(e)) {
           console.error(`🔑 Session error on ${stock.sym}: ${e.message} — forcing shared re-login`);
           try { await forceReloginREST(); } catch (le) { console.error('🔑 Re-login failed:', le.message); }
@@ -1896,13 +1840,10 @@ async function processHistoricalFetch(body) {
           } catch (e2) {
             console.error(`🛑 Session still dead after re-login (${e2.message}). Stopping historical fetch.`);
             historicalFailed.add(String(stock.token));
-            for (const s of queue) historicalFailed.add(String(s.token));   // v5.42: leftovers resume next run
+            for (const s of queue) historicalFailed.add(String(s.token));
             break;
           }
         }
-        // v5.42 BRANCH 2 — RATE limit (AB1021/429/plain 403):
-        // wait 60s → ONE retry (2nd & last attempt) → still limited = STOP RUN
-        // (protects the API key; leftover stocks resume on the next manual run)
         else if (isRateError(e) || /403/.test(e?.message || '')) {
           console.warn(`⛔ Rate-limit on ${stock.sym}: ${e.message} — waiting 60s, then 1 retry (2nd & last attempt)`);
           await sleepMs(60000);
@@ -1914,11 +1855,10 @@ async function processHistoricalFetch(body) {
           } catch (e2) {
             console.error(`🛑 Rate-limit again on ${stock.sym}: ${e2.message} — STOPPING run to protect the API key. Leftover stocks resume next run.`);
             historicalFailed.add(String(stock.token));
-            for (const s of queue) historicalFailed.add(String(s.token));   // v5.42: leftovers resume next run
+            for (const s of queue) historicalFailed.add(String(s.token));
             break;
           }
         }
-        // v5.42 BRANCH 3 — any other error: original gentle retry
         else {
           await new Promise(r => setTimeout(r, 5000));
           try {
@@ -1963,7 +1903,6 @@ async function processHistoricalFetch(body) {
     console.error('Historical fetch error:', e);
   } finally {
     historicalRunning = false;
-    // CHANGE 6: release the session lock properly when the run ends
     try {
       if (lockClient) {
         await lockClient.query('SELECT pg_advisory_unlock(7451)').catch(() => {});
@@ -2011,7 +1950,7 @@ async function fetchDayHLC() {
 
       const token = String(q.token);
       const close = q.ltp || q.close;
-      const vol = q.volume || 0; // ✅ Full Day EOD Volume
+      const vol = q.volume || 0;
       const sym = SYM_BY_TOKEN[token] || INDEX_SYMS[token] || '?';
 
       setCachedLTP(token, close);
@@ -2302,7 +2241,6 @@ async function buildChipList(date) {
 }
 
 
-// v5.43: shared users builder (old scan + VC engine both use it)
 async function buildAutoUsers() {
   const { rows: dbUsers } = await db.query(`SELECT id, username, side_mode FROM users`);
   const users = [...userCapital.entries()].map(([userId, capital]) => {
@@ -2519,9 +2457,6 @@ function scheduleFinalFlush() {
   }, ms);
 }
 
-// v5.43: which day's candles should the VC watchlist use?
-// Before 15:35 → last completed trading day (today still forming).
-// From 15:35 onwards → today itself (candles final) = next day's candidates.
 function getVCWatchDate() {
   const ist = getIST();
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
@@ -2539,7 +2474,6 @@ function scheduleVCWatchReload() {
   }, ms);
 }
 
-// v5.43: daily 4 PM IST auto historical fetch (trading days only)
 function scheduleDailyHistorical() {
   const ms = msUntil(16, 0);
   console.log(`⏰ Next auto-historical (4 PM) in ${Math.round(ms / 60000)} min`);
@@ -2575,8 +2509,8 @@ function scheduleMorningPreload() {
     seedRSIStateFromMemory();
     const today = getIST().toISOString().split('T')[0];
     await recomputeAllRSI(today);
-    await loadVCWatchlist(today, getVCWatchDate());      // v5.43: fresh sideways watchlist for the new day
-    await rebuildVCState(today);       // v5.43
+    await loadVCWatchlist(today, getVCWatchDate());
+    await rebuildVCState(today);
     scheduleMorningPreload();
   }, ms);
 }
@@ -2612,14 +2546,14 @@ app.listen(PORT, async () => {
   await loadHolidaysFromDB();
   await loadPrevCloseFromDB();
   await loadAvgVolumeFromDB(); 
-  await loadLastEodVolumeFromDB();   // v5.43: pre-market volume fallback
+  await loadLastEodVolumeFromDB();
   await loadBSCacheFromDB();
   await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();
   await loadChipListFromDB(getIST().toISOString().split('T')[0]);
   await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
   computeBuyersGroups();
-  updateMarketBreadth();   // v5.43: EOD breadth ready for page-loads after market hours
+  updateMarketBreadth();
 
   try {
     const quotes = await fetchQuotesForTokens(INDEX_TOKENS);
@@ -2651,8 +2585,8 @@ app.listen(PORT, async () => {
     onVCChange: () => broadcastVC()
   });
   await loadOpenPositions(getIST().toISOString().split('T')[0]);
-  await loadVCWatchlist(getIST().toISOString().split('T')[0], getVCWatchDate());      // v5.43
-  await rebuildVCState(getIST().toISOString().split('T')[0]);       // v5.43
+  await loadVCWatchlist(getIST().toISOString().split('T')[0], getVCWatchDate());
+  await rebuildVCState(getIST().toISOString().split('T')[0]);
   
   await loadPrevWSClosesFromDB();
   await loadTodayWSClosesFromDB();

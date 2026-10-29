@@ -15,10 +15,12 @@ const API = window.TRADEALGO_API || (() => {
   if (h === 'localhost' || h === '127.0.0.1' || h.endsWith('.local')) {
     return 'http://localhost:3000';
   }
-  return 'https://tradeedge-a5y0.onrender.com';
+  // Fixed: Use current VPS domain instead of Render
+  return window.location.origin; 
 })();
 
-const APP_URL = 'https://yousuf408.github.io/Tradeedge/frontend/';
+// Fixed: Use VPS URL for WhatsApp sharing
+const APP_URL = window.location.origin + '/';
 const GREEN = 'var(--success)';
 const RED = 'var(--danger)';
 
@@ -409,7 +411,7 @@ async function doLogin() {
       username: r.username,
       name: r.name,
       needsSetup: r.needsSetup,
-      totpEnabled: r.totpEnabled, // NAYA
+      totpEnabled: r.totpEnabled, 
       newSecret: null
     };
 

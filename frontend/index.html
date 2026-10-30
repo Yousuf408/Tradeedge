@@ -212,6 +212,7 @@
   <ul class="nav-links">
     <li><a class="active" data-page="screener">🔍 Screener</a></li>
     <li><a data-page="orders">📋 Orders</a></li>
+    <li><a data-page="ai">🧠 AI Picks</a></li>
     <li class="admin-only" style="display:none"><a data-page="users">👥 Users</a></li>
     <li><a data-page="settings">⚙️ Settings</a></li>
   </ul>
@@ -246,11 +247,10 @@
 </nav>
 
 <!-- ============================================================
-     SECTION 4.1 — MARKET TICKER (NEW)
+     SECTION 4.1 — MARKET TICKER
      ============================================================ -->
 <div class="ticker-wrap">
   <div class="ticker" id="tickerContent">
-    <!-- Data will be injected via JS (screener.js) -->
     <div class="ticker-item">Loading market data...</div>
   </div>
 </div>
@@ -265,7 +265,6 @@
   <div id="page-screener" class="page active">
     <div class="panel-glass">
       <div class="panel-head">
-        <!-- OLD NIFTY HEADER REMOVED FROM HERE -->
         <div class="screener-controls">
           <label>Strategy:</label>
           <select id="strategySelect" onchange="onStrategyChange()">
@@ -311,6 +310,18 @@
     <div id="ordersStats" style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 10px 0;"></div>
     <div class="panel-glass">
       <div class="panel-body table-wrap" id="ordersTable" style="padding: 10px;"></div>
+    </div>
+  </div>
+
+  <!-- 5.2 — AI PICKS -->
+  <div id="page-ai" class="page" style="padding-top: 0;">
+    <div class="panel-glass">
+      <div class="panel-head">
+        <h3>🧠 AI Institutional Setups (Today)</h3>
+      </div>
+      <div class="panel-body table-wrap" id="aiTable" style="padding: 10px;">
+        <div style="text-align:center;padding:40px;color:var(--text-muted)">Loading AI Plans...</div>
+      </div>
     </div>
   </div>
 
@@ -663,9 +674,9 @@ Rahul Verma,9876543212,5d"></textarea>
      SECTION 8 — SCRIPTS
      ============================================================ -->
 <script src="admin.js"></script>
-<script src="screener.js?v=20261026"></script>
-<script src="orders.js?v=20261026"></script>
-<script src="app.js?v=20261014"></script>
+<script src="screener.js?v=20261030"></script>
+<script src="orders.js?v=20261030"></script>
+<script src="app.js?v=20261030"></script>
 
 </body>
 </html>

@@ -192,6 +192,7 @@ function navigateTo(pageId) {
 
   if (pageId === 'portfolio' && typeof loadPortfolio === 'function') loadPortfolio();
   if (pageId === 'screener' && typeof initScreener === 'function') initScreener();
+  if (pageId === 'ai' && typeof renderAIPlans === 'function') renderAIPlans(); 
   if (pageId === 'settings') loadProfileForm();
   if (pageId === 'users' && currentUser?.role === 'admin' && !impersonating) {
     renderKPIs();

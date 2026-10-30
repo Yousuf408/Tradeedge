@@ -1350,6 +1350,12 @@ app.get('/api/screener/chips', auth, (req, res) => {
   }));
   res.json({ ok: true, date: chipDate, locked: chipDate != null, chips });
 });
+app.get('/api/ai-plans', auth, async (req, res) => {
+  try {
+    const { rows } = await db.query(`SELECT * FROM ai_trade_plans WHERE date = CURRENT_DATE ORDER BY sym`);
+    res.json({ ok: true, plans: rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get('/api/tv-rsi/:sym', auth, async (req, res) => {
   const symbol = req.params.sym;

@@ -1073,3 +1073,58 @@ function setPill(text, color) {
   pill.textContent = text;
   pill.style.color = color || 'var(--text-muted)';
 }
+
+/* ============================================================
+   SECTION 11 — AI PICKS TAB RENDERER
+   ============================================================ */
+async function renderAIPlans() {
+  const wrap = document.getElementById('aiTable');
+  if (!wrap) return;
+  
+  wrap.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">Loading AI Plans...</div>';
+
+  try {
+    const r = await fetch(API + '/api/ai-plans', {
+      headers: { Authorization: 'Bearer ' + getToken() }
+    });
+    const d = await r.json();
+    
+    if (!d.plans || !d.plans.length) {
+      wrap.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">No AI plans generated yet for today.<br><span style="font-size:12px">The AI runs automatically at 4:30 PM for the next day.</span></div>';
+      return;
+    }
+
+    const rows = d.plans.map(p => `
+      <tr style="border-bottom:1px solid var(--border-soft);">
+        <td style="padding:10px;"><strong>${p.sym}</strong></td>
+        <td style="padding:10px;color:var(--success);font-weight:700">${p.buy_trigger ? '₹' + p.buy_trigger : '—'}</td>
+        <td style="padding:10px;color:var(--danger)">${p.buy_sl ? '₹' + p.buy_sl : '—'}</td>
+        <td style="padding:10px;color:var(--success)">${p.buy_t1 ? '₹' + p.buy_t1 : '—'} <br><span style="font-size:10px;color:var(--text-muted)">T2: ${p.buy_t2 ? '₹' + p.buy_t2 : '—'}</span></td>
+        <td style="padding:10px;color:var(--danger);font-weight:700">${p.sell_trigger ? '₹' + p.sell_trigger : '—'}</td>
+        <td style="padding:10px;color:var(--danger)">${p.sell_sl ? '₹' + p.sell_sl : '—'}</td>
+        <td style="padding:10px;color:var(--danger)">${p.sell_t1 ? '₹' + p.sell_t1 : '—'} <br><span style="font-size:10px;color:var(--text-muted)">T2: ${p.sell_t2 ? '₹' + p.sell_t2 : '—'}</span></td>
+        <td style="padding:10px;font-size:11px;color:var(--text-muted);max-width:300px;white-space:normal;">${p.reasoning || ''}</td>
+      </tr>
+    `).join('');
+
+    wrap.innerHTML = `
+      <table class="table-modern" style="width:100%; text-align:left; border-collapse:collapse;">
+        <thead>
+          <tr style="border-bottom:2px solid var(--border-soft);">
+            <th style="padding:10px;font-size:11px;">STOCK</th>
+            <th style="padding:10px;font-size:11px;">BUY TRIGGER</th>
+            <th style="padding:10px;font-size:11px;">BUY SL</th>
+            <th style="padding:10px;font-size:11px;">BUY T1 / T2</th>
+            <th style="padding:10px;font-size:11px;">SELL TRIGGER</th>
+            <th style="padding:10px;font-size:11px;">SELL SL</th>
+            <th style="padding:10px;font-size:11px;">SELL T1 / T2</th>
+            <th style="padding:10px;font-size:11px;">AI REASONING</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+  } catch (e) {
+    wrap.innerHTML = `<div style="color:var(--danger);padding:20px;">Error loading AI plans: ${e.message}</div>`;
+  }
+}

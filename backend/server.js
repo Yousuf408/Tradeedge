@@ -58,6 +58,7 @@ import {
 } from './autoTrader.js';
 
 import { registerAdminRoutes } from './admin.js';
+import { generateAIPlan } from './aiAnalyzer.js';
 
 import {
   initMarginService,
@@ -2507,6 +2508,90 @@ function scheduleDailyHistorical() {
     scheduleDailyHistorical();
   }, ms);
 }
+// ============================================================
+// AI POST-MARKET ANALYSIS (4:30 PM)
+// ============================================================
+async function runAIPostMarket() {
+  if (!isTradingDay(getIST())) return;
+  console.log('🧠 AI Engine: Starting Post-Market analysis for tomorrow...');
+  
+  const queue = [...STOCKS]; 
+  let processed = 0;
+
+  for (const stock of queue) {
+    const sym = stock.sym;
+    const token = String(stock.token);
+
+    try {
+      await generateAIPlan(db, token, sym);
+    } catch (e) {
+      console.error(`❌ AI Engine error for ${sym}:`, e.message);
+    }
+    
+    processed++;
+    if (processed % 25 === 0) {
+      console.log(`🧠 AI Engine Progress: ${processed}/${queue.length} stocks analyzed.`);
+    }
+    // 500ms delay to avoid DeepSeek API rate limits
+    await new Promise(r => setTimeout(r, 500)); 
+  }
+  console.log('🧠 AI Engine: Post-Market analysis complete!');
+}
+
+function scheduleAIPostMarket() {
+  const ms = msUntil(16, 30); // 4:30 PM IST
+  console.log(`⏰ Next AI Post-Market analysis in ${Math.round(ms / 60000)} min`);
+  setTimeout(async () => {
+    await runAIPostMarket();
+    scheduleAIPostMarket();
+  }, ms);
+}
+
+// ============================================================
+// AI PRE-MARKET TRIGGER CHECK (9:08 AM)
+// ============================================================
+async function runAIPreMarketCheck() {
+  if (!isTradingDay(getIST())) return;
+  console.log('🎯 9:08 AM: Checking AI Triggers against Pre-Open...');
+
+  try {
+    const { rows: plans } = await db.query(`SELECT * FROM ai_trade_plans WHERE date = CURRENT_DATE`);
+    if (!plans.length) {
+      console.log('⚠️ No AI plans found for today.');
+      return;
+    }
+
+    const tokens = plans.map(p => p.token);
+    const quotes = await fetchQuotesForTokens(tokens);
+    
+    const preOpenMap = {};
+    for (const q of quotes) {
+      preOpenMap[String(q.token)] = q.ltp;
+    }
+
+    for (const plan of plans) {
+      const preOpen = preOpenMap[plan.token];
+      if (!preOpen) continue;
+
+      if (plan.buy_trigger && preOpen >= plan.buy_trigger) {
+        console.log(`🚀 9:08 AM TRIGGER: ${plan.sym} BUY | Pre-Open: ${preOpen} >= Trigger: ${plan.buy_trigger}`);
+      } else if (plan.sell_trigger && preOpen <= plan.sell_trigger) {
+        console.log(`🚀 9:08 AM TRIGGER: ${plan.sym} SELL | Pre-Open: ${preOpen} <= Trigger: ${plan.sell_trigger}`);
+      }
+    }
+  } catch (e) {
+    console.error('Error in 9:08 AM Pre-Open check:', e.message);
+  }
+}
+
+function scheduleAIPreMarketCheck() {
+  const ms = msUntil(9, 8); // 9:08 AM IST
+  console.log(`⏰ Next AI Pre-Open Check in ${Math.round(ms / 60000)} min`);
+  setTimeout(async () => {
+    await runAIPreMarketCheck();
+    scheduleAIPreMarketCheck();
+  }, ms);
+}
 
 function scheduleMorningPreload() {
   const ms = msUntil(9, 0);
@@ -2665,14 +2750,16 @@ app.listen(PORT, async () => {
     startBSInterval();
   }
 
-  scheduleDailyHLC();
+    scheduleDailyHLC();
   scheduleBSAutoFetch();
   scheduleFinalFlush();
   scheduleDailyHistorical();
   scheduleVCWatchReload();
   scheduleMorningPreload();
+  scheduleAIPostMarket();       // <--- ADD THIS
+  scheduleAIPreMarketCheck();   // <--- ADD THIS
   startMarginRefreshLoop();
-
+   
   maybeRefreshMargins('angelone', { force: true }).catch(() => {});
 
   setInterval(updateMarketBreadth, 5000);

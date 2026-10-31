@@ -1,23 +1,28 @@
 /* ============================================================
-   fifteen.js — v1.0  (SEPARATE 15-min candle backfill from Angel REST)
+   fifteen.js — v1.1  (SEPARATE 15-min backfill, DB-VERIFIED RESUME)
    ------------------------------------------------------------
-   - Own button / own route / own lock (7452) / own progress state
-   - NEVER touches the 5-min historical flow (processHistoricalFetch)
-   - Reuses ONLY the safe shared helpers passed via deps (D):
-       login/re-login, rate & session error classification, fetchAngelInterval
-   - Fetches FULL OHLCV: tries interval FIFTEEN_MINUTE first; if Angel
-     rejects the interval, falls back to FIVE_MINUTE and merges 3→1
-     (high = max of highs, low = min of lows → exchange-exact)
-   - Stores into: ws_15min_open/high/low/close/volume/ts (nullable cols)
-   - Window: last N working days (default 44 ≈ 2 months), alphabetical,
-     paced 1.5s, same 2-attempt safe-stop rules as the 5-min runner
-   - Pauses itself automatically if the 5-min historical run is active
+   - Own button / route / lock (7452) / progress — never touches 5-min flow
+   - RESUME LOGIC (v1.1): before fetching, cross-checks DB per stock:
+       * expected trading days = last 66 calendar days minus weekends/holidays
+         (today counted only after 15:35)
+       * a day is "complete" when ws_15min_close has >= 25 candles
+       * stocks with ALL days complete  → skipped, ZERO API calls
+       * stocks with gaps               → fetched only from their FIRST
+         MISSING DAY forward (last-good-row + 1), not from the beginning
+       * stocks failed in an earlier run (fifteenFailed) → always re-queued
+   - Fetches true OHLCV: tries FIFTEEN_MINUTE; if Angel refuses, merges
+     FIVE_MINUTE 3→1 (max-of-highs / min-of-lows / sum-volume = exact)
+   - Safety: session error → re-login → 30s → retry → 120s → last retry → stop;
+     rate error → 60s → 1 retry → stop; leftovers resume next press
+   - Atomic writes: a stock's day rows are upserted only after its full
+     fetch succeeds — partial/wrong data can never be stored
    ============================================================ */
 
 let fifteenRunning = false;
 const fifteenFailed = new Set();
 const fifteenProgress = { running: false, done: 0, total: 0, current: '' };
 const sleep15 = ms => new Promise(r => setTimeout(r, ms));
+const getIST15 = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 
 /* ---------- group raw Angel candles into 15-min buckets (IST, true OHLCV) ----------
    Works for FIFTEEN_MINUTE rows as-is AND for FIVE_MINUTE rows (3 merge into 1).   */
@@ -49,19 +54,47 @@ function group15OHLCV(raw) {
   return out;
 }
 
-/* ---------- one stock: fetch + upsert ---------- */
-async function backfill15OneStock(D, stock, daysKeep) {
+/* ---------- expected trading days in range (weekends + holidays removed) ---------- */
+async function expectedDays15(D, rangeStart, todayStr, istMins) {
+  let hol = new Set();
+  try {
+    const { rows } = await D.db.query('SELECT date::text AS d FROM trading_holidays');
+    hol = new Set(rows.map(r => r.d));
+  } catch {}
+  const out = [];
+  const d = new Date(rangeStart + 'T00:00:00Z');
+  const end = new Date(todayStr + 'T00:00:00Z');
+  while (d <= end) {
+    const ds = d.toISOString().slice(0, 10);
+    const dow = d.getUTCDay();
+    const isToday = ds === todayStr;
+    if (dow !== 0 && dow !== 6 && !hol.has(ds) && !(isToday && istMins < 15 * 60 + 35)) out.push(ds);
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return out;
+}
+
+const isSess15 = (D, e) => D.isSessionError(e) || /invalid token/i.test(e?.message || '');
+
+/* ---------- one stock: fetch ONLY from its first missing day + upsert ---------- */
+async function backfill15OneStock(D, stock, daysKeep, missingFrom) {
   const token = String(stock.token);
+  const ist = getIST15();
+  const todayMs = ist.getTime();
+  const fromMs = new Date(missingFrom + 'T00:00:00Z').getTime() - 5.5 * 3600 * 1000;
+  const calDays = Math.max(1, Math.ceil((todayMs - fromMs) / 86400000));
+
   let raw;
   try {
-    raw = await D.fetchAngelInterval(token, 'FIFTEEN_MINUTE', 62);   // 62 → ~68 calendar days ≈ 44+ working days
+    raw = await D.fetchAngelInterval(token, 'FIFTEEN_MINUTE', calDays);
   } catch (e) {
-    if (D.isRateError(e) || D.isSessionError(e)) throw e;             // never mask safety errors
-    console.log(`📊 ${stock.sym}: FIFTEEN_MINUTE unsupported → merging FIVE_MINUTE`);
-    raw = await D.fetchAngelInterval(token, 'FIVE_MINUTE', 62);
+    if (D.isRateError(e) || isSess15(D, e)) throw e;          // never mask safety/session errors
+    console.log(`📊 ${stock.sym}: FIFTEEN_MINUTE unavailable → merging FIVE_MINUTE (exact OHLCV)`);
+    raw = await D.fetchAngelInterval(token, 'FIVE_MINUTE', calDays);
   }
+
   const by15 = group15OHLCV(raw);
-  const dates = Object.keys(by15).sort().slice(-daysKeep);
+  const dates = Object.keys(by15).sort().slice(-daysKeep).filter(dt => dt >= missingFrom);
   let saved = 0;
   for (const date of dates) {
     const rowsArr = by15[date];
@@ -103,17 +136,50 @@ async function process15minFetch(D, body) {
   }
 
   const daysKeep = Math.min(Math.max(+body?.days || 44, 1), 60);
-  const queue = [...D.STOCKS].sort((a, b) => String(a.sym).localeCompare(String(b.sym)));
-  fifteenProgress.running = true;
-  fifteenProgress.done = 0;
-  fifteenProgress.total = queue.length;
-  fifteenProgress.current = '';
-  let ok = 0, fail = 0;
-  console.log(`📊 15-min fetch start: ${queue.length} stocks | keeping last ${daysKeep} working days | OHLCV`);
+  const ist0 = getIST15();
+  const todayStr = ist0.toISOString().slice(0, 10);
+  const mins0 = ist0.getUTCHours() * 60 + ist0.getUTCMinutes();
+  const rangeStart = new Date(ist0.getTime() - 66 * 86400000).toISOString().slice(0, 10);
 
   try {
+    /* ---- DB cross-check: which stocks are complete, which day is each missing from ---- */
+    const expected = await expectedDays15(D, rangeStart, todayStr, mins0);
+    const { rows: fullRows } = await D.db.query(
+      `SELECT token, array_agg(date::text ORDER BY date) AS dates
+       FROM strategy_bs_snapshot
+       WHERE strategy_id='momentum' AND ws_15min_close IS NOT NULL
+         AND array_length(ws_15min_close,1) >= 25 AND date >= $1
+       GROUP BY token`,
+      [rangeStart]
+    );
+    const fullMap = new Map(fullRows.map(r => [String(r.token), new Set(r.dates)]));
+
+    const queue = [];
+    let complete = 0;
+    for (const s of D.STOCKS) {
+      const t = String(s.token);
+      const have = fullMap.get(t);
+      let missingFrom = null;
+      for (const dstr of expected) {
+        if (!have || !have.has(dstr)) { missingFrom = dstr; break; }
+      }
+      if (!missingFrom && !fifteenFailed.has(t)) { complete++; continue; }
+      queue.push({ ...s, missingFrom: missingFrom || rangeStart });
+    }
+    queue.sort((a, b) => String(a.sym).localeCompare(String(b.sym)));
+
+    fifteenProgress.running = true;
+    fifteenProgress.done = 0;
+    fifteenProgress.total = queue.length;
+    fifteenProgress.current = '';
+    console.log(`📊 15-min resume check: ${complete} stocks already COMPLETE (0 API calls) | ${queue.length} to fetch (each from its first missing day, expected ${expected.length} days)`);
+    if (!queue.length) {
+      console.log('✅ 15-min: nothing to fetch — all stocks complete');
+      return;
+    }
+
+    let ok = 0, fail = 0;
     while (queue.length) {
-      // never fight the 5-min historical runner
       if (D.getHistoricalRunning()) {
         console.warn('⏸️ 15-min fetch pausing — 5-min historical is running');
         await sleep15(30000);
@@ -127,27 +193,36 @@ async function process15minFetch(D, body) {
       }
 
       try {
-        await backfill15OneStock(D, stock, daysKeep);
+        await backfill15OneStock(D, stock, daysKeep, stock.missingFrom);
         ok++; fifteenProgress.done++;
         fifteenFailed.delete(String(stock.token));
       } catch (e) {
-        if (D.isSessionError(e)) {
-          console.error(`🔑 15-min session error on ${stock.sym}: ${e.message} — re-login + 1 retry`);
+        if (isSess15(D, e)) {
+          console.error(`🔑 15-min session error on ${stock.sym}: ${e.message} — re-login → wait 30s → retry`);
           try { await D.forceRelogin(); } catch {}
+          await sleep15(30000);
           try {
-            await backfill15OneStock(D, stock, daysKeep);
+            await backfill15OneStock(D, stock, daysKeep, stock.missingFrom);
             ok++; fifteenProgress.done++;
           } catch (e2) {
-            console.error(`🛑 15-min session still dead on ${stock.sym} (${e2.message}) — STOPPING`);
-            fifteenFailed.add(String(stock.token));
-            for (const s of queue) fifteenFailed.add(String(s.token));
-            break;
+            console.warn(`🔑 Still failing on ${stock.sym}: ${e2.message} — re-login → wait 120s → last retry`);
+            try { await D.forceRelogin(); } catch {}
+            await sleep15(120000);
+            try {
+              await backfill15OneStock(D, stock, daysKeep, stock.missingFrom);
+              ok++; fifteenProgress.done++;
+            } catch (e3) {
+              console.error(`🛑 Session truly dead on ${stock.sym} (${e3.message}) — STOPPING, leftovers resume next run`);
+              fifteenFailed.add(String(stock.token));
+              for (const s of queue) fifteenFailed.add(String(s.token));
+              break;
+            }
           }
         } else if (D.isRateError(e) || /403/.test(e?.message || '')) {
           console.warn(`⛔ 15-min rate-limit on ${stock.sym}: ${e.message} — 60s wait, 1 retry (last)`);
           await sleep15(60000);
           try {
-            await backfill15OneStock(D, stock, daysKeep);
+            await backfill15OneStock(D, stock, daysKeep, stock.missingFrom);
             ok++; fifteenProgress.done++;
           } catch (e2) {
             console.error(`🛑 15-min still limited on ${stock.sym} (${e2.message}) — STOPPING, leftovers resume next run`);
@@ -186,7 +261,7 @@ export function registerFifteenRoutes(app, D) {
     if (fifteenRunning) return res.status(409).json({ error: '15-min fetch already running' });
     if (D.getHistoricalRunning()) return res.status(409).json({ error: '5-min historical is running — try after it finishes' });
     fifteenRunning = true;
-    res.json({ ok: true, message: '15-min fetch started in background' });
+    res.json({ ok: true, message: '15-min fetch started in background (DB-verified resume)' });
     process15minFetch(D, req.body).catch(e => {
       console.error('🛑 15-min background error:', e.message);
       fifteenRunning = false;
@@ -198,5 +273,5 @@ export function registerFifteenRoutes(app, D) {
     res.json({ running: fifteenRunning || fifteenProgress.running, ...fifteenProgress });
   });
 
-  console.log('📊 15-min backfill routes registered (/api/admin/fetch-15min)');
+  console.log('📊 15-min backfill routes registered (/api/admin/fetch-15min) — DB-verified resume ON');
 }

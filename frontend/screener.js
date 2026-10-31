@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.8.3 (5-Min Historical Fetch with Progress Bar)
+   SCREENER.JS  — v4.8.4 (Separate 15-Min OHLCV Fetch button)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -24,6 +24,7 @@ let QUOTE_FETCHING = false;
 let DAYHLC_FETCHING = false;
 let EOD_FETCHING = false;
 let HISTORICAL_FETCHING = false;
+let FIFTEEN_FETCHING = false;   // v4.8.4: separate 15-min fetch guard
 
 let SCREENER_MOMENTUM_FILTER = 'open_gain';
 let SCREENER_SORT_BY = 'change';
@@ -110,6 +111,7 @@ function renderStrategyControls() {
   let strategyButtons = `
     <button id="fetchBSBtn" class="btn btn-primary" ${btnStyle} onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
     <button id="fetchHistoricalBtn" class="btn btn-outline" ${btnStyle} onclick="startHistoricalFetch()">📥 Fetch Historical</button>
+    <button id="fetch15Btn" class="btn btn-outline" ${btnStyle} onclick="startFifteenFetch()">📊 Fetch 15-Min</button>
     <button id="fetchEODBtn" class="btn btn-outline" ${btnStyle} onclick="startEODClosesFetch()">⚙️ Fetch EOD Closes</button>`;
 
   controls.innerHTML = `
@@ -122,12 +124,12 @@ function renderStrategyControls() {
     <label style="font-size:11px;font-weight:600;color:var(--text-secondary);margin-left:2px">Mode</label>
     <select id="sideModeSelect"
             style="padding:6px 8px;border:1.5px solid var(--border-soft);border-radius:8px;
-                   font-size:12px;font-family:inherit;background:var(--bg-secondary);
+                   font-family:inherit;background:var(--bg-secondary);
                    color:var(--text-primary);cursor:pointer;font-weight:700"
             onchange="onSideModeChange()">
       <option value="MIX"  ${SIDE_MODE === 'MIX'  ? 'selected' : ''}>🔀 Mix (50/50)</option>
       <option value="BUY"  ${SIDE_MODE === 'BUY'  ? 'selected' : ''}>📈 Buy Only</option>
-      <option value="SELL" ${SIDE_MODE === 'SELL' ? 'selected' : ''}>📉 Sell Only</option>
+      <option value="SELL" ${SIDE_MODE === 'SELL'  ? 'selected' : ''}>📉 Sell Only</option>
     </select>
     <div id="progressBar" style="display:none;width:100%;margin-top:8px">
       <div style="background:rgba(0,0,0,0.06);border-radius:10px;height:6px;overflow:hidden">
@@ -432,7 +434,7 @@ function formatTimeIST(isoStr) {
     const d = new Date(isoStr);
     const ist = new Date(d.getTime() + 5.5 * 3600 * 1000);
     return ist.toISOString().slice(11, 19);
-  } catch { return '—'; }
+  } catch { return ''; }
 }
 
 function formatQty(n) {
@@ -484,7 +486,7 @@ function renderTicker() {
   if (TICKER_BREADTH.adv > 0 || TICKER_BREADTH.dec > 0) {
     html += `<div class="ticker-item">
       MARKET BREADTH
-      <span class="val"><span class="pos">🟢 ${TICKER_BREADTH.adv} Adv</span> &nbsp;|&nbsp; <span class="neg">🔴 ${TICKER_BREADTH.dec} Dec</span></span>
+      <span class="val"><span class="pos">🟢 ${TICKER_BREADTH.adv} Adv</span>  |  <span class="neg">🔴 ${TICKER_BREADTH.dec} Dec</span></span>
     </div>`;
   }
 
@@ -506,9 +508,7 @@ function updateLTPCells(ticks, vwaps, rsis) {
     if (!row) continue;
 
     const ltpEl = row.querySelector('.ltp-cell');
-    if (ltpEl && ltpEl.textContent !== '₹' + (+price).toFixed(2)) {
-      ltpEl.textContent = '₹' + (+price).toFixed(2);
-    }
+    if (ltpEl) ltpEl.textContent = '₹' + (+price).toFixed(2);
 
     const chgEl = row.querySelector('.change-cell');
     if (chgEl) {
@@ -736,6 +736,76 @@ async function startHistoricalFetch() {
     HISTORICAL_FETCHING = false; 
     btn.disabled = false; 
     btn.textContent = '📥 Fetch Historical';
+    if (pb) pb.style.display = 'none';
+  }
+}
+
+/* ============================================================
+   SECTION 5.7 — FETCH 15-MIN CANDLES (v4.8.4: separate button,
+   own runner on server, OHLCV, ~2 months, never touches 5-min)
+   ============================================================ */
+async function startFifteenFetch() {
+  const btn = document.getElementById('fetch15Btn');
+  if (!btn) return;
+  if (FIFTEEN_FETCHING) return;
+
+  const ok = confirm('📊 Fetch 15-Min Candles (OHLCV)\n\nDownloads last ~2 months of 15-minute open/high/low/close/volume for all stocks from Angel REST.\nRuns in background with its own progress bar. Continue?');
+  if (!ok) return;
+
+  FIFTEEN_FETCHING = true;
+  btn.disabled = true;
+  btn.textContent = '⏳ Fetching 15-min...';
+
+  const pb = document.getElementById('progressBar');
+  if (pb) pb.style.display = 'block';
+
+  try {
+    const r = await fetch(API + '/api/admin/fetch-15min', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
+      body: JSON.stringify({ days: 44 })
+    });
+
+    let d = {};
+    try { d = await r.json(); } catch (e) { d = { error: 'Server timeout or invalid response' }; }
+
+    if (!r.ok) {
+      showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
+      FIFTEEN_FETCHING = false;
+      btn.disabled = false;
+      btn.textContent = '📊 Fetch 15-Min';
+      if (pb) pb.style.display = 'none';
+      return;
+    }
+
+    showToast('✅ 15-Min Fetch Started', 'Background process running. Watch progress bar.');
+
+    const poll = setInterval(async () => {
+      try {
+        const pr = await fetch(API + '/api/admin/fetch-15min-progress', {
+          headers: { Authorization: 'Bearer ' + getToken() }
+        }).then(res => res.json());
+
+        if (pr.running) {
+          updateProgress(pr.done, pr.total);
+          btn.textContent = `⏳ 15-min ${pr.current || ''} (${pr.done}/${pr.total})`;
+        } else {
+          clearInterval(poll);
+          FIFTEEN_FETCHING = false;
+          btn.disabled = false;
+          btn.textContent = '📊 Fetch 15-Min';
+          updateProgress(pr.total || 1, pr.total || 1);
+          showToast('🎉 15-Min Complete', 'OHLCV 15-min candles saved for ~2 months.');
+          setTimeout(() => { if (pb) pb.style.display = 'none'; }, 3000);
+        }
+      } catch (e) { console.error('15-min progress poll failed:', e); }
+    }, 2000);
+
+  } catch (e) {
+    showToast('⚠️ Network Error', 'Server is not reachable.');
+    FIFTEEN_FETCHING = false;
+    btn.disabled = false;
+    btn.textContent = '📊 Fetch 15-Min';
     if (pb) pb.style.display = 'none';
   }
 }

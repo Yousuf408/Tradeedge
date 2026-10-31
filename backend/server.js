@@ -6,6 +6,7 @@
 process.on('unhandledRejection', (reason) => {
   console.error('⚠️ Unhandled Rejection:', reason);
 });
+
 process.on('uncaughtException', (err) => {
   console.error('⚠️ Uncaught Exception:', err.message);
 });
@@ -58,6 +59,7 @@ import {
 } from './autoTrader.js';
 
 import { registerAdminRoutes } from './admin.js';
+import { registerFifteenRoutes } from './fifteen.js';
 import { generateAIPlan } from './aiAnalyzer.js';
 
 import {
@@ -109,7 +111,7 @@ STOCKS.forEach(s => { SYM_BY_TOKEN[String(s.token)] = s.sym; });
 const TOKEN_BY_SYM = {};
 STOCKS.forEach(s => {
   const key = String(s.sym).toUpperCase().trim().replace(/-EQ$|-BE$|-BL$|-BZ$/, '');
-  TOKEN_BY_SYM[key] = String(s.token);
+  TOKEN_BY_SYM[key] = s.token;
 });
 
 const NIFTY50_TOKEN = '99926000';
@@ -703,7 +705,8 @@ async function recomputeRSIFromWS(date) {
   try {
     const activeTokens = STOCKS.map(s => String(s.token));
     const { rows: prevRows } = await db.query(
-      `SELECT token, ws_1min_close FROM strategy_bs_snapshot
+      `SELECT token, ws_1min_close
+       FROM strategy_bs_snapshot
        WHERE strategy_id='momentum' AND ws_1min_close IS NOT NULL
          AND array_length(ws_1min_close, 1) > 0
          AND token = ANY($1) AND date < $2
@@ -1785,7 +1788,7 @@ async function processHistoricalFetch(body) {
       return;
     }
   } catch (e) {
-    try { if (lockClient) { lockClient.release(); } } catch {}
+    try { if (lockClient) lockClient.release(); } catch {}
     historicalRunning = false;
     return;
   }
@@ -1995,7 +1998,7 @@ async function fetchDayHLC() {
     if (dbErrors.length) console.log(`❌ [HLC] DB errors (first 5):`, dbErrors.slice(0, 5));
     broadcastBS(new Date());
     console.log(`✅ Day H/L/C + Volume: ${savedTokens.size}/${allTokens.length} saved in ${Math.round((Date.now() - t0) / 1000)}s`);
-  } catch (e) { console.error('❌ Day H/L/C fetch failed:', e); }
+  } catch (e) { console.error('❌ Day H/L/C fetch failed:', e.message); }
 }
 
 /* ============================================================
@@ -2097,7 +2100,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
         await db.query(
           `UPDATE strategy_bs_snapshot AS s SET volume=v.volume, fetched_at=NOW()
            FROM unnest($1::text[], $2::numeric[]) AS v(token, volume)
-           WHERE s.date=$3 AND s.token=v.token AND s.strategy_id='momentum'`,
+           WHERE s.date=$3 AND s.token=v.token AND s.strategy_id = 'momentum'`,
           [vTokens, vVols, p.date]
         );
       } catch (e) { dbErrors.push(`bulk-vol: ${e.message}`); }
@@ -2631,6 +2634,14 @@ registerAdminRoutes(app, {
   db, SECRET,
   auth, adminOnly, log,
   loadHolidaysFromDB
+});
+
+// v5.45: plug in the separate 15-min backfill module (own button, own lock, own progress)
+registerFifteenRoutes(app, {
+  db, auth, adminOnly, STOCKS,
+  fetchAngelInterval, isRateError, isSessionError,
+  forceRelogin: forceReloginREST, loginREST, getSessionStatusREST,
+  getHistoricalRunning: () => historicalRunning
 });
 
 const PORT = process.env.PORT || 3000;

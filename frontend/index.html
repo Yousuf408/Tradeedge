@@ -213,6 +213,7 @@
     <li><a class="active" data-page="screener">🔍 Screener</a></li>
     <li><a data-page="orders">📋 Orders</a></li>
     <li><a data-page="ai">🧠 AI Picks</a></li>
+        <li><a data-page="sectors">🏢 Sectors</a></li>
     <li class="admin-only" style="display:none"><a data-page="users">👥 Users</a></li>
     <li><a data-page="settings">⚙️ Settings</a></li>
   </ul>
@@ -260,7 +261,10 @@
      SECTION 5 — MAIN CONTAINER
      ============================================================ -->
 <div class="container">
-
+  <!-- 5.0 — SECTORS (standalone page in iframe) -->
+  <div id="page-sectors" class="page">
+    <iframe src="/sectors.html" style="width:100%;height:calc(100vh - 190px);border:0;border-radius:12px"></iframe>
+  </div>
   <!-- 5.1 — SCREENER -->
   <div id="page-screener" class="page active">
     <div class="panel-glass">

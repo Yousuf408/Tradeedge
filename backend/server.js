@@ -2515,9 +2515,11 @@ function scheduleDailyHistorical() {
 // AI POST-MARKET ANALYSIS (4:30 PM)
 // ============================================================
 async function runAIPostMarket() {
-  if (!isTradingDay(getIST())) return;
-  console.log('🧠 AI Engine: Starting Post-Market analysis for tomorrow...');
-  
+  // 👇 ADD THIS GUARD HERE 👇
+  if (!process.env.DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY.trim() === '') {
+    console.log('🛑 AI Engine: No API key found. Background run rejected.');
+    return;
+  }
   const queue = [...STOCKS]; 
   let processed = 0;
 
@@ -2546,7 +2548,7 @@ function scheduleAIPostMarket() {
   console.log(`⏰ Next AI Post-Market analysis in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
     await runAIPostMarket();
-    scheduleAIPostMarket();
+    //scheduleAIPostMarket();
   }, ms);
 }
 

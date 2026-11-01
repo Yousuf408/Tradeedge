@@ -1367,13 +1367,14 @@ app.get('/api/sectors', auth, (req, res) => {
     const sec = s.sector || 'MISC';
     const ltp = getCachedLTP(t) ?? bsCache.get(t)?.ltp ?? null;
     const open = bsCache.get(t)?.dayOpen ?? null;
-    const e = by[sec] || (by[sec] = { sector: sec, up: 0, down: 0, flat: 0, noData: 0, sumOpen: 0, nOpen: 0, stocks: [] });
+    const pc = prevCloseCache.get(t) || null;
+    const e = by[sec] || (by[sec] = { sector: sec, up: 0, down: 0, flat: 0, noData: 0, sumOpen: 0, nOpen: 0, sumPrev: 0, nPrev: 0, stocks: [] });
     if (!ltp || ltp <= 0) {
       e.noData++;
-      e.stocks.push({ sym: s.sym, token: t, ltp: null, openPct: null });
+      e.stocks.push({ sym: s.sym, token: t, ltp: null, openPct: null, prevPct: null });
       continue;
     }
-    let openPct = null;
+    let openPct = null, prevPct = null;
     if (open && open > 0) {
       openPct = +(((ltp - open) / open) * 100).toFixed(2);
       if (ltp > open) e.up++;
@@ -1384,11 +1385,17 @@ app.get('/api/sectors', auth, (req, res) => {
     } else {
       e.noData++;
     }
-    e.stocks.push({ sym: s.sym, token: t, ltp, openPct });
+    if (pc && pc > 0) {
+      prevPct = +(((ltp - pc) / pc) * 100).toFixed(2);
+      e.sumPrev += prevPct;
+      e.nPrev++;
+    }
+    e.stocks.push({ sym: s.sym, token: t, ltp, openPct, prevPct });
   }
   const sectors = Object.values(by).map(e => ({
     ...e,
-    avgOpenPct: e.nOpen ? +(e.sumOpen / e.nOpen).toFixed(2) : null
+    avgOpenPct: e.nOpen ? +(e.sumOpen / e.nOpen).toFixed(2) : null,
+    avgPrevPct: e.nPrev ? +(e.sumPrev / e.nPrev).toFixed(2) : null
   })).sort((a, b) => (b.avgOpenPct ?? -999) - (a.avgOpenPct ?? -999));
   for (const e of sectors) e.stocks.sort((a, b) => (b.openPct ?? -999) - (a.openPct ?? -999));
   res.json({ ok: true, time: new Date().toISOString(), sectors });

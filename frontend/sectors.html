@@ -26,7 +26,7 @@
 
   /* ---------- compact sector rows (all 16 in one frame) ---------- */
   .sector-list { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:6px; display:flex; flex-direction:column; gap:2px; }
-  .row { display:grid; grid-template-columns: 1fr 74px 62px 150px; align-items:center; gap:8px;
+  .row { display:grid; grid-template-columns: 1fr 96px 60px 128px; align-items:center; gap:8px;
          padding:6px 8px; border-radius:8px; cursor:pointer; transition:background .12s; }
   .row:hover { background:rgba(108,92,231,.10); }
   .row.active { background:rgba(108,92,231,.16); box-shadow:inset 0 0 0 1px var(--brand); }
@@ -85,7 +85,7 @@
 const API = window.location.origin;
 const getToken = () => localStorage.getItem('ta_token');
 const EMO = { BANK:'🏦', FINANCIAL:'💰', IT:'💻', PHARMA:'💊', AUTO:'🚗', FMCG:'🛒', METAL:'⚙️', ENERGY:'🛢️', POWER:'⚡', REALTY:'🏗️', INFRA:'🚧', CAPITAL_GOODS:'🏭', CHEMICAL:'🧪', MEDIA:'📺', SERVICES:'🛫', MISC:'📦' };
-let SECTORS = [], ACTIVE = null, SORT_KEY = 'openPct';   // descending always
+let SECTORS = [], ACTIVE = null, SORT_KEY = 'prevPct';   // default: CHANGE % descending; click header to switch
 
 const fmtL = v => v == null ? '—' : '₹' + (+v).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const cls = v => v == null ? 'flatc' : (v > 0 ? 'up' : v < 0 ? 'down' : 'flatc');
@@ -100,7 +100,7 @@ function renderSectors() {
     <div class="row ${ACTIVE === s.sector ? 'active' : ''}" onclick="pick('${s.sector}')"
          title="${s.sector} · vs prev close: ${sgn(s.avgPrevPct)} · ${s.up}↑ ${s.down}↓ ${s.flat}= · ${s.noData} no-data">
       <span class="nm">${EMO[s.sector] || '📦'} ${s.sector}<em>${s.stocks.length}</em></span>
-      <span class="ud mono">${s.up}<span class="up">↑</span> ${s.down}<span class="down">↓</span></span>
+      <span class="ud mono">${s.up}<span class="up">↑</span> ${s.down}<span class="down">↓</span>${s.flat ? ` ${s.flat}<span class="flatc">=</span>` : ''}${s.noData ? ` ${s.noData}<span class="flatc">nd</span>` : ''}</span>
       <span class="pc mono ${cls(v)}">${sgn(v)}</span>
       <span class="barzone"><i class="bar ${v >= 0 ? 'pos' : 'neg'}" style="width:${w}%"></i></span>
     </div>`;
@@ -122,7 +122,7 @@ function renderStocks() {
       <h2>${EMO[s.sector] || '📦'} ${s.sector}</h2>
       <span class="avg mono ${cls(s.avgOpenPct)}">${sgn(s.avgOpenPct)} vs open</span>
       <span class="avg mono ${cls(s.avgPrevPct)}" style="font-size:10.5px">${sgn(s.avgPrevPct)} vs prev</span>
-      <span class="sub mono">${s.up}↑ ${s.down}↓ ${s.flat}= · ${s.noData} nd</span>
+      <span class="sub mono">${s.up}↑ ${s.down}↓ ${s.flat}= ${s.noData}nd · sorted ▼ ${SORT_KEY === 'prevPct' ? 'CHANGE%' : 'OPEN%'}</span>
     </div>
     <div class="sp-body">
       <table>

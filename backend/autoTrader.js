@@ -34,6 +34,7 @@ const VC_GAP_MAX_PCT    = Number(process.env.VC_GAP_MAX_PCT ?? 3.0);
 const VC_MIN_CANDLE_PCT = Number(process.env.VC_MIN_CANDLE_PCT ?? 1.0);
 const VC_CTC_PCT        = Number(process.env.VC_CTC_PCT ?? 1.0);
 const VC_ENTRY_END_MIN  = Number(process.env.VC_ENTRY_END_MIN ?? 14 * 60 + 30);
+const VC_SECTOR_GATE    = String(process.env.VC_SECTOR_GATE ?? 'true') === 'true';   // v3.1: sector-majority confirmation vs DAY OPEN
 
 let db = null;
 let getJwt = null;
@@ -45,6 +46,7 @@ let getLev = null;
 let getDayOpen = () => null;
 let getTodayMinutes = () => null;
 let getUsers = async () => [];
+let sectorByToken = {};   // v3.1: token -> sector (from grouped nifty500 file)
 let onVCChange = null;
 let live = false;
 
@@ -74,6 +76,7 @@ export function initAutoTrader(deps) {
   getDayOpen = deps.getDayOpen || (() => null);
   getTodayMinutes = deps.getTodayMinutes || (() => null);
   getUsers = deps.getUsers || (async () => []);
+  sectorByToken = deps.sectorByToken || {};
   onVCChange = deps.onVCChange || null;
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
   console.log(`🤖 AutoTrader v3.0 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | VC engine: ${VC_ENABLED ? 'ON' : 'OFF'} | Dynamic MIX Enabled`);
@@ -81,6 +84,23 @@ export function initAutoTrader(deps) {
 }
 
 function vcNotify() { if (onVCChange) { try { onVCChange(); } catch {} } }
+
+/* ---------- v3.1 SECTOR MAJORITY GATE (direction vs DAY OPEN only) ----------
+   Counts live: stocks of the sector above open (up) vs below open (down).
+   Returns { side:'BUY'|'SELL'|null, up, down } — null = tie or no data.      */
+function sectorBias(sector) {
+  let up = 0, down = 0;
+  for (const [t, sec] of Object.entries(sectorByToken)) {
+    if (sec !== sector) continue;
+    const ltp = getLtp(t);
+    const open = getDayOpen(t);
+    if (!ltp || ltp <= 0 || !open || open <= 0) continue;
+    if (ltp > open) up++;
+    else if (ltp < open) down++;
+  }
+  if (up === down) return { side: null, up, down };
+  return { side: up > down ? 'BUY' : 'SELL', up, down };
+}
 
 /* ---------- Angel placeOrder (MARKET, INTRADAY) ---------- */
 async function placeOrder({ token, sym, side, qty }) {
@@ -195,6 +215,21 @@ function vcOnTick(tk, ltp) {
 
   const hit = st.side === 'BUY' ? ltp >= st.trigger : ltp <= st.trigger;
   if (!hit) return;
+
+  // v3.1: sector-majority confirmation (vs DAY OPEN) before placing entry
+  if (VC_SECTOR_GATE) {
+    const sector = sectorByToken[tk] || 'MISC';
+    const sb = sectorBias(sector);
+    if (!sb.up && !sb.down) {
+      console.warn(`🧭 VC ${st.sym}: no open-data for sector ${sector} — gate skipped (fail-open)`);
+    } else if (sb.side !== st.side) {
+      console.log(`🚫 VC ${st.sym} ${st.side} held: sector ${sector} majority ${sb.side || 'TIE'} (${sb.up}↑/${sb.down}↓ vs open)`);
+      return;   // keep setup alive — re-checks on next ticks, can enter later if sector flips
+    } else {
+      console.log(`🧭 VC ${st.sym} ${st.side} confirmed: sector ${sector} ${sb.up}↑/${sb.down}↓ vs open`);
+    }
+  }
+
   st.entered = true;
   console.log(`🎯 VC TRIGGER ${st.sym} ${st.side} @${ltp} | trigger=${st.trigger} mode=${st.mode}`);
   vcNotify();

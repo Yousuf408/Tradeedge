@@ -232,7 +232,11 @@ async function loadLastEodVolumeFromDB() {
 async function loadPrevCloseFromDB() {
   try {
     const activeTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
-    const latestDate = getIST().toISOString().split('T')[0];
+    // v5.45 fix: on weekends/holidays the "previous close" baseline must come from
+    // the LAST TRADING DAY's prev_close — not today's row, not quote's same-day close
+    const istNow = getIST();
+    const todayStr = istNow.toISOString().split('T')[0];
+    const baseDate = isTradingDay(istNow) ? todayStr : getPreviousTradingDay(istNow);
 
     const { rows } = await db.query(
       `SELECT DISTINCT ON (token) token, prev_close
@@ -241,32 +245,49 @@ async function loadPrevCloseFromDB() {
          AND token = ANY($1)
          AND date = $2
        ORDER BY token, date DESC`,
-      [activeTokens, latestDate]
+      [activeTokens, baseDate]
     );
 
     for (const r of rows) prevCloseCache.set(String(r.token), +r.prev_close);
-    console.log(`💾 prevClose (BS source): ${rows.length} tokens`);
+    console.log(`💾 prevClose (BS source, base=${baseDate}): ${rows.length} tokens`);
 
     if (rows.length < activeTokens.length) {
-      console.log(`🔄 Fetching prevClose via Quote API fallback for missing tokens...`);
       const missingTokens = activeTokens.filter(t => !prevCloseCache.has(String(t)));
-      try {
-        const quotes = await fetchQuotesForTokens(missingTokens);
-        if (quotes && quotes.length > 0) {
-          let count = 0;
-          for (const q of quotes) {
-            if (q.close && q.close > 0) {
-              prevCloseCache.set(String(q.token), +q.close);
-              count++;
+      if (isTradingDay(istNow)) {
+        // trading day pre-open: quote API's close = previous day's close = correct baseline
+        console.log(`🔄 Fetching prevClose via Quote API fallback for missing tokens...`);
+        try {
+          const quotes = await fetchQuotesForTokens(missingTokens);
+          if (quotes && quotes.length > 0) {
+            let count = 0;
+            for (const q of quotes) {
+              if (q.close && q.close > 0) {
+                prevCloseCache.set(String(q.token), +q.close);
+                count++;
+              }
+              if (q.ltp && q.ltp > 0) {
+                setCachedLTP(String(q.token), +q.ltp);
+              }
             }
-            if (q.ltp && q.ltp > 0) {
-              setCachedLTP(String(q.token), +q.ltp);
-            }
+            console.log(`✅ Quote API Fallback: Fetched data for ${count} tokens`);
           }
-          console.log(`✅ Quote API Fallback: Fetched data for ${count} tokens`);
+        } catch (apiErr) {
+          console.error('⚠️ Quote API fallback failed:', apiErr.message);
         }
-      } catch (apiErr) {
-        console.error('⚠️ Quote API fallback failed:', apiErr.message);
+      } else {
+        // weekend/holiday: baseline = trading day before baseDate's day_close
+        const P = getPreviousTradingDay(new Date(baseDate + 'T00:00:00Z'));
+        try {
+          const { rows: r2 } = await db.query(
+            `SELECT DISTINCT ON (token) token, day_close
+             FROM strategy_bs_snapshot
+             WHERE day_close IS NOT NULL AND token = ANY($1) AND date = $2
+             ORDER BY token, date DESC`,
+            [missingTokens, P]
+          );
+          for (const r of r2) prevCloseCache.set(String(r.token), +r.day_close);
+          console.log(`💾 prevClose weekend baseline from ${P}: ${r2.length} tokens`);
+        } catch (e2) { console.error('weekend baseline failed:', e2.message); }
       }
     }
 

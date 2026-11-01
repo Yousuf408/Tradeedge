@@ -7,25 +7,19 @@ const deepseek = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY,
 });
 
-const getSystemPrompt = (sym, daily, m15, m5) => `
-You are an Institutional Price Action Expert. Analyze the multi-timeframe data for ${sym} and create a Two-Sided Trading Plan (Buy and Sell) for tomorrow's intraday session.
+// Lightweight Prompt: No JSON, just raw numbers
+const getSystemPrompt = (sym, dailyPrices, m15Prices) => `
+You are an Institutional Price Action Expert. Analyze the data for ${sym}.
 
 DATA:
-- Daily Candles (Last 15 days): ${JSON.stringify(daily)}
-- 15-Min Candles (Last 2 days): ${JSON.stringify(m15)}
-- 5-Min Candles (Last 1 day): ${JSON.stringify(m5)}
+- Daily Closes (Last 15 days, oldest to newest): ${dailyPrices}
+- 5-Min Closes (Last 2 days): ${m15Prices}
 
 RULES:
-1. Identify major Support/Resistance from Daily and 15-Min data.
+1. Identify major Support/Resistance.
 2. Look for liquidity traps (fake breakouts).
-3. If the setup is choppy or no clear edge, return "no_trade": true.
-4. If a valid setup exists, calculate:
-   - BUY Trigger: Price to break above.
-   - BUY SL: Strictly below the recent swing low.
-   - BUY T1, T2: Logical resistance levels.
-   - SELL Trigger: Price to break below.
-   - SELL SL: Strictly above the recent swing high.
-   - SELL T1, T2: Logical support levels.
+3. If choppy, return "no_trade": true.
+4. Calculate: BUY Trigger, BUY SL, BUY T1, BUY T2, SELL Trigger, SELL SL, SELL T1, SELL T2.
 
 OUTPUT STRICT JSON ONLY:
 {
@@ -39,40 +33,41 @@ OUTPUT STRICT JSON ONLY:
 
 export async function generateAIPlan(db, token, sym) {
   try {
+    if (!process.env.DEEPSEEK_API_KEY) {
+       console.log('⚠️ Skipped AI for', sym, '- No API key.');
+       return null;
+    }
+
     const dailyRes = await db.query(
-      `SELECT date, day_open, day_high, day_low, day_close, volume 
-       FROM strategy_bs_snapshot 
+      `SELECT day_close FROM strategy_bs_snapshot 
        WHERE token = $1 AND date <= CURRENT_DATE 
-       ORDER BY date DESC LIMIT 15`, [token]
+       ORDER BY date ASC LIMIT 15`, [token]
     );
 
     const m15Res = await db.query(
-      `SELECT date, ws_5min_close 
-       FROM strategy_bs_snapshot 
+      `SELECT ws_5min_close FROM strategy_bs_snapshot 
        WHERE token = $1 AND date <= CURRENT_DATE 
-       ORDER BY date DESC LIMIT 2`, [token]
+       ORDER BY date ASC LIMIT 2`, [token]
     );
     
-    const m5Res = m15Res.rows[0] || {}; 
-    const daily = dailyRes.rows;
-    const m15 = m15Res.rows;
-    const m5 = m5Res.ws_5min_close || [];
+    if (!dailyRes.rows.length || !m15Res.rows.length) return null;
 
-    if (!daily.length || !m15.length) return null;
+    // Convert arrays to simple comma-separated strings
+    const dailyPrices = dailyRes.rows.map(r => r.day_close).join(', ');
+    const m15Prices = m15Res.rows.map(r => (r.ws_5min_close || []).join(', ')).join(' | ');
 
     const response = await deepseek.chat.completions.create({
       model: 'deepseek-chat',
-      messages: [{ role: 'system', content: getSystemPrompt(sym, daily, m15, m5) }],
+      messages: [{ role: 'system', content: getSystemPrompt(sym, dailyPrices, m15Prices) }],
       response_format: { type: 'json_object' },
       temperature: 0.1,
     });
 
     const plan = JSON.parse(response.choices[0].message.content);
-
     if (plan.no_trade) return plan;
 
+    // Save to Neon
     if (plan.buy_plan || plan.sell_plan) {
-      // SAVE FOR TOMORROW (CURRENT_DATE + 1)
       await db.query(`
         INSERT INTO ai_trade_plans 
         (date, sym, token, buy_trigger, buy_sl, buy_t1, buy_t2, sell_trigger, sell_sl, sell_t1, sell_t2, reasoning)
@@ -91,7 +86,11 @@ export async function generateAIPlan(db, token, sym) {
 
     return plan;
   } catch (error) {
-    console.error(`❌ AI Error for ${sym}:`, error.message);
+    if (error.message.includes('402')) {
+       console.error('🛑 AI Error: Insufficient Balance in DeepSeek API.');
+    } else {
+       console.error(`❌ AI Error for ${sym}:`, error.message);
+    }
     return null;
   }
 }

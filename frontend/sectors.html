@@ -1,0 +1,133 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sector Analysis — TradeAlgo Pro</title>
+<style>
+  :root { --bg:#0b0e14; --panel:#151a23; --panel2:#1b2130; --border:#2a3244; --text:#e8ecf4; --muted:#8b93a7; --green:#22c55e; --red:#ef4444; --brand:#6C5CE7; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,sans-serif; padding:16px; }
+  .topbar { display:flex; align-items:center; gap:14px; margin-bottom:14px; }
+  .topbar h1 { font-size:20px; font-weight:800; }
+  .topbar h1 span { color:var(--brand); }
+  .topbar a { color:var(--muted); font-size:12px; text-decoration:none; border:1px solid var(--border); padding:6px 10px; border-radius:8px; }
+  .topbar a:hover { color:var(--text); border-color:var(--brand); }
+  .clock { margin-left:auto; color:var(--muted); font-size:12px; font-family:ui-monospace,monospace; }
+  .wrap { display:grid; grid-template-columns: 340px 1fr; gap:14px; align-items:start; }
+  .col-title { font-size:11px; font-weight:700; color:var(--muted); letter-spacing:1px; margin-bottom:8px; }
+  .sector-list { display:flex; flex-direction:column; gap:8px; max-height:82vh; overflow-y:auto; padding-right:4px; }
+  .sector-card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:12px 14px; cursor:pointer; display:flex; align-items:center; gap:12px; transition:border .15s, background .15s; }
+  .sector-card:hover { border-color:var(--brand); }
+  .sector-card.active { border-color:var(--brand); background:var(--panel2); }
+  .sector-rank { width:26px; height:26px; border-radius:8px; background:var(--panel2); border:1px solid var(--border); display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:800; color:var(--muted); flex:none; }
+  .sector-name { font-weight:800; font-size:13px; flex:1; }
+  .sector-name small { display:block; font-weight:500; color:var(--muted); font-size:10px; margin-top:2px; }
+  .sector-avg { font-size:16px; font-weight:800; font-family:ui-monospace,monospace; min-width:74px; text-align:right; }
+  .sector-ud { font-size:10px; color:var(--muted); min-width:64px; text-align:right; font-family:ui-monospace,monospace; }
+  .up { color:var(--green); } .down { color:var(--red); } .flatc { color:var(--muted); }
+  .stock-panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px; max-height:82vh; overflow-y:auto; }
+  .stock-panel h2 { font-size:14px; font-weight:800; margin-bottom:4px; }
+  .stock-panel .sub { font-size:11px; color:var(--muted); margin-bottom:10px; }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; font-size:10px; letter-spacing:1px; color:var(--muted); padding:6px 8px; border-bottom:1px solid var(--border); }
+  th:last-child, td:last-child { text-align:right; }
+  td { padding:7px 8px; border-bottom:1px solid rgba(42,50,68,.5); font-size:13px; }
+  td.sym { font-weight:700; }
+  td.ltp { font-family:ui-monospace,monospace; font-weight:700; }
+  .empty { color:var(--muted); text-align:center; padding:60px 0; font-size:13px; }
+  .loginwarn { background:#3b1d1d; border:1px solid var(--red); color:#ffb4b4; border-radius:12px; padding:18px; text-align:center; font-size:14px; }
+  .loginwarn a { color:#fff; }
+  @media (max-width: 860px) { .wrap { grid-template-columns:1fr; } .sector-list { max-height:40vh; } }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>🏢 Sector <span>Analysis</span></h1>
+    <a href="/index.html">← Back to Screener</a>
+    <div class="clock" id="clock">--:--:--</div>
+  </div>
+  <div id="loginWarn" class="loginwarn" style="display:none">
+    Not logged in. <a href="/index.html">Open TradeAlgo Pro and login</a>, then come back to this page.
+  </div>
+  <div class="wrap" id="wrap" style="display:none">
+    <div>
+      <div class="col-title">SECTORS — TOP PERFORMER → TOP LOSER (vs DAY OPEN)</div>
+      <div class="sector-list" id="sectorList"></div>
+    </div>
+    <div class="stock-panel" id="stockPanel">
+      <div class="empty">👈 Click any sector to see its stocks</div>
+    </div>
+  </div>
+
+<script>
+const API = window.location.origin;
+const getToken = () => localStorage.getItem('ta_token');
+let SECTORS = [];
+let ACTIVE = null;
+
+function fmtLtp(v) { return v == null ? '—' : '₹' + (+v).toFixed(2); }
+function cls(v) { return v == null ? 'flatc' : (v > 0 ? 'up' : v < 0 ? 'down' : 'flatc'); }
+function sign(v) { return v == null ? '—' : (v > 0 ? '+' : '') + v.toFixed(2) + '%'; }
+
+function renderSectors() {
+  const el = document.getElementById('sectorList');
+  el.innerHTML = SECTORS.map((s, i) => `
+    <div class="sector-card ${ACTIVE === s.sector ? 'active' : ''}" onclick="pickSector('${s.sector}')">
+      <div class="sector-rank">${i + 1}</div>
+      <div class="sector-name">${s.sector}<small>${s.stocks.length} stocks</small></div>
+      <div class="sector-ud"><span class="up">${s.up}↑</span> <span class="down">${s.down}↓</span></div>
+      <div class="sector-avg ${cls(s.avgOpenPct)}">${sign(s.avgOpenPct)}</div>
+    </div>`).join('');
+}
+
+function pickSector(sec) {
+  ACTIVE = sec;
+  renderSectors();
+  renderStocks();
+}
+
+function renderStocks() {
+  const el = document.getElementById('stockPanel');
+  const s = SECTORS.find(x => x.sector === ACTIVE);
+  if (!s) { el.innerHTML = '<div class="empty">👈 Click any sector to see its stocks</div>'; return; }
+  el.innerHTML = `
+    <h2>${s.sector} <span class="${cls(s.avgOpenPct)}" style="font-family:ui-monospace,monospace">${sign(s.avgOpenPct)}</span></h2>
+    <div class="sub">${s.up} above open · ${s.down} below open · ${s.flat} flat · ${s.noData} no-data</div>
+    <table>
+      <thead><tr><th>STOCK</th><th>LTP</th></tr></thead>
+      <tbody>
+        ${s.stocks.map(st => `<tr><td class="sym">${st.sym}</td><td class="ltp">${fmtLtp(st.ltp)}</td></tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+async function loadSectors() {
+  const tk = getToken();
+  if (!tk) { document.getElementById('loginWarn').style.display = 'block'; return; }
+  try {
+    const r = await fetch(API + '/api/sectors', { headers: { Authorization: 'Bearer ' + tk } });
+    if (r.status === 401) { document.getElementById('loginWarn').style.display = 'block'; return; }
+    const d = await r.json();
+    if (d && d.sectors) {
+      SECTORS = d.sectors;
+      document.getElementById('wrap').style.display = 'grid';
+      document.getElementById('loginWarn').style.display = 'none';
+      if (ACTIVE && !SECTORS.find(x => x.sector === ACTIVE)) ACTIVE = null;
+      renderSectors();
+      if (ACTIVE) renderStocks();
+    }
+  } catch (e) { console.error('sector load failed:', e); }
+}
+
+setInterval(() => {
+  const d = new Date(Date.now() + 5.5 * 3600 * 1000);
+  document.getElementById('clock').textContent = d.toISOString().slice(11, 19) + ' IST';
+}, 1000);
+
+loadSectors();
+setInterval(loadSectors, 5000);   // live refresh every 5 sec
+</script>
+</body>
+</html>

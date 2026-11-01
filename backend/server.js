@@ -1,5 +1,16 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.44 (5-min Historical Fetch + Progress API)
+   server.js — TradeAlgo Pro backend  |  v5.45 (Sector analysis page API)
+   ============================================================
+   CHANGES vs v5.44 (NOTHING else touched):
+   15. Stock list loader now accepts BOTH formats: old flat array OR new
+       grouped sector-wise JSON — and tags every stock with .sector
+   16. SECTOR_BY_TOKEN map built at startup, passed to autoTrader
+       (powers the sector-majority entry gate)
+   17. NEW route GET /api/sectors — live sector-wise analysis
+       (direction vs DAY OPEN, ranked top performer → top loser)
+       for the new frontend/sectors.html page
+   All AI engine, 15-min backfill, progress APIs, VC engine, schedulers,
+   WS/BS/depth, margins, admin routes = exactly as v5.44.
    ============================================================ */
 
 // === GLOBAL ERROR HANDLERS (Prevents crashes) ===
@@ -99,10 +110,16 @@ db.on('error', (err) => {
 const SECRET = process.env.JWT_SECRET;
 const __dir = dirname(fileURLToPath(import.meta.url));
 
-const ALL_STOCKS = JSON.parse(
+// v5.45: accepts BOTH old flat array and new grouped sector-wise JSON
+const RAW_STOCKS = JSON.parse(
   readFileSync(join(__dir, 'brokers/angelone/Angel_nifty500.json'), 'utf8')
 );
+const ALL_STOCKS = Array.isArray(RAW_STOCKS)
+  ? RAW_STOCKS
+  : Object.entries(RAW_STOCKS).flatMap(([sector, arr]) => arr.map(s => ({ ...s, sector })));
 const STOCKS = ALL_STOCKS.filter(s => !s.disabled);
+const SECTOR_BY_TOKEN = {};
+ALL_STOCKS.forEach(s => { SECTOR_BY_TOKEN[String(s.token)] = s.sector || 'MISC'; });
 console.log(`📋 Stocks: ${STOCKS.length} active / ${ALL_STOCKS.length} total`);
 
 const SYM_BY_TOKEN = {};
@@ -1340,6 +1357,41 @@ app.get('/api/screener/data', auth, (req, res) => {
 
 app.get('/api/screener/vc', auth, (req, res) => {
   res.json({ ok: true, ...getVCStatus() });
+});
+
+// v5.45: sector-wise live analysis (direction vs DAY OPEN, ranked best → worst)
+app.get('/api/sectors', auth, (req, res) => {
+  const by = {};
+  for (const s of STOCKS) {
+    const t = String(s.token);
+    const sec = s.sector || 'MISC';
+    const ltp = getCachedLTP(t) ?? bsCache.get(t)?.ltp ?? null;
+    const open = bsCache.get(t)?.dayOpen ?? null;
+    const e = by[sec] || (by[sec] = { sector: sec, up: 0, down: 0, flat: 0, noData: 0, sumOpen: 0, nOpen: 0, stocks: [] });
+    if (!ltp || ltp <= 0) {
+      e.noData++;
+      e.stocks.push({ sym: s.sym, token: t, ltp: null, openPct: null });
+      continue;
+    }
+    let openPct = null;
+    if (open && open > 0) {
+      openPct = +(((ltp - open) / open) * 100).toFixed(2);
+      if (ltp > open) e.up++;
+      else if (ltp < open) e.down++;
+      else e.flat++;
+      e.sumOpen += openPct;
+      e.nOpen++;
+    } else {
+      e.noData++;
+    }
+    e.stocks.push({ sym: s.sym, token: t, ltp, openPct });
+  }
+  const sectors = Object.values(by).map(e => ({
+    ...e,
+    avgOpenPct: e.nOpen ? +(e.sumOpen / e.nOpen).toFixed(2) : null
+  })).sort((a, b) => (b.avgOpenPct ?? -999) - (a.avgOpenPct ?? -999));
+  for (const e of sectors) e.stocks.sort((a, b) => (b.openPct ?? -999) - (a.openPct ?? -999));
+  res.json({ ok: true, time: new Date().toISOString(), sectors });
 });
 
 app.get('/api/screener/chips', auth, (req, res) => {
@@ -2648,7 +2700,7 @@ registerFifteenRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.41`);
+  console.log(`✅ Server on port ${PORT} — v5.45`);
   initMarginService(db, getBrokerSession);
 
   try { 
@@ -2697,7 +2749,8 @@ app.listen(PORT, async () => {
       l: wsTodayLows.get(String(t)) || []
     }),
     getUsers: buildAutoUsers,
-    onVCChange: () => broadcastVC()
+    onVCChange: () => broadcastVC(),
+    sectorByToken: SECTOR_BY_TOKEN
   });
   await loadOpenPositions(getIST().toISOString().split('T')[0]);
   await loadVCWatchlist(getIST().toISOString().split('T')[0], getVCWatchDate());
@@ -2769,13 +2822,13 @@ app.listen(PORT, async () => {
   scheduleDailyHistorical();
   scheduleVCWatchReload();
   scheduleMorningPreload();
-  scheduleAIPostMarket();       // <--- ADD THIS
-  scheduleAIPreMarketCheck();   // <--- ADD THIS
+  scheduleAIPostMarket();
+  scheduleAIPreMarketCheck();
   startMarginRefreshLoop();
    
   maybeRefreshMargins('angelone', { force: true }).catch(() => {});
 
   setInterval(updateMarketBreadth, 5000);
 
-  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15 (30s) | Quote@9:30 | VC entries@9:16-14:30 | HLC@15:31 | FinalFlush@15:31 | AutoHistorical@16:00 | Preload@9:00 | Margins@30min');
+  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15 (30s) | Quote@9:30 | VC entries@9:16-14:30 | HLC@15:31 | FinalFlush@15:31 | AutoHistorical@16:00 | AI@16:30 | Preload@9:00 | Margins@30min');
 });

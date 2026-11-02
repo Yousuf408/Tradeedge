@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6,6 +7,52 @@
 <title>TradeAlgo Pro</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
 <link rel="stylesheet" href="styles.css" />
+<style>
+/* ============================================================
+   v2 (2026-10-27) — SLIDING DRAWER HEADER (left sidebar, screenshot style)
+   Purani 72px navbar hat gayi → ☰ button + left slide-in drawer.
+   Classes .navbar/.nav-links/.nav-right JAANBUJH ke rakhi hai taaki
+   admin.js/orders.js ke bindings aur logged-out hide rules waise hi kaam karein.
+   ============================================================ */
+.navbar.fab-menu {
+  position:fixed; top:8px; left:10px; z-index:120;
+  width:42px; height:40px; padding:0;
+  display:flex; align-items:center; justify-content:center;
+  background:var(--bg-secondary); border:1px solid var(--border-soft); border-radius:10px;
+  box-shadow:var(--shadow-sm); cursor:pointer; font-size:17px; line-height:1;
+  color:var(--text-primary); backdrop-filter:none; transition:var(--t);
+}
+.navbar.fab-menu:hover { background:rgba(108,92,231,0.12); }
+.navbar.drawer {
+  position:fixed; top:0; left:0; height:100vh; width:272px; z-index:110;
+  display:flex; flex-direction:column; align-items:stretch; justify-content:flex-start;
+  flex-wrap:nowrap; gap:6px; padding:14px 14px 18px; overflow-y:auto;
+  background:var(--bg-secondary);
+  border-bottom:none; border-right:1px solid var(--border-soft);
+  box-shadow:var(--shadow-lg); backdrop-filter:none;
+  transform:translateX(-105%); transition:transform .28s cubic-bezier(.2,0,0,1);
+}
+.navbar.drawer.open { transform:translateX(0); }
+body.impersonating .navbar.drawer { top:42px; height:calc(100vh - 42px); }
+.drawer-head { display:flex; align-items:center; justify-content:space-between;
+               padding:2px 6px 12px; border-bottom:1px solid var(--border-soft); margin-bottom:8px; }
+.drawer-head .logo { font-size:19px; }
+.drawer-close { background:none; border:none; color:var(--text-muted); font-size:15px;
+                cursor:pointer; padding:6px 9px; border-radius:8px; font-family:inherit; }
+.drawer-close:hover { background:rgba(108,92,231,0.10); color:var(--text-primary); }
+.drawer .nav-links { flex-direction:column; gap:4px; flex-wrap:nowrap; }
+.drawer .nav-links a { display:flex; align-items:center; width:100%; padding:10px 14px; }
+.drawer .nav-right { flex-direction:column; align-items:stretch; gap:12px;
+                     margin-top:auto; padding-top:14px; border-top:1px solid var(--border-soft); }
+.drawer .nav-right .balance { text-align:center; }
+.drawer .avatar-wrap { width:100%; }
+.drawer #userPill { width:100%; justify-content:space-between; }
+.drawer .avatar-menu { left:0; right:auto; top:46px; width:100%; min-width:0; }
+.drawer-backdrop { position:fixed; inset:0; background:rgba(8,10,20,.45); z-index:105;
+                   opacity:0; pointer-events:none; transition:opacity .25s; }
+.drawer-backdrop.show { opacity:1; pointer-events:auto; }
+.ticker-wrap { padding-left:64px; }   /* ☰ button ki jagah */
+</style>
 <script>
   // Apply saved theme before page renders (avoids flash)
   (function() {
@@ -204,16 +251,21 @@
 
 
 <!-- ============================================================
-     SECTION 4 — NAVBAR
+     SECTION 4 — SLIDING DRAWER HEADER (v2: 72px navbar → ☰ + left drawer)
      ============================================================ -->
-<nav class="navbar">
-  <div class="logo">📊 <span>TradeAlgo</span>Pro</div>
+<button id="fabMenu" class="navbar fab-menu" onclick="toggleDrawer()" title="Menu — tabs & account" aria-label="Open menu">☰</button>
+<div class="drawer-backdrop" id="drawerBackdrop" onclick="closeDrawer()"></div>
+<aside id="appDrawer" class="navbar drawer" aria-label="Main menu">
+  <div class="drawer-head">
+    <div class="logo">📊 <span>TradeAlgo</span>Pro</div>
+    <button class="drawer-close" onclick="closeDrawer()" title="Close menu">✕</button>
+  </div>
 
   <ul class="nav-links">
     <li><a class="active" data-page="screener">🔍 Screener</a></li>
     <li><a data-page="orders">📋 Orders</a></li>
     <li><a data-page="ai">🧠 AI Picks</a></li>
-        <li><a data-page="sectors">🏢 Sectors</a></li>
+    <li><a data-page="sectors">🏢 Sectors</a></li>
     <li class="admin-only" style="display:none"><a data-page="users">👥 Users</a></li>
     <li><a data-page="settings">⚙️ Settings</a></li>
   </ul>
@@ -245,7 +297,7 @@
       </div>
     </div>
   </div>
-</nav>
+</aside>
 
 <!-- ============================================================
      SECTION 4.1 — MARKET TICKER
@@ -263,7 +315,7 @@
 <div class="container">
   <!-- 5.0 — SECTORS (standalone page in iframe) -->
   <div id="page-sectors" class="page">
-    <iframe src="/sectors.html" style="width:100%;height:calc(100vh - 148px);border:0;border-radius:12px;display:block;margin-top:-6px"></iframe>
+    <iframe src="/sectors.html" style="width:100%;height:calc(100vh - 76px);border:0;border-radius:12px;display:block;margin-top:-6px"></iframe>
   </div>
   <!-- 5.1 — SCREENER -->
   <div id="page-screener" class="page active">
@@ -681,6 +733,26 @@ Rahul Verma,9876543212,5d"></textarea>
 <script src="screener.js?v=20261030"></script>
 <script src="orders.js?v=20261030"></script>
 <script src="app.js?v=20261030"></script>
+
+<script>
+/* ============================================================
+   v2 — DRAWER CONTROLS (☰ / backdrop / Esc / tab-click par close)
+   ============================================================ */
+function openDrawer() {
+  document.getElementById('appDrawer').classList.add('open');
+  document.getElementById('drawerBackdrop').classList.add('show');
+}
+function closeDrawer() {
+  document.getElementById('appDrawer').classList.remove('open');
+  document.getElementById('drawerBackdrop').classList.remove('show');
+}
+function toggleDrawer() {
+  if (document.getElementById('appDrawer').classList.contains('open')) closeDrawer();
+  else openDrawer();
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
+document.querySelectorAll('.nav-links a').forEach(a => a.addEventListener('click', () => closeDrawer()));
+</script>
 
 </body>
 </html>

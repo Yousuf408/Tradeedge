@@ -347,6 +347,10 @@ const rsiState = new Map();
 const chipList = new Map();
 let chipDate = null;
 
+// v5.45 ORB-15: first 15-min candle (9:15–9:30) per stock, computed once at 9:30
+const orbCache = new Map();      // token -> { high, low, size, volume }
+let orbDoneDate = null;
+
 let latestBreadth = { adv: 0, dec: 0 };
 
 function computeRSI(prevCloses, currentClose) {
@@ -908,6 +912,9 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     }
     if (RSI_SOURCE === 'ws') await updateRSIFromWS(date, prevKey);
 
+    // v5.45: at 9:30 sharp the first 15-min candle is complete → compute + store ORB
+    if (prevKey === '09:29') computeOrbCandles(date).catch(e => console.error('🎯 ORB compute failed:', e.message));
+
     console.log(`🕐 WS minute-close: ${tokens.length} tokens @ ${prevKey}${isFive ? ' (5m)' : ''}`);
   } catch (e) { console.error('WS minute-close flush failed:', e.message); }
 }
@@ -1378,6 +1385,23 @@ app.get('/api/screener/data', auth, (req, res) => {
 
 app.get('/api/screener/vc', auth, (req, res) => {
   res.json({ ok: true, ...getVCStatus() });
+});
+
+// v5.45: ORB-15 list — only stocks whose first 15-min candle size <= 1.5%
+app.get('/api/screener/orb', auth, (req, res) => {
+  const list = [];
+  for (const [t, o] of orbCache) {
+    if (o.size <= 1.5) {
+      list.push({
+        token: t,
+        sym: SYM_BY_TOKEN[t] || '?',
+        ltp: getCachedLTP(t) ?? bsCache.get(t)?.ltp ?? null,
+        size: o.size, volume: o.volume, high: o.high, low: o.low
+      });
+    }
+  }
+  list.sort((a, b) => a.size - b.size);   // tightest ORB first
+  res.json({ ok: true, done: orbDoneDate != null, count: list.length, list });
 });
 
 // v5.45: sector-wise live analysis (direction vs DAY OPEN, ranked best → worst)
@@ -2342,6 +2366,63 @@ async function buildChipList(date) {
 }
 
 
+/* ============================================================
+   v5.45 — ORB-15 (first 15-min candle 9:15–9:30)
+   Computed once at 9:30 from live 1-min memory, stored in DB
+   (orb_high/orb_low/orb_size/orb_volume), served via /api/screener/orb
+   ============================================================ */
+async function computeOrbCandles(date) {
+  if (orbDoneDate === date) return;
+  const toks = [], hs = [], ls = [], szs = [], vols = [];
+  for (const s of STOCKS) {
+    const tk = String(s.token);
+    const H = wsTodayHighs.get(tk) || [];
+    const L = wsTodayLows.get(tk) || [];
+    const C = wsTodayCloses.get(tk) || [];
+    const V = wsTodayVols.get(tk) || [];
+    if (C.length < 15 || H.length < 15 || L.length < 15) continue;
+    const h = Math.max(...H.slice(0, 15));
+    const l = Math.min(...L.slice(0, 15));
+    if (!(l > 0) || !(h > 0)) continue;
+    const sz = +(((h - l) / l) * 100).toFixed(2);
+    const v = V.slice(0, 15).reduce((a, b) => a + (+b || 0), 0);
+    orbCache.set(tk, { high: +h.toFixed(2), low: +l.toFixed(2), size: sz, volume: v });
+    toks.push(tk); hs.push(+h.toFixed(2)); ls.push(+l.toFixed(2)); szs.push(sz); vols.push(v);
+  }
+  if (toks.length) {
+    try {
+      await db.query(
+        `UPDATE strategy_bs_snapshot AS s
+         SET orb_high=v.h, orb_low=v.l, orb_size=v.sz, orb_volume=v.vol
+         FROM unnest($1::text[], $2::numeric[], $3::numeric[], $4::numeric[], $5::numeric[]) AS v(token, h, l, sz, vol)
+         WHERE s.date=$6 AND s.token=v.token AND s.strategy_id='momentum'`,
+        [toks, hs, ls, szs, vols, date]
+      );
+    } catch (e) { console.error('🎯 ORB save failed:', e.message); }
+  }
+  orbDoneDate = date;
+  const tight = [...orbCache.values()].filter(x => x.size <= 1.5).length;
+  console.log(`🎯 ORB-15 candles computed: ${toks.length} stocks | size ≤1.5%: ${tight}`);
+}
+
+async function loadOrbFromDB(date) {
+  if (!date) return;
+  try {
+    const { rows } = await db.query(
+      `SELECT token, orb_high, orb_low, orb_size, orb_volume
+       FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND orb_size IS NOT NULL`,
+      [date]
+    );
+    orbCache.clear();
+    for (const r of rows) {
+      orbCache.set(String(r.token), { high: +r.orb_high, low: +r.orb_low, size: +r.orb_size, volume: +r.orb_volume });
+    }
+    if (rows.length) orbDoneDate = date;
+    if (rows.length) console.log(`🎯 ORB-15 loaded from DB: ${rows.length} stocks for ${date}`);
+  } catch (e) { console.error('🎯 ORB load failed:', e.message); }
+}
+
 async function buildAutoUsers() {
   const { rows: dbUsers } = await db.query(`SELECT id, username, side_mode FROM users`);
   const users = [...userCapital.entries()].map(([userId, capital]) => {
@@ -2686,6 +2767,8 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
+    orbCache.clear();          // v5.45: fresh ORB for the new day
+    orbDoneDate = null;
     console.log('🧹 v5.41 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
@@ -2747,6 +2830,7 @@ app.listen(PORT, async () => {
   await loadTodayClosesFromDB();
   await loadChipListFromDB(getIST().toISOString().split('T')[0]);
   await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
+  await loadOrbFromDB(getScreenerPhase().date);   // v5.45: ORB list survives restarts/after-hours
   computeBuyersGroups();
   updateMarketBreadth();
 

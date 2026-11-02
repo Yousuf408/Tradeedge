@@ -15,23 +15,29 @@
   .mono { font-family:ui-monospace,'SF Mono',Consolas,monospace; }
   .up { color:var(--green); } .down { color:var(--red); } .flatc { color:var(--muted); }
 
-  .hdr { display:flex; align-items:center; gap:10px; margin-bottom:4px; }
-  .hdr h1 { font-size:16px; font-weight:800; }
-  .hdr h1 b { color:var(--brand); }
-  .live-dot { width:7px; height:7px; border-radius:50%; background:var(--green); animation:pulse 2s infinite; }
+  .hdr { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
+  .live-dot { width:7px; height:7px; border-radius:50%; background:var(--green); animation:pulse 2s infinite; flex:none; }
   @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(34,197,94,.5)} 70%{box-shadow:0 0 0 6px rgba(34,197,94,0)} 100%{box-shadow:0 0 0 0 rgba(34,197,94,0)} }
+  .searchwrap { position:relative; flex:1; max-width:340px; }
+  .searchwrap input { width:100%; background:var(--panel); border:1px solid var(--border); color:var(--text); border-radius:9px;
+                      padding:7px 12px; font-size:12px; font-family:inherit; outline:none; }
+  .searchwrap input:focus { border-color:var(--brand); }
+  .sdrop { position:absolute; top:34px; left:0; right:0; background:var(--panel2); border:1px solid var(--border); border-radius:10px;
+           z-index:50; overflow:hidden; display:none; }
+  .sdrop div { padding:7px 12px; font-size:12px; cursor:pointer; display:flex; gap:10px; }
+  .sdrop div:hover { background:rgba(108,92,231,.15); }
+  .sdrop .sec { color:var(--brand); font-weight:700; margin-left:auto; font-size:10.5px; }
   .hdr .clock { margin-left:auto; color:var(--muted); font-size:10.5px; }
 
   .wrap { display:grid; grid-template-columns: minmax(340px,430px) 1fr; gap:14px; align-items:start; }
 
-  /* ---------- compact sector rows (all 16 in one frame) ---------- */
   .sector-list { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:6px; display:flex; flex-direction:column; gap:2px; }
   .row { display:grid; grid-template-columns: 1fr 96px 60px 128px; align-items:center; gap:8px;
          padding:7px 9px; border-radius:8px; cursor:pointer; transition:background .12s; }
   .row:hover { background:rgba(108,92,231,.10); }
   .row.active { background:rgba(108,92,231,.16); box-shadow:inset 0 0 0 1px var(--brand); }
   .nm { font-size:13px; font-weight:700; letter-spacing:.2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .nm em { font-style:normal; color:var(--muted); font-weight:500; font-size:9.5px; margin-left:6px; }
+  .nm em { font-style:normal; color:var(--muted); font-weight:500; font-size:10px; margin-left:6px; }
   .ud { font-size:10px; color:var(--muted); text-align:right; white-space:nowrap; }
   .pc { font-size:13.5px; font-weight:800; text-align:right; }
   .barzone { height:10px; background:rgba(255,255,255,.04); border-radius:3px; overflow:hidden; }
@@ -39,18 +45,17 @@
   .bar.pos { background:linear-gradient(90deg,#15803d,#4ade80); }
   .bar.neg { background:linear-gradient(90deg,#b91c1c,#f87171); }
 
-  /* ---------- stocks panel ---------- */
   .stock-panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; overflow:hidden;
-                 display:flex; flex-direction:column; max-height:calc(100vh - 70px); }
+                 display:flex; flex-direction:column; max-height:calc(100vh - 60px); }
   .sp-head { padding:10px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
   .sp-head h2 { font-size:15px; font-weight:800; }
   .sp-head .avg { font-size:13px; font-weight:800; }
   .sp-head .sub { font-size:10px; color:var(--muted); margin-left:auto; }
   .sp-body { overflow-y:auto; }
   .sp-body::-webkit-scrollbar { width:6px; } .sp-body::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
-  table { width:100%; max-width:860px; border-collapse:collapse; }
-  thead th { position:sticky; top:0; background:var(--panel); text-align:left; font-size:9.5px; letter-spacing:1px; color:var(--muted);
-             padding:9px 14px; border-bottom:1px solid var(--border); z-index:2; white-space:nowrap; font-size:10px; }
+  table { width:100%; max-width:980px; border-collapse:collapse; }
+  thead th { position:sticky; top:0; background:var(--panel); text-align:left; font-size:10px; letter-spacing:1px; color:var(--muted);
+             padding:9px 14px; border-bottom:1px solid var(--border); z-index:2; white-space:nowrap; }
   thead th.sortable { cursor:pointer; }
   thead th.sortable:hover { color:var(--text); }
   thead th .arr { color:var(--brand); }
@@ -59,6 +64,8 @@
   tbody tr:nth-child(even) { background:rgba(255,255,255,.015); }
   tbody tr:hover { background:rgba(108,92,231,.07); }
   td.sym { font-weight:700; }
+  tr.flash { animation:flash 1.2s ease; }
+  @keyframes flash { 0%{background:rgba(108,92,231,.35)} 100%{background:transparent} }
   .empty { color:var(--muted); text-align:center; padding:60px 20px; font-size:12.5px; }
   .loginwarn { background:rgba(239,68,68,.08); border:1px solid var(--red); color:#ffb4b4; border-radius:12px; padding:18px; text-align:center; font-size:13px; margin-top:14px; }
   .loginwarn a { color:#fff; }
@@ -66,9 +73,13 @@
 </style>
 </head>
 <body>
-  <div class="hdr" style="margin-bottom:6px">
-    <div class="live-dot"></div>
-    <div class="clock mono" id="clock" style="margin-left:auto">--:--:-- IST</div>
+  <div class="hdr">
+    <div class="live-dot" title="live via WebSocket"></div>
+    <div class="searchwrap">
+      <input id="q" type="text" placeholder="🔍 Search stock → see its sector…" autocomplete="off" />
+      <div class="sdrop" id="sdrop"></div>
+    </div>
+    <div class="clock mono" id="clock">--:--:-- IST</div>
   </div>
   <div id="loginWarn" class="loginwarn" style="display:none">
     🔐 Not logged in. <a href="/index.html" target="_top">Open TradeAlgo Pro & sign in</a>, then return here.
@@ -84,65 +95,167 @@
 const API = window.location.origin;
 const getToken = () => localStorage.getItem('ta_token');
 const EMO = { BANK:'🏦', FINANCIAL:'💰', IT:'💻', PHARMA:'💊', AUTO:'🚗', FMCG:'🛒', METAL:'⚙️', ENERGY:'🛢️', POWER:'⚡', REALTY:'🏗️', INFRA:'🚧', CAPITAL_GOODS:'🏭', CHEMICAL:'🧪', MEDIA:'📺', SERVICES:'🛫', MISC:'📦' };
-let SECTORS = [], ACTIVE = null, SORT_KEY = 'prevPct';   // default: CHANGE % descending; click header to switch
+let SECTORS = [], ACTIVE = null, SORT_KEY = 'prevPct';
+let BY = {};            // token -> stock object ref
+let ROWS = {};          // token -> {ltp, prev, open, orb} cell refs
+let CARDS = {};         // sector -> {pc, ud, bar} refs
+let orderSig = '';
 
 const fmtL = v => v == null ? '—' : '₹' + (+v).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const cls = v => v == null ? 'flatc' : (v > 0 ? 'up' : v < 0 ? 'down' : 'flatc');
 const sgn = v => v == null ? '—' : (v > 0 ? '+' : '') + v.toFixed(2) + '%';
+const pct = (ltp, base) => (ltp && base && base > 0) ? +(((ltp - base) / base) * 100).toFixed(2) : null;
 
+function indexBy() {
+  BY = {};
+  for (const s of SECTORS) for (const st of s.stocks) BY[st.token] = st;
+}
+
+/* ---------- structural renders ---------- */
 function renderSectors() {
+  const keepY = window.scrollY;
   const maxAbs = Math.max(0.3, ...SECTORS.map(s => Math.abs(s.avgOpenPct ?? 0)));
   document.getElementById('sectorList').innerHTML = SECTORS.map(s => {
     const v = s.avgOpenPct ?? 0;
     const w = Math.max(2, Math.abs(v) / maxAbs * 100);
     return `
-    <div class="row ${ACTIVE === s.sector ? 'active' : ''}" onclick="pick('${s.sector}')"
-         title="${s.sector} · vs prev close: ${sgn(s.avgPrevPct)} · ${s.up}↑ ${s.down}↓ ${s.flat}= · ${s.noData} no-data">
+    <div class="row ${ACTIVE === s.sector ? 'active' : ''}" data-sec="${s.sector}" onclick="pick('${s.sector}')"
+         title="${s.sector} · vs prev: ${sgn(s.avgPrevPct)}">
       <span class="nm">${EMO[s.sector] || '📦'} ${s.sector}<em>${s.stocks.length}</em></span>
-      <span class="ud mono">${s.up}<span class="up">↑</span> ${s.down}<span class="down">↓</span>${s.flat ? ` ${s.flat}<span class="flatc">=</span>` : ''}${s.noData ? ` ${s.noData}<span class="flatc">nd</span>` : ''}</span>
-      <span class="pc mono ${cls(v)}">${sgn(v)}</span>
-      <span class="barzone"><i class="bar ${v >= 0 ? 'pos' : 'neg'}" style="width:${w}%"></i></span>
+      <span class="ud mono"></span>
+      <span class="pc mono"></span>
+      <span class="barzone"><i class="bar"></i></span>
     </div>`;
   }).join('');
+  CARDS = {};
+  document.querySelectorAll('#sectorList .row').forEach(el => {
+    CARDS[el.dataset.sec] = { ud: el.querySelector('.ud'), pc: el.querySelector('.pc'), bar: el.querySelector('.bar') };
+  });
+  paintCards();
+  window.scrollTo(0, keepY);
 }
-
-function pick(sec) { ACTIVE = sec; renderSectors(); renderStocks(); }
-function setSort(k) { SORT_KEY = k; renderStocks(); }
 
 function renderStocks() {
   const el = document.getElementById('stockPanel');
   const s = SECTORS.find(x => x.sector === ACTIVE);
-  if (!s) { el.innerHTML = '<div class="empty">👈 Select a sector</div>'; return; }
-  const stocks = [...s.stocks].sort((a, b) => Math.abs(b[SORT_KEY] ?? 0) - Math.abs(a[SORT_KEY] ?? 0));   // biggest mover first (works for + and - sectors)
-  const arrO = SORT_KEY === 'openPct' ? '<span class="arr">▼</span>' : '';
-  const arrP = SORT_KEY === 'prevPct' ? '<span class="arr">▼</span>' : '';
+  if (!s) { el.innerHTML = '<div class="empty">👈 Select a sector</div>'; ROWS = {}; return; }
+  const stocks = [...s.stocks].sort((a, b) => Math.abs(b[SORT_KEY] ?? 0) - Math.abs(a[SORT_KEY] ?? 0));
   el.innerHTML = `
     <div class="sp-head">
       <h2>${EMO[s.sector] || '📦'} ${s.sector}</h2>
-      <span class="avg mono ${cls(s.avgOpenPct)}">${sgn(s.avgOpenPct)} vs open</span>
-      <span class="avg mono ${cls(s.avgPrevPct)}" style="font-size:10.5px">${sgn(s.avgPrevPct)} vs prev</span>
-      <span class="sub mono">${s.up}↑ ${s.down}↓ ${s.flat}= ${s.noData}nd · biggest mover first · ${SORT_KEY === 'prevPct' ? 'CHANGE%' : 'OPEN%'}</span>
+      <span class="avg mono ${cls(s.avgOpenPct)}" data-h="open"></span>
+      <span class="avg mono ${cls(s.avgPrevPct)}" style="font-size:10.5px" data-h="prev"></span>
+      <span class="sub mono">biggest mover first · ${SORT_KEY === 'prevPct' ? 'CHANGE%' : 'OPEN%'}</span>
     </div>
     <div class="sp-body">
       <table>
         <thead><tr>
           <th>STOCK</th><th>LTP</th>
-          <th class="sortable" onclick="setSort('prevPct')">CHANGE % · PREV ${arrP}</th>
-          <th class="sortable" onclick="setSort('openPct')">OPEN GAIN % · OPEN ${arrO}</th>
+          <th class="sortable" onclick="setSort('prevPct')">CHANGE % · PREV ${SORT_KEY === 'prevPct' ? '<span class=arr>▼</span>' : ''}</th>
+          <th class="sortable" onclick="setSort('openPct')">OPEN GAIN % ${SORT_KEY === 'openPct' ? '<span class=arr>▼</span>' : ''}</th>
+          <th>CANDLE SIZE ≤9:30</th>
         </tr></thead>
         <tbody>
           ${stocks.map(st => `
-            <tr>
+            <tr data-tk="${st.token}">
               <td class="sym">${st.sym}</td>
-              <td class="mono">${fmtL(st.ltp)}</td>
-              <td class="mono ${cls(st.prevPct)}">${sgn(st.prevPct)}</td>
-              <td class="mono ${cls(st.openPct)}">${sgn(st.openPct)}</td>
+              <td class="mono c-ltp"></td>
+              <td class="mono c-prev"></td>
+              <td class="mono c-open"></td>
+              <td class="mono c-orb"></td>
             </tr>`).join('')}
         </tbody>
       </table>
     </div>`;
+  ROWS = {};
+  el.querySelectorAll('tbody tr[data-tk]').forEach(tr => {
+    ROWS[tr.dataset.tk] = {
+      ltp: tr.querySelector('.c-ltp'), prev: tr.querySelector('.c-prev'),
+      open: tr.querySelector('.c-open'), orb: tr.querySelector('.c-orb')
+    };
+  });
+  paintRows();
+  paintHead();
 }
 
+/* ---------- targeted paints (no re-render, no scroll jump) ---------- */
+function paintCards() {
+  for (const s of SECTORS) {
+    const c = CARDS[s.sector];
+    if (!c) continue;
+    const v = s.avgOpenPct ?? 0;
+    const maxAbs = Math.max(0.3, ...SECTORS.map(x => Math.abs(x.avgOpenPct ?? 0)));
+    c.pc.textContent = sgn(s.avgOpenPct);
+    c.pc.className = 'pc mono ' + cls(s.avgOpenPct);
+    c.ud.innerHTML = `${s.up}<span class="up">↑</span> ${s.down}<span class="down">↓</span>${s.flat ? ` ${s.flat}<span class="flatc">=</span>` : ''}${s.noData ? ` ${s.noData}<span class="flatc">nd</span>` : ''}`;
+    c.bar.className = 'bar ' + (v >= 0 ? 'pos' : 'neg');
+    c.bar.style.width = Math.max(2, Math.abs(v) / maxAbs * 100) + '%';
+  }
+}
+
+function paintRows() {
+  for (const tk in ROWS) {
+    const st = BY[tk];
+    const r = ROWS[tk];
+    if (!st || !r) continue;
+    r.ltp.textContent = fmtL(st.ltp);
+    r.prev.textContent = sgn(st.prevPct); r.prev.className = 'mono c-prev ' + cls(st.prevPct);
+    r.open.textContent = sgn(st.openPct); r.open.className = 'mono c-open ' + cls(st.openPct);
+    r.orb.textContent = st.orbSize == null ? '—' : st.orbSize.toFixed(2) + '%';
+    r.orb.style.color = st.orbSize == null ? 'var(--muted)' : (st.orbSize <= 1 ? 'var(--green)' : st.orbSize <= 1.5 ? '#F5A623' : 'var(--red)');
+  }
+}
+
+function paintHead() {
+  const s = SECTORS.find(x => x.sector === ACTIVE);
+  if (!s) return;
+  const el = document.getElementById('stockPanel');
+  const ho = el.querySelector('[data-h="open"]'), hp = el.querySelector('[data-h="prev"]');
+  if (ho) { ho.textContent = sgn(s.avgOpenPct) + ' vs open'; ho.className = 'avg mono ' + cls(s.avgOpenPct); }
+  if (hp) { hp.textContent = sgn(s.avgPrevPct) + ' vs prev'; hp.className = 'avg mono ' + cls(s.avgPrevPct); }
+}
+
+function recomputeSector(s) {
+  let up = 0, down = 0, flat = 0, noData = 0, so = 0, no = 0, sp = 0, np = 0;
+  for (const st of s.stocks) {
+    if (st.ltp == null || st.ltp <= 0) { noData++; continue; }
+    if (st.openPct != null) {
+      if (st.ltp > st.open) up++; else if (st.ltp < st.open) down++; else flat++;
+      so += st.openPct; no++;
+    } else noData++;
+    if (st.prevPct != null) { sp += st.prevPct; np++; }
+  }
+  s.up = up; s.down = down; s.flat = flat; s.noData = noData;
+  s.avgOpenPct = no ? +(so / no).toFixed(2) : null;
+  s.avgPrevPct = np ? +(sp / np).toFixed(2) : null;
+}
+
+/* ---------- realtime via SSE (WebSocket-fed ticks) ---------- */
+function startSSE() {
+  const tk = getToken();
+  if (!tk) return;
+  const sse = new EventSource(API + '/api/screener/stream?token=' + encodeURIComponent(tk));
+  sse.onmessage = e => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type !== 'ltp' || !msg.ticks) return;
+      const dirty = new Set();
+      for (const token of Object.keys(msg.ticks)) {
+        const st = BY[token];
+        if (!st) continue;
+        st.ltp = msg.ticks[token];
+        st.openPct = pct(st.ltp, st.open);
+        st.prevPct = pct(st.ltp, st.prev);
+        dirty.add(st.sectorRef);
+      }
+      for (const s of SECTORS) if (dirty.has(s)) recomputeSector(s);
+      paintCards(); paintRows(); paintHead();
+    } catch {}
+  };
+  sse.onerror = () => {};   // auto-reconnects
+}
+
+/* ---------- 5s poll: refresh orb sizes/counts; re-render only if structure changed ---------- */
 async function load() {
   const tk = getToken();
   if (!tk) { document.getElementById('loginWarn').style.display = 'block'; return; }
@@ -150,15 +263,46 @@ async function load() {
     const r = await fetch(API + '/api/sectors', { headers: { Authorization: 'Bearer ' + tk } });
     if (r.status === 401) { document.getElementById('loginWarn').style.display = 'block'; return; }
     const d = await r.json();
-    if (d && d.sectors) {
-      SECTORS = d.sectors;   // server already ranks descending by vs-open
-      document.getElementById('wrap').style.display = 'grid';
-      document.getElementById('loginWarn').style.display = 'none';
-      if (ACTIVE && !SECTORS.find(x => x.sector === ACTIVE)) ACTIVE = null;
-      if (!ACTIVE && SECTORS.length) ACTIVE = SECTORS[0].sector;
-      renderSectors(); renderStocks();
-    }
+    if (!d || !d.sectors) return;
+    document.getElementById('wrap').style.display = 'grid';
+    document.getElementById('loginWarn').style.display = 'none';
+    const sig = d.sectors.map(s => s.sector).join(',');
+    SECTORS = d.sectors;
+    for (const s of SECTORS) for (const st of s.stocks) st.sectorRef = s.sector;
+    indexBy();
+    if (ACTIVE && !SECTORS.find(x => x.sector === ACTIVE)) ACTIVE = null;
+    if (!ACTIVE && SECTORS.length) ACTIVE = SECTORS[0].sector;
+    if (sig !== orderSig) { orderSig = sig; renderSectors(); renderStocks(); }
+    else { paintCards(); paintRows(); paintHead(); }
   } catch (e) { console.error('sector load failed:', e); }
+}
+
+function pick(sec) { ACTIVE = sec; renderSectors(); renderStocks(); }
+function setSort(k) { SORT_KEY = k; renderStocks(); }
+
+/* ---------- search: stock → sector ---------- */
+const q = document.getElementById('q');
+const drop = document.getElementById('sdrop');
+q.addEventListener('input', () => {
+  const v = q.value.trim().toUpperCase();
+  if (!v) { drop.style.display = 'none'; return; }
+  const hits = Object.values(BY).filter(st => st.sym.includes(v)).slice(0, 8);
+  if (!hits.length) { drop.style.display = 'none'; return; }
+  drop.innerHTML = hits.map(st => {
+    const sec = SECTORS.find(s => s.stocks.includes(st))?.sector || st.sectorRef || '?';
+    return `<div onclick="jump('${sec}','${st.token}')"><b>${st.sym}</b><span class="mono">${fmtL(st.ltp)}</span><span class="sec">${sec}</span></div>`;
+  }).join('');
+  drop.style.display = 'block';
+});
+q.addEventListener('keydown', e => { if (e.key === 'Escape') drop.style.display = 'none'; });
+function jump(sec, token) {
+  drop.style.display = 'none';
+  q.value = '';
+  pick(sec);
+  setTimeout(() => {
+    const tr = document.querySelector(`tr[data-tk="${token}"]`);
+    if (tr) { tr.scrollIntoView({ block: 'center' }); tr.classList.add('flash'); setTimeout(() => tr.classList.remove('flash'), 1300); }
+  }, 60);
 }
 
 setInterval(() => {
@@ -167,6 +311,7 @@ setInterval(() => {
 
 load();
 setInterval(load, 5000);
+startSSE();
 </script>
 </body>
 </html>

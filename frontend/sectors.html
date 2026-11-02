@@ -5,6 +5,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sector Analysis — TradeAlgo Pro</title>
+<!-- v6 (2026-10-27): search box stock-section me table ke upar; Shift+S shortcut; top header strip removed -->
 <style>
   :root {
     --bg:#0d1021; --panel:#151a2e; --panel2:#1b2140; --border:#262d4a;
@@ -15,10 +16,13 @@
   .mono { font-family:ui-monospace,'SF Mono',Consolas,monospace; }
   .up { color:var(--green); } .down { color:var(--red); } .flatc { color:var(--muted); }
 
-  .hdr { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
+  /* v6: top header removed — search strip ab stock panel ke upar (.sp-top) */
+  .stock-col { display:flex; flex-direction:column; gap:8px; min-width:0; }
+  .sp-top { display:flex; align-items:center; gap:10px; background:var(--panel); border:1px solid var(--border);
+            border-radius:12px; padding:6px 12px; flex:none; }
   .live-dot { width:7px; height:7px; border-radius:50%; background:var(--green); animation:pulse 2s infinite; flex:none; }
   @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(34,197,94,.5)} 70%{box-shadow:0 0 0 6px rgba(34,197,94,0)} 100%{box-shadow:0 0 0 0 rgba(34,197,94,0)} }
-  .searchwrap { position:relative; flex:1; max-width:340px; }
+  .searchwrap { position:relative; flex:1; max-width:460px; }
   .searchwrap input { width:100%; background:var(--panel); border:1px solid var(--border); color:var(--text); border-radius:9px;
                       padding:7px 12px; font-size:12px; font-family:inherit; outline:none; }
   .searchwrap input:focus { border-color:var(--brand); }
@@ -27,7 +31,7 @@
   .sdrop div { padding:7px 12px; font-size:12px; cursor:pointer; display:flex; gap:10px; }
   .sdrop div:hover { background:rgba(108,92,231,.15); }
   .sdrop .sec { color:var(--brand); font-weight:700; margin-left:auto; font-size:10.5px; }
-  .hdr .clock { margin-left:auto; color:var(--muted); font-size:10.5px; }
+  .sp-top .clock { margin-left:auto; color:var(--muted); font-size:10.5px; white-space:nowrap; }
 
   .wrap { display:grid; grid-template-columns: minmax(340px,430px) 1fr; gap:14px; align-items:start; }
 
@@ -46,7 +50,7 @@
   .bar.neg { background:linear-gradient(90deg,#b91c1c,#f87171); }
 
   .stock-panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; overflow:hidden;
-                 display:flex; flex-direction:column; max-height:calc(100vh - 60px); }
+                 display:flex; flex-direction:column; max-height:calc(100vh - 76px); }
   .sp-head { padding:10px 16px; border-bottom:1px solid var(--border); display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
   .sp-head h2 { font-size:15px; font-weight:800; }
   .sp-head .avg { font-size:13px; font-weight:800; }
@@ -73,21 +77,23 @@
 </style>
 </head>
 <body>
-  <div class="hdr">
-    <div class="live-dot" title="live via WebSocket"></div>
-    <div class="searchwrap">
-      <input id="q" type="text" placeholder="🔍 Search stock → see its sector…" autocomplete="off" />
-      <div class="sdrop" id="sdrop"></div>
-    </div>
-    <div class="clock mono" id="clock">--:--:-- IST</div>
-  </div>
   <div id="loginWarn" class="loginwarn" style="display:none">
     🔐 Not logged in. <a href="/index.html" target="_top">Open TradeAlgo Pro & sign in</a>, then return here.
   </div>
   <div class="wrap" id="wrap" style="display:none">
     <div class="sector-list" id="sectorList"></div>
-    <div class="stock-panel" id="stockPanel">
-      <div class="empty">👈 Select a sector</div>
+    <div class="stock-col">
+      <div class="sp-top">
+        <div class="live-dot" title="live via WebSocket"></div>
+        <div class="searchwrap">
+          <input id="q" type="text" placeholder="🔍 Search stock → see its sector…   (Shift+S)" autocomplete="off" />
+          <div class="sdrop" id="sdrop"></div>
+        </div>
+        <div class="clock mono" id="clock">--:--:-- IST</div>
+      </div>
+      <div class="stock-panel" id="stockPanel">
+        <div class="empty">👈 Select a sector</div>
+      </div>
     </div>
   </div>
 
@@ -295,6 +301,17 @@ q.addEventListener('input', () => {
   drop.style.display = 'block';
 });
 q.addEventListener('keydown', e => { if (e.key === 'Escape') drop.style.display = 'none'; });
+/* v6: Shift+S = search box focus+open (page me kahin se bhi); Esc = drop band + blur */
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+  if (e.key === 'Escape') { drop.style.display = 'none'; if (document.activeElement === q) q.blur(); return; }
+  if (e.shiftKey && (e.key === 'S' || e.key === 's') && document.activeElement !== q) {
+    e.preventDefault();
+    q.focus();
+    q.select();
+    drop.style.display = q.value.trim() ? drop.style.display : 'none';
+  }
+});
 function jump(sec, token) {
   drop.style.display = 'none';
   q.value = '';

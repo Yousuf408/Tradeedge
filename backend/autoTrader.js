@@ -35,6 +35,15 @@ const VC_MIN_CANDLE_PCT = Number(process.env.VC_MIN_CANDLE_PCT ?? 1.0);
 const VC_CTC_PCT        = Number(process.env.VC_CTC_PCT ?? 1.0);
 const VC_ENTRY_END_MIN  = Number(process.env.VC_ENTRY_END_MIN ?? 14 * 60 + 30);
 const VC_SECTOR_GATE    = String(process.env.VC_SECTOR_GATE ?? 'true') === 'true';   // v3.1: sector-majority confirmation vs DAY OPEN
+const VC_ENTRIES        = String(process.env.VC_ENTRIES ?? 'false') === 'true';      // v3.3: VC entries OFF by default (ORB is the entry engine now)
+
+/* ---- v3.3 ORB ENTRY ENGINE (9:15–9:30 candle breakout) ---- */
+const ORB_MAX_SIZE      = Number(process.env.ORB_MAX_SIZE ?? 1.5);        // first 15-min candle size cap %
+const ORB_ENTRY_START   = 9 * 60 + 30;                                    // entries only after candle completes
+const ORB_ENTRY_END_MIN = Number(process.env.ORB_ENTRY_END_MIN ?? 14 * 60 + 30);
+const ORB_SECTOR_GATE   = String(process.env.ORB_SECTOR_GATE ?? 'true') === 'true';
+const ORB_ENABLED       = String(process.env.ORB_ENGINE ?? 'true') === 'true';
+const orbEntered = new Set();   // token → already entered today (one entry per stock per day)
 
 let db = null;
 let getJwt = null;
@@ -47,6 +56,7 @@ let getDayOpen = () => null;
 let getTodayMinutes = () => null;
 let getUsers = async () => [];
 let sectorByToken = {};   // v3.1: token -> sector (from grouped nifty500 file)
+let getOrb = () => null;  // v3.3: token -> { high, low, size, volume } of first 15-min candle
 let onVCChange = null;
 let live = false;
 
@@ -77,6 +87,7 @@ export function initAutoTrader(deps) {
   getTodayMinutes = deps.getTodayMinutes || (() => null);
   getUsers = deps.getUsers || (async () => []);
   sectorByToken = deps.sectorByToken || {};
+  getOrb = deps.getOrb || (() => null);
   onVCChange = deps.onVCChange || null;
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
   console.log(`🤖 AutoTrader v3.0 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | VC engine: ${VC_ENABLED ? 'ON' : 'OFF'} | Dynamic MIX Enabled`);
@@ -205,12 +216,12 @@ export function vcOnMinuteCandle(token, c) {
    VC ENGINE — tick trigger (called from onTickPos for every tick)
    ============================================================ */
 function vcOnTick(tk, ltp) {
-  if (!VC_ENABLED) return;
+  if (!VC_ENABLED || !VC_ENTRIES) return;   // v3.3: VC entries off by default — ORB is the entry engine
   const st = vcState.get(tk);
   if (!st || st.entered || st.done) return;
   const ist = getIST();
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  if (mins < 9 * 60 + 15 || mins >= VC_ENTRY_END_MIN) return;
+  if (mins < 9 * 60 + 16 || mins >= VC_ENTRY_END_MIN) return;   // v3.2: entries from 9:16 (first candle close), never 9:15
   if (!Number.isFinite(ltp) || ltp <= 0) return;
 
   const hit = st.side === 'BUY' ? ltp >= st.trigger : ltp <= st.trigger;
@@ -233,10 +244,10 @@ function vcOnTick(tk, ltp) {
   st.entered = true;
   console.log(`🎯 VC TRIGGER ${st.sym} ${st.side} @${ltp} | trigger=${st.trigger} mode=${st.mode}`);
   vcNotify();
-  vcPlaceEntries(tk, st, ltp).catch(e => console.error('🤖 VC entry error:', e.message));
+  placeEntries(tk, { sym: st.sym, side: st.side, sl: st.sl0, strat: 'vc', tag: 'VC' }, ltp).catch(e => console.error('🤖 VC entry error:', e.message));
 }
 
-async function vcPlaceEntries(tk, st, ltp) {
+async function placeEntries(tk, o, ltp) {
   if (posDate !== todayIST()) {
     positions.clear();
     liveOrdered.clear();
@@ -245,7 +256,7 @@ async function vcPlaceEntries(tk, st, ltp) {
   const users = await getUsers();
   for (const u of users) {
     const userMode = u.sideMode || 'MIX';
-    if (userMode !== 'MIX' && userMode !== st.side) continue;
+    if (userMode !== 'MIX' && userMode !== o.side) continue;
 
     let userEntryCount = 0;
     for (const p of positions.values()) if (p.userId === u.userId) userEntryCount++;
@@ -269,29 +280,29 @@ async function vcPlaceEntries(tk, st, ltp) {
     if (qty < 1) continue;
 
     const pos = {
-      userId: u.userId, token: tk, sym: st.sym || symByToken[tk] || '?', qty,
-      side: st.side,
+      userId: u.userId, token: tk, sym: o.sym || symByToken[tk] || '?', qty,
+      side: o.side,
       entry: +entryLtp.toFixed(2),
-      sl: +st.sl0.toFixed(2),
+      sl: +o.sl.toFixed(2),
       stage: 0,
       peak: +entryLtp.toFixed(2),
       status: 'open', reason: null, exitPrice: null,
       entryAt: new Date().toISOString(), exitAt: null,
-      strat: 'vc'
+      strat: o.strat
     };
     positions.set(key, pos);
 
-    const orderKey = `${st.side}:${tk}`;
+    const orderKey = `${o.side}:${tk}`;
     if (live && !liveOrdered.has(orderKey)) {
       liveOrdered.add(orderKey);
       try {
         const oid = await placeOrder({ token: tk, sym: pos.sym, side: pos.side, qty: pos.qty });
-        console.log(`🤖 VC ${pos.side} ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} order=${oid}`);
+        console.log(`🤖 ${o.tag} ${pos.side} ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} order=${oid}`);
       } catch (e) {
         console.error(`🤖 VC ${pos.side} failed ${pos.sym}: ${e.message}`);
       }
     } else if (!live) {
-      console.log(`🤖 [PAPER] VC ${pos.side} ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} user=${u.userId}`);
+      console.log(`🤖 [PAPER] ${o.tag} ${pos.side} ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} user=${u.userId}`);
     }
     savePos(pos, posDate).catch(() => {});
   }
@@ -369,17 +380,52 @@ export function getVCStatus() {
   return { date: vcDate, watchDate: vcWatchDateUsed, watch, state };
 }
 
+/* ---------- v3.3 ORB ENTRY ENGINE ----------
+   Entry = LTP breaks the 9:15-9:30 candle high (BUY) / low (SELL).
+   Only candles with size <= ORB_MAX_SIZE qualify. SL = opposite end.
+   One entry per stock per day. Sector-majority gate optional.      */
+function orbOnTick(tk, ltp) {
+  if (!ORB_ENABLED || orbEntered.has(tk)) return;
+  const ist = getIST();
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  if (mins < ORB_ENTRY_START || mins >= ORB_ENTRY_END_MIN) return;
+  if (!Number.isFinite(ltp) || ltp <= 0) return;
+  const orb = getOrb(tk);
+  if (!orb || !(orb.high > 0) || !(orb.low > 0)) return;
+  if (orb.size > ORB_MAX_SIZE) return;
+  let side = null;
+  if (ltp >= orb.high) side = 'BUY';
+  else if (ltp <= orb.low) side = 'SELL';
+  if (!side) return;
+  if (ORB_SECTOR_GATE) {
+    const sector = sectorByToken[tk] || 'MISC';
+    const sb = sectorBias(sector);
+    if (sb.up || sb.down) {
+      if (sb.side !== side) {
+        console.log(`🚫 ORB ${symByToken[tk] || tk} ${side} held: sector ${sector} majority ${sb.side || 'TIE'} (${sb.up}↑/${sb.down}↓ vs open)`);
+        return;
+      }
+    }
+  }
+  orbEntered.add(tk);
+  const sl = side === 'BUY' ? orb.low : orb.high;
+  console.log(`🎯 ORB TRIGGER ${symByToken[tk] || tk} ${side} @${ltp} | ORB ${orb.low}–${orb.high} size ${orb.size}% | SL ${sl}`);
+  placeEntries(tk, { sym: symByToken[tk] || '?', side, sl, strat: 'orb', tag: 'ORB' }, ltp)
+    .catch(e => console.error('🤖 ORB entry error:', e.message));
+}
+
 export function onTickPos(token, ltp) {
   const tk = String(token);
 
-  vcOnTick(tk, ltp);   // v3.0: VC entry trigger check (lightweight, in-memory)
+  orbOnTick(tk, ltp);  // v3.3: ORB entry trigger (9:15-9:30 candle breakout)
+  vcOnTick(tk, ltp);   // v3.0: VC entry trigger check (OFF by default now)
 
   for (const [key, pos] of positions) {
     if (pos.token !== tk || pos.status !== 'open') continue;
     let changed = false;
 
     /* ---- v3.0: VC positions — candle SL → CTC at +1%, NO trail ---- */
-    if (pos.strat === 'vc') {
+    if (pos.strat === 'vc' || pos.strat === 'orb') {
       if (pos.stage === 0) {
         const ctcHit = pos.side === 'BUY'
           ? ltp >= pos.entry * (1 + VC_CTC_PCT / 100)
@@ -489,6 +535,7 @@ export async function loadOpenPositions(date, userId) {
       });
     }
     posDate = date;
+    for (const r of rows) orbEntered.add(String(r.token));   // v3.3: no re-entry on stocks already traded today
     const open = rows.filter(r => r.status === 'open').length;
     console.log(`🤖 Positions loaded: ${rows.length} total, ${open} open${userId ? ` (user=${userId})` : ''}`);
   } catch (e) {

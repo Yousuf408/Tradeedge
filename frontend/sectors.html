@@ -6,6 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sector Analysis — TradeAlgo Pro</title>
 <!-- v6 (2026-10-27): search box stock-section me table ke upar; Shift+S shortcut; top header strip removed -->
+<!-- v7 (2026-11-02): VC watchlist tick (✓ purple) stock ke naam ke aage; /api/screener/vc se; 15-min refresh -->
 <style>
   :root {
     --bg:#0d1021; --panel:#151a2e; --panel2:#1b2140; --border:#262d4a;
@@ -69,6 +70,8 @@
   tbody tr:hover { background:rgba(108,92,231,.07); }
   td.sym { font-weight:700; }
   tr.flash { animation:flash 1.2s ease; }
+  /* v7: VC watchlist tick */
+  .vc-tick { color:#a78bfa; font-weight:700; margin-left:5px; font-size:12px; cursor:help; text-shadow:0 0 6px rgba(167,139,250,.45); }
   @keyframes flash { 0%{background:rgba(108,92,231,.35)} 100%{background:transparent} }
   .empty { color:var(--muted); text-align:center; padding:60px 20px; font-size:12.5px; }
   .loginwarn { background:rgba(239,68,68,.08); border:1px solid var(--red); color:#ffb4b4; border-radius:12px; padding:18px; text-align:center; font-size:13px; margin-top:14px; }
@@ -104,6 +107,32 @@ const EMO = { BANK:'🏦', FINANCIAL:'💰', IT:'💻', PHARMA:'💊', AUTO:'�
 let SECTORS = [], ACTIVE = null, SORT_KEY = 'prevPct';
 let BY = {};            // token -> stock object ref
 let ROWS = {};          // token -> {ltp, prev, open, orb} cell refs
+
+/* ---------- v7: VC watchlist tick ---------- */
+let VC = {};            // token -> {rangePct, watchDate}
+async function loadVC() {
+  const tk = getToken(); if (!tk) return;
+  try {
+    const r = await fetch(API + '/api/screener/vc', { headers: { Authorization: 'Bearer ' + tk } });
+    const d = await r.json();
+    if (!d || !d.ok) return;
+    VC = {};
+    for (const [t, w] of Object.entries(d.watch || {})) VC[t] = { rangePct: w.rangePct, watchDate: d.watchDate };
+    applyVCTicks();
+  } catch (e) { console.error('VC tick load failed:', e); }
+}
+function applyVCTicks() {
+  document.querySelectorAll('tbody tr[data-tk]').forEach(tr => {
+    const cell = tr.querySelector('.sym'); if (!cell) return;
+    const v = VC[tr.dataset.tk];
+    let sp = cell.querySelector('.vc-tick');
+    if (v) {
+      if (!sp) { sp = document.createElement('span'); sp.className = 'vc-tick'; cell.appendChild(sp); }
+      sp.textContent = '\u2713';
+      sp.title = 'VC watchlist \u00b7 kal ka range ' + (v.rangePct != null ? (+v.rangePct).toFixed(2) : '?') + '%' + (v.watchDate ? ' (' + v.watchDate + ' candles)' : '');
+    } else if (sp) sp.remove();
+  });
+}
 let CARDS = {};         // sector -> {pc, ud, bar} refs
 let orderSig = '';
 
@@ -182,6 +211,7 @@ function renderStocks() {
   });
   paintRows();
   paintHead();
+  applyVCTicks();   // v7: re-render ke baad ticks wapas lagao
 }
 
 /* ---------- targeted paints (no re-render, no scroll jump) ---------- */
@@ -329,6 +359,8 @@ setInterval(() => {
 load();
 setInterval(load, 5000);
 startSSE();
+loadVC();                              // v7: VC ticks
+setInterval(loadVC, 15 * 60 * 1000);   // watchlist din me fix rehti hai; 15-min refresh sirf date-roll ke liye
 </script>
 </body>
 </html>

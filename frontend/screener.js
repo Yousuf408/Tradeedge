@@ -14,6 +14,8 @@ let SCREENER_LEVERAGE = {};
 let SCREENER_MARGIN_PS = {};
 let SCREENER_CHIPS = [];
 let SCREENER_VC = { watch: {}, state: {}, date: null };   // v5.43: VC candidates badge/chip
+let SCREENER_ORB = [];          // v5.45: ORB-15 list (size <= 1.5%)
+let SCREENER_ORB_DONE = false;
 let SCREENER_LASTUPD = {};
 let SCREENER_VWAP = {};
 let SCREENER_RSI_FIRST = {};
@@ -77,6 +79,8 @@ async function initScreener() {
   await loadLTP();
   await loadChips();
   await loadVC();
+  await loadORB();
+  setInterval(loadORB, 10000);   // v5.45: keep ORB list fresh (light route)
   SCREENER_INIT_DONE = true;
   startSSE();
 }
@@ -219,6 +223,22 @@ async function loadVC() {
   } catch (e) { console.error('VC load failed:', e); }
 }
 
+// v5.45: ORB-15 list (first 15-min candle size <= 1.5%)
+async function loadORB() {
+  try {
+    const r = await fetch(API + '/api/screener/orb', {
+      headers: { Authorization: 'Bearer ' + getToken() }
+    });
+    const d = await r.json();
+    if (d && d.list) {
+      SCREENER_ORB = d.list;
+      SCREENER_ORB_DONE = !!d.done;
+      renderChips();
+      if (SCREENER_MOMENTUM_FILTER === 'orb15') renderScreenerTable();
+    }
+  } catch (e) { console.error('ORB load failed:', e); }
+}
+
 /* ============================================================
    SECTION 2.1 — FILTERS + CHIPS
    ============================================================ */
@@ -234,6 +254,9 @@ function setMomentumFilter(key) {
   } else if (key === 'vc_candidates') {
     SCREENER_SORT_BY = 'vc_range';
     SCREENER_SORT_DIR = 'asc';
+  } else if (key === 'orb15') {
+    SCREENER_SORT_BY = 'change';
+    SCREENER_SORT_DIR = 'desc';
   } else {
     SCREENER_SORT_BY = 'change';
     SCREENER_SORT_DIR = 'desc';
@@ -293,7 +316,8 @@ function renderChips() {
       chip('sell_candidates', `📉 Top Shorts (${scCount})`) +
       chip('all', 'All') +
       chip('rsi_chips', '🔒 RSI Chips') +
-      chip('vc_candidates', `🎯 ${vcWatchLabel()} (${vcCount})`);
+      chip('vc_candidates', `🎯 ${vcWatchLabel()} (${vcCount})`) +
+      chip('orb15', `🎯 ORB-15 (${SCREENER_ORB.length})`);
       
     el.style.display = '';
     return;
@@ -967,6 +991,31 @@ function renderScreenerTable() {
   if (!head || !body) return;
 
   if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
+    // v5.45: ORB-15 section — its own 4-column table
+    if (SCREENER_MOMENTUM_FILTER === 'orb15') {
+      head.innerHTML = `<tr>
+        <th>SYMBOL</th>
+        <th>LTP</th>
+        <th>9:15 CANDLE SIZE %</th>
+        <th>VOLUME (first 15-min)</th>
+      </tr>`;
+      if (!SCREENER_ORB.length) {
+        body.innerHTML = `<tr><td colspan="4" style="text-align:center;padding:60px;color:var(--text-muted)">
+          ${SCREENER_ORB_DONE ? 'No stocks with first 15-min candle ≤ 1.5% today.' : '🎯 ORB forms at 9:30 — list appears automatically.'}
+        </td></tr>`;
+      } else {
+        body.innerHTML = SCREENER_ORB.map(o => `
+          <tr data-token="${o.token}">
+            <td><span class="sym">${o.sym}</span><span class="tok">${o.token}</span></td>
+            <td style="white-space:nowrap"><span class="cell-primary ltp-cell">${o.ltp ? '₹' + (+o.ltp).toFixed(2) : '—'}</span></td>
+            <td style="font-weight:800;color:${o.size <= 1 ? 'var(--success)' : '#F5A623'}">${o.size.toFixed(2)}%</td>
+            <td style="font-family:ui-monospace,monospace;font-size:12px">${formatQty(o.volume)}</td>
+          </tr>`).join('');
+      }
+      if (count) count.textContent = `${SCREENER_ORB.length} ORB stocks (candle ≤ 1.5%)`;
+      renderChips();
+      return;
+    }
     const isOpenGainTab = SCREENER_MOMENTUM_FILTER === 'open_gain';
     const isSellTab = SCREENER_MOMENTUM_FILTER === 'sell_candidates';
     const showRankCol = isOpenGainTab || isSellTab;

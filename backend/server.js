@@ -350,6 +350,7 @@ let chipDate = null;
 // v5.45 ORB-15: first 15-min candle (9:15–9:30) per stock, computed once at 9:30
 const orbCache = new Map();      // token -> { high, low, size, volume }
 let orbDoneDate = null;
+const orbForming = new Map();    // v5.45: live forming 9:15–9:30 candle (tick-built) for pre-9:30 display
 
 let latestBreadth = { adv: 0, dec: 0 };
 
@@ -1128,6 +1129,15 @@ function handleTick(token, ltp, tickMs, extra) {
   if (!currentMinHighs.has(tk) || ltp > currentMinHighs.get(tk)) currentMinHighs.set(tk, ltp);
   if (!currentMinLows.has(tk) || ltp < currentMinLows.get(tk)) currentMinLows.set(tk, ltp);
 
+  // v5.45: live-forming first 15-min candle (9:15:00–9:29:59) for the ORB size column
+  const minsNow = getIST().getUTCHours() * 60 + getIST().getUTCMinutes();
+  if (minsNow >= 555 && minsNow <= 569 && ltp > 0) {
+    const f = orbForming.get(tk) || { h: ltp, l: ltp };
+    if (ltp > f.h) f.h = ltp;
+    if (ltp < f.l) f.l = ltp;
+    orbForming.set(tk, f);
+  }
+
   if (extra && Number.isFinite(extra.volume) && extra.volume > 0) {
     const today = getIST().toISOString().split('T')[0];
     if (vwapDate !== today) { vwapPV.clear(); vwapV.clear(); vwapDate = today; }
@@ -1405,6 +1415,14 @@ app.get('/api/screener/orb', auth, (req, res) => {
 });
 
 // v5.45: sector-wise live analysis (direction vs DAY OPEN, ranked best → worst)
+function orbSizeFor(t) {
+  const done = orbCache.get(t);
+  if (done) return done.size;
+  const f = orbForming.get(t);
+  if (f && f.l > 0) return +(((f.h - f.l) / f.l) * 100).toFixed(2);
+  return null;   // before 9:15 → blank
+}
+
 app.get('/api/sectors', auth, (req, res) => {
   const by = {};
   for (const s of STOCKS) {
@@ -1414,9 +1432,10 @@ app.get('/api/sectors', auth, (req, res) => {
     const open = bsCache.get(t)?.dayOpen ?? null;
     const pc = prevCloseCache.get(t) || null;
     const e = by[sec] || (by[sec] = { sector: sec, up: 0, down: 0, flat: 0, noData: 0, sumOpen: 0, nOpen: 0, sumPrev: 0, nPrev: 0, stocks: [] });
+    const orbSize = orbSizeFor(t);
     if (!ltp || ltp <= 0) {
       e.noData++;
-      e.stocks.push({ sym: s.sym, token: t, ltp: null, openPct: null, prevPct: null });
+      e.stocks.push({ sym: s.sym, token: t, ltp: null, open, prev: pc, openPct: null, prevPct: null, orbSize });
       continue;
     }
     let openPct = null, prevPct = null;
@@ -1435,7 +1454,7 @@ app.get('/api/sectors', auth, (req, res) => {
       e.sumPrev += prevPct;
       e.nPrev++;
     }
-    e.stocks.push({ sym: s.sym, token: t, ltp, openPct, prevPct });
+    e.stocks.push({ sym: s.sym, token: t, ltp, open, prev: pc, openPct, prevPct, orbSize });
   }
   const sectors = Object.values(by).map(e => ({
     ...e,
@@ -2401,6 +2420,7 @@ async function computeOrbCandles(date) {
     } catch (e) { console.error('🎯 ORB save failed:', e.message); }
   }
   orbDoneDate = date;
+  orbForming.clear();   // forming candle no longer needed after finalize
   const tight = [...orbCache.values()].filter(x => x.size <= 1.5).length;
   console.log(`🎯 ORB-15 candles computed: ${toks.length} stocks | size ≤1.5%: ${tight}`);
 }
@@ -2769,6 +2789,7 @@ function scheduleMorningPreload() {
     chipDate = null;
     orbCache.clear();          // v5.45: fresh ORB for the new day
     orbDoneDate = null;
+    orbForming.clear();
     console.log('🧹 v5.41 morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
@@ -2862,7 +2883,8 @@ app.listen(PORT, async () => {
     }),
     getUsers: buildAutoUsers,
     onVCChange: () => broadcastVC(),
-    sectorByToken: SECTOR_BY_TOKEN
+    sectorByToken: SECTOR_BY_TOKEN,
+    getOrb: (t) => orbCache.get(String(t)) || null
   });
   await loadOpenPositions(getIST().toISOString().split('T')[0]);
   await loadVCWatchlist(getIST().toISOString().split('T')[0], getVCWatchDate());

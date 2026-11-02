@@ -9,49 +9,129 @@
 <link rel="stylesheet" href="styles.css" />
 <style>
 /* ============================================================
-   v2 (2026-10-27) — SLIDING DRAWER HEADER (left sidebar, screenshot style)
-   Purani 72px navbar hat gayi → ☰ button + left slide-in drawer.
+   v3 (2026-10-27) — CODINGLAB-STYLE SIDEBAR (icon-rail <-> full sidebar)
+   Desktop : sidebar ALWAYS visible. Closed = 78px icon rail (sirf icons),
+             Open = 252px full menu. Content PUSH hota hai, overlay NAHIN.
+   Mobile  : <=900px off-canvas drawer + ☰ fab + backdrop.
    Classes .navbar/.nav-links/.nav-right JAANBUJH ke rakhi hai taaki
    admin.js/orders.js ke bindings aur logged-out hide rules waise hi kaam karein.
    ============================================================ */
+body { --sbw: 78px; }
+body.sb-open { --sbw: 252px; }
+
+/* --- sidebar shell --- */
+.navbar.sidebar {
+  position:fixed; top:0; left:0; height:100vh; width:var(--sbw);
+  z-index:110; display:flex; flex-direction:column; flex-wrap:nowrap;
+  align-items:stretch; justify-content:flex-start; gap:6px;
+  padding:14px 12px; overflow:hidden;
+  background:var(--bg-secondary);
+  border-bottom:none; border-right:1px solid var(--border-soft);
+  box-shadow:var(--shadow-sm); backdrop-filter:none;
+  transition:width .26s cubic-bezier(.2,0,0,1);
+}
+body.impersonating .navbar.sidebar { height:calc(100vh - 42px); }
+
+/* --- round edge toggle (codinglab arrow) — sidebar ke bahar, isliye clip nahi hota --- */
+#sbToggle {
+  position:fixed; left:calc(var(--sbw) - 13px); top:24px; z-index:115;
+  width:26px; height:26px; border-radius:50%; padding:0;
+  border:1px solid var(--border-soft); background:var(--bg-secondary);
+  color:var(--text-secondary); display:flex; align-items:center; justify-content:center;
+  cursor:pointer; box-shadow:var(--shadow-sm);
+  transition:left .26s cubic-bezier(.2,0,0,1), color .15s;
+}
+#sbToggle:hover { color:var(--brand); }
+#sbToggle svg { transition:transform .26s; display:block; }
+body.sb-open #sbToggle svg { transform:rotate(180deg); }
+body.impersonating #sbToggle { top:66px; }
+body.logged-out #sbToggle { display:none; }
+
+/* --- head / brand --- */
+.sb-head { display:flex; align-items:center; gap:10px; padding:2px 2px 12px;
+           border-bottom:1px solid var(--border-soft); margin-bottom:6px; min-height:40px; }
+.sb-logo { flex:0 0 40px; width:40px; height:40px; border-radius:12px;
+           background:var(--gradient-brand); display:flex; align-items:center;
+           justify-content:center; font-size:19px; box-shadow:0 4px 14px rgba(108,92,231,.35); }
+.sb-brand { font-size:16px; font-weight:800; color:var(--text-primary); }
+.sb-brand span { color:var(--brand); }
+.sb-x { display:none; margin-left:auto; background:none; border:none; color:var(--text-muted);
+        font-size:15px; cursor:pointer; padding:6px 9px; border-radius:8px; font-family:inherit; }
+.sb-x:hover { background:rgba(108,92,231,0.10); color:var(--text-primary); }
+
+/* --- labels: rail closed par hide --- */
+.sidebar .nl { white-space:nowrap; opacity:1; transition:opacity .16s .08s; }
+body:not(.sb-open) .sidebar .nl { opacity:0; width:0; overflow:hidden; transition:opacity .1s; }
+
+/* --- nav links --- */
+.sidebar .nav-links { flex-direction:column; flex-wrap:nowrap; gap:4px; margin:4px 0 0; }
+.sidebar .nav-links li { list-style:none; }
+.sidebar .nav-links a { display:flex; align-items:center; gap:12px; width:100%;
+                        padding:10px 12px; border-radius:10px; }
+.sidebar .nav-links a .ni { flex:0 0 24px; width:24px; text-align:center; font-size:17px; }
+body:not(.sb-open) .sidebar .nav-links a { justify-content:center; gap:0; padding:11px 0; }
+
+/* --- bottom block (status / balance / theme / user) --- */
+.sidebar .nav-right { flex-direction:column; align-items:stretch; gap:10px;
+                      margin-top:auto; padding-top:12px; border-top:1px solid var(--border-soft); }
+.sidebar .balance { text-align:center; }
+body:not(.sb-open) .sidebar .balance { display:none; }
+.sidebar #userPill { width:100%; justify-content:flex-start; background:rgba(108,92,231,0.08);
+                     border:none; padding:8px 10px; border-radius:10px; font-weight:700;
+                     font-size:14px; color:var(--text-primary); cursor:pointer;
+                     font-family:inherit; display:flex; align-items:center; gap:10px; }
+.sidebar #userPill .ni { flex:0 0 24px; width:24px; text-align:center; font-size:16px; }
+.sidebar .avatar-menu { left:0; right:auto; top:auto; bottom:52px; width:100%; min-width:0; }
+body:not(.sb-open) .sidebar .status { justify-content:center; }
+body:not(.sb-open) .sidebar .theme-toggle,
+body:not(.sb-open) .sidebar #userPill { align-self:center; }
+body:not(.sb-open) .sidebar #userPill { padding:8px 8px; }
+body:not(.sb-open) .sidebar .avatar-wrap { align-self:center; }
+body:not(.sb-open) .sidebar .avatar-menu { left:44px; bottom:0; width:224px; }
+
+/* --- main column: push, overlay nahi --- */
+.main-col { margin-left:var(--sbw); min-width:0;
+            transition:margin-left .26s cubic-bezier(.2,0,0,1); }
+body.impersonating .main-col { padding-top:42px; }
+
+/* --- mobile fab: desktop par hidden --- */
 .navbar.fab-menu {
-  position:fixed; top:8px; left:10px; z-index:120;
-  width:42px; height:40px; padding:0;
-  display:flex; align-items:center; justify-content:center;
+  display:none; position:fixed; top:8px; left:10px; z-index:120;
+  width:42px; height:40px; padding:0; align-items:center; justify-content:center;
   background:var(--bg-secondary); border:1px solid var(--border-soft); border-radius:10px;
   box-shadow:var(--shadow-sm); cursor:pointer; font-size:17px; line-height:1;
   color:var(--text-primary); backdrop-filter:none; transition:var(--t);
 }
 .navbar.fab-menu:hover { background:rgba(108,92,231,0.12); }
-.navbar.drawer {
-  position:fixed; top:0; left:0; height:100vh; width:272px; z-index:110;
-  display:flex; flex-direction:column; align-items:stretch; justify-content:flex-start;
-  flex-wrap:nowrap; gap:6px; padding:14px 14px 18px; overflow-y:auto;
-  background:var(--bg-secondary);
-  border-bottom:none; border-right:1px solid var(--border-soft);
-  box-shadow:var(--shadow-lg); backdrop-filter:none;
-  transform:translateX(-105%); transition:transform .28s cubic-bezier(.2,0,0,1);
-}
-.navbar.drawer.open { transform:translateX(0); }
-body.impersonating .navbar.drawer { top:42px; height:calc(100vh - 42px); }
-.drawer-head { display:flex; align-items:center; justify-content:space-between;
-               padding:2px 6px 12px; border-bottom:1px solid var(--border-soft); margin-bottom:8px; }
-.drawer-head .logo { font-size:19px; }
-.drawer-close { background:none; border:none; color:var(--text-muted); font-size:15px;
-                cursor:pointer; padding:6px 9px; border-radius:8px; font-family:inherit; }
-.drawer-close:hover { background:rgba(108,92,231,0.10); color:var(--text-primary); }
-.drawer .nav-links { flex-direction:column; gap:4px; flex-wrap:nowrap; }
-.drawer .nav-links a { display:flex; align-items:center; width:100%; padding:10px 14px; }
-.drawer .nav-right { flex-direction:column; align-items:stretch; gap:12px;
-                     margin-top:auto; padding-top:14px; border-top:1px solid var(--border-soft); }
-.drawer .nav-right .balance { text-align:center; }
-.drawer .avatar-wrap { width:100%; }
-.drawer #userPill { width:100%; justify-content:space-between; }
-.drawer .avatar-menu { left:0; right:auto; top:46px; width:100%; min-width:0; }
 .drawer-backdrop { position:fixed; inset:0; background:rgba(8,10,20,.45); z-index:105;
                    opacity:0; pointer-events:none; transition:opacity .25s; }
 .drawer-backdrop.show { opacity:1; pointer-events:auto; }
-.ticker-wrap { padding-left:64px; }   /* ☰ button ki jagah */
+
+/* ============ MOBILE (<=900px): off-canvas drawer ============ */
+@media (max-width: 900px) {
+  body, body.sb-open { --sbw:0px; }
+  .navbar.sidebar { width:270px; transform:translateX(-105%);
+                    transition:transform .28s cubic-bezier(.2,0,0,1);
+                    padding:14px 14px 16px; top:0 !important; height:100vh !important;
+                    box-shadow:var(--shadow-lg); overflow-y:auto; }
+  body.sb-mobile-open .navbar.sidebar { transform:translateX(0); }
+  body.impersonating.sb-mobile-open .navbar.sidebar { top:42px !important; height:calc(100vh - 42px) !important; }
+  .main-col { margin-left:0; }
+  .navbar.fab-menu { display:flex; }
+  #sbToggle { display:none; }
+  .sb-x { display:block; }
+  /* rail rules OFF — mobile par labels hamesha full */
+  body:not(.sb-open) .sidebar .nl { opacity:1; width:auto; overflow:visible; }
+  body:not(.sb-open) .sidebar .balance { display:block; }
+  body:not(.sb-open) .sidebar .nav-links a { justify-content:flex-start; gap:12px; padding:10px 12px; }
+  body:not(.sb-open) .sidebar .status { justify-content:flex-start; }
+  body:not(.sb-open) .sidebar .theme-toggle,
+  body:not(.sb-open) .sidebar #userPill,
+  body:not(.sb-open) .sidebar .avatar-wrap { align-self:stretch; }
+  body:not(.sb-open) .sidebar #userPill { justify-content:flex-start; padding:8px 10px; }
+  body:not(.sb-open) .sidebar .avatar-menu { left:0; bottom:52px; width:100%; }
+  .ticker-wrap { padding-left:60px; }
+}
 </style>
 <script>
   // Apply saved theme before page renders (avoids flash)
@@ -251,27 +331,34 @@ body.impersonating .navbar.drawer { top:42px; height:calc(100vh - 42px); }
 
 
 <!-- ============================================================
-     SECTION 4 — SLIDING DRAWER HEADER (v2: 72px navbar → ☰ + left drawer)
+     SECTION 4 — SIDEBAR (v3: codinglab-style icon-rail <-> full sidebar)
+     Desktop: rail hamesha dikhta hai (icons), arrow se expand/collapse.
+     Mobile : ☰ fab + off-canvas drawer + backdrop.
      ============================================================ -->
-<button id="fabMenu" class="navbar fab-menu" onclick="toggleDrawer()" title="Menu — tabs & account" aria-label="Open menu">☰</button>
-<div class="drawer-backdrop" id="drawerBackdrop" onclick="closeDrawer()"></div>
-<aside id="appDrawer" class="navbar drawer" aria-label="Main menu">
-  <div class="drawer-head">
-    <div class="logo">📊 <span>TradeAlgo</span>Pro</div>
-    <button class="drawer-close" onclick="closeDrawer()" title="Close menu">✕</button>
+<button id="fabMenu" class="navbar fab-menu" onclick="toggleMobileNav()" title="Menu — tabs & account" aria-label="Open menu">☰</button>
+<div class="drawer-backdrop" id="drawerBackdrop" onclick="closeMobileNav()"></div>
+<button id="sbToggle" onclick="toggleSidebar()" title="Expand / collapse menu" aria-label="Expand or collapse menu">
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+       stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+</button>
+<aside id="appSidebar" class="navbar sidebar" aria-label="Main menu">
+  <div class="sb-head">
+    <div class="sb-logo">📊</div>
+    <div class="sb-brand nl">TradeAlgo <span>Pro</span></div>
+    <button class="sb-x" onclick="closeMobileNav()" title="Close menu">✕</button>
   </div>
 
   <ul class="nav-links">
-    <li><a class="active" data-page="screener">🔍 Screener</a></li>
-    <li><a data-page="orders">📋 Orders</a></li>
-    <li><a data-page="ai">🧠 AI Picks</a></li>
-    <li><a data-page="sectors">🏢 Sectors</a></li>
-    <li class="admin-only" style="display:none"><a data-page="users">👥 Users</a></li>
-    <li><a data-page="settings">⚙️ Settings</a></li>
+    <li><a class="active" data-page="screener" title="Screener"><span class="ni">🔍</span><span class="nl">Screener</span></a></li>
+    <li><a data-page="orders" title="Orders"><span class="ni">📋</span><span class="nl">Orders</span></a></li>
+    <li><a data-page="ai" title="AI Picks"><span class="ni">🧠</span><span class="nl">AI Picks</span></a></li>
+    <li><a data-page="sectors" title="Sectors"><span class="ni">🏢</span><span class="nl">Sectors</span></a></li>
+    <li class="admin-only" style="display:none"><a data-page="users" title="Users"><span class="ni">👥</span><span class="nl">Users</span></a></li>
+    <li><a data-page="settings" title="Settings"><span class="ni">⚙️</span><span class="nl">Settings</span></a></li>
   </ul>
 
   <div class="nav-right">
-    <span class="status"><span class="dot"></span> Live</span>
+    <span class="status"><span class="dot"></span><span class="nl">Live</span></span>
     <span class="balance">₹1,24,500</span>
 
     <button id="themeToggleBtn" class="theme-toggle" onclick="toggleTheme()" title="Switch theme">
@@ -279,12 +366,10 @@ body.impersonating .navbar.drawer { top:42px; height:calc(100vh - 42px); }
     </button>
 
     <div class="avatar-wrap">
-      <button id="userPill" onclick="toggleAvatarMenu(event)"
-              style="background:rgba(108,92,231,0.08);border:none;padding:8px 16px;border-radius:10px;
-                     font-weight:700;font-size:14px;color:var(--text-primary);cursor:pointer;
-                     font-family:inherit;display:flex;align-items:center;gap:8px">
-        <span id="userPillName">Loading...</span>
-        <span style="font-size:10px;color:var(--text-muted)">▼</span>
+      <button id="userPill" onclick="toggleAvatarMenu(event)">
+        <span class="ni">👤</span>
+        <span class="nl" id="userPillName">Loading...</span>
+        <span class="nl" style="font-size:10px;color:var(--text-muted)">▼</span>
       </button>
       <div class="avatar-menu" id="avatarMenu">
         <div class="avatar-menu-header">
@@ -300,8 +385,9 @@ body.impersonating .navbar.drawer { top:42px; height:calc(100vh - 42px); }
 </aside>
 
 <!-- ============================================================
-     SECTION 4.1 — MARKET TICKER
+     SECTION 4.1 — MARKET TICKER (main-col ke andar, sidebar ke right)
      ============================================================ -->
+<div class="main-col">
 <div class="ticker-wrap">
   <div class="ticker" id="tickerContent">
     <div class="ticker-item">Loading market data...</div>
@@ -601,6 +687,7 @@ Rahul Verma,9876543212,5d"></textarea>
   </div>
 
 </div>
+</div><!-- /main-col -->
 
 
 <!-- ============================================================
@@ -736,22 +823,41 @@ Rahul Verma,9876543212,5d"></textarea>
 
 <script>
 /* ============================================================
-   v2 — DRAWER CONTROLS (☰ / backdrop / Esc / tab-click par close)
+   v3 — SIDEBAR CONTROLS
+   Desktop : icon-rail <-> full sidebar (push layout, overlay NAHIN)
+   Mobile  : off-canvas drawer + backdrop + ☰ fab
+   State   : localStorage 'ta_sb' (1 = expanded)
    ============================================================ */
-function openDrawer() {
-  document.getElementById('appDrawer').classList.add('open');
+function sbIsOpen() { return document.body.classList.contains('sb-open'); }
+function setSidebar(open, persist) {
+  document.body.classList.toggle('sb-open', !!open);
+  if (persist !== false) localStorage.setItem('ta_sb', open ? '1' : '0');
+}
+function toggleSidebar() { setSidebar(!sbIsOpen()); }
+function openMobileNav() {
+  document.body.classList.add('sb-mobile-open');
   document.getElementById('drawerBackdrop').classList.add('show');
 }
-function closeDrawer() {
-  document.getElementById('appDrawer').classList.remove('open');
+function closeMobileNav() {
+  document.body.classList.remove('sb-mobile-open');
   document.getElementById('drawerBackdrop').classList.remove('show');
 }
-function toggleDrawer() {
-  if (document.getElementById('appDrawer').classList.contains('open')) closeDrawer();
-  else openDrawer();
+function toggleMobileNav() {
+  if (document.body.classList.contains('sb-mobile-open')) closeMobileNav();
+  else openMobileNav();
 }
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
-document.querySelectorAll('.nav-links a').forEach(a => a.addEventListener('click', () => closeDrawer()));
+(function initSidebar() {
+  setSidebar(localStorage.getItem('ta_sb') === '1', false);   // default = icon rail
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    if (document.body.classList.contains('sb-mobile-open')) closeMobileNav();
+    else if (sbIsOpen()) setSidebar(false);
+  });
+  // mobile: tab click par drawer band; desktop: sidebar jaisa hai waisa rahe
+  document.querySelectorAll('.nav-links a').forEach(a => a.addEventListener('click', () => {
+    if (window.matchMedia('(max-width: 900px)').matches) closeMobileNav();
+  }));
+})();
 </script>
 
 </body>

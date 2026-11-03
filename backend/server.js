@@ -1,5 +1,5 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.45 (Sector analysis page API)
+   server.js — TradeAlgo Pro backend  |  v5.46 (ORB-15 official source: GetQuote + historical)
    ============================================================
    CHANGES vs v5.44 (NOTHING else touched):
    15. Stock list loader now accepts BOTH formats: old flat array OR new
@@ -913,8 +913,14 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     }
     if (RSI_SOURCE === 'ws') await updateRSIFromWS(date, prevKey);
 
-    // v5.45: at 9:30 sharp the first 15-min candle is complete → compute + store ORB
-    if (prevKey === '09:29') computeOrbCandles(date).catch(e => console.error('🎯 ORB compute failed:', e.message));
+    // v5.46: OFFICIAL source primary (quote@9:30:05 + historical@9:35, see ORB OFFICIAL section).
+    // WS compute = last-resort fallback: only if by ~9:31 nothing official landed.
+    if (prevKey === '09:29' && orbQuoteDoneDate !== date && orbHistDoneDate !== date) {
+      setTimeout(() => {
+        if (orbQuoteDoneDate !== date && orbHistDoneDate !== date && !orbOfficialRunning)
+          computeOrbCandles(date).catch(e => console.error('🎯 ORB WS fallback failed:', e.message));
+      }, 70000);
+    }
 
     console.log(`🕐 WS minute-close: ${tokens.length} tokens @ ${prevKey}${isFive ? ' (5m)' : ''}`);
   } catch (e) { console.error('WS minute-close flush failed:', e.message); }
@@ -2392,6 +2398,8 @@ async function buildChipList(date) {
    ============================================================ */
 async function computeOrbCandles(date) {
   if (orbDoneDate === date) return;
+  // v5.46: WS = last-resort only. Official (gq/orb archive) cache present ho to skip.
+  if (orbCache.size >= 50) { console.log('🎯 ORB WS fallback skipped — official values already in cache'); return; }
   const toks = [], hs = [], ls = [], szs = [], vols = [];
   for (const s of STOCKS) {
     const tk = String(s.token);
@@ -2400,6 +2408,12 @@ async function computeOrbCandles(date) {
     const C = wsTodayCloses.get(tk) || [];
     const V = wsTodayVols.get(tk) || [];
     if (C.length < 15 || H.length < 15 || L.length < 15) continue;
+    // v5.46 guard: after a mid-session restart H/L arrays start late (DB stores closes only).
+    // Misaligned arrays would compute the WRONG window → never trust them.
+    if (H.length !== C.length || L.length !== C.length) {
+      console.warn(`🎯 ORB WS skip ${tk}: H/L misaligned (restart?) H=${H.length} L=${L.length} C=${C.length}`);
+      continue;
+    }
     const h = Math.max(...H.slice(0, 15));
     const l = Math.min(...L.slice(0, 15));
     if (!(l > 0) || !(h > 0)) continue;
@@ -2427,6 +2441,26 @@ async function computeOrbCandles(date) {
 
 async function loadOrbFromDB(date) {
   if (!date) return;
+  // v5.46: PRIMARY = gq_* (GetQuote official). Fallback = orb_* (historical/WS archive).
+  try {
+    const { rows } = await db.query(
+      `SELECT token, gq_high, gq_low, gq_volume
+       FROM strategy_bs_snapshot
+       WHERE date=$1 AND strategy_id='momentum' AND gq_high IS NOT NULL AND gq_low IS NOT NULL`,
+      [date]
+    );
+    if (rows.length) {
+      orbCache.clear();
+      for (const r of rows) {
+        const h = +r.gq_high, l = +r.gq_low;
+        if (!(h > 0) || !(l > 0)) continue;
+        orbCache.set(String(r.token), { high: h, low: l, size: +(((h - l) / l) * 100).toFixed(2), volume: +r.gq_volume || 0 });
+      }
+      orbDoneDate = date;
+      console.log(`🎯 ORB loaded from gq_* (GetQuote official): ${orbCache.size} stocks for ${date}`);
+      return;
+    }
+  } catch (e) { console.error('🎯 gq_* load failed (ALTER pending?):', e.message); }
   try {
     const { rows } = await db.query(
       `SELECT token, orb_high, orb_low, orb_size, orb_volume
@@ -2439,9 +2473,267 @@ async function loadOrbFromDB(date) {
       orbCache.set(String(r.token), { high: +r.orb_high, low: +r.orb_low, size: +r.orb_size, volume: +r.orb_volume });
     }
     if (rows.length) orbDoneDate = date;
-    if (rows.length) console.log(`🎯 ORB-15 loaded from DB: ${rows.length} stocks for ${date}`);
+    if (rows.length) console.log(`🎯 ORB loaded from orb_* (fallback archive): ${rows.length} stocks for ${date}`);
   } catch (e) { console.error('🎯 ORB load failed:', e.message); }
 }
+
+/* ============================================================
+   v5.46 — ORB-15 OFFICIAL SOURCE (GetQuote @9:30 + historical @9:35 / restart)
+   Why: WS tick-built H/L arrays are memory-only; a mid-session restart left them
+        empty/misaligned → slice(0,15) picked the WRONG 15-min window and garbage
+        got persisted to orb_* columns.
+   Now: broker-official values → same orb_* DB columns → restart-safe (loadOrbFromDB).
+   Flow:
+     09:15–09:29  forming column = quote poll every minute (official day high/low so far)
+     09:30:05     batch GetQuote FULL → orb_* (day H/L at 9:30 ≈ 9:15–9:30 window)
+     09:35:00     historical ONE_MINUTE exact 09:15–09:29 window → overwrite orb_* (authoritative)
+     restart      loadOrbFromDB restores values; if IST ≥09:31 on a trading day → one-shot
+                  historical repair at +45s (also heals stale WS-era values, e.g. today)
+     fallback     v5.45 WS compute only if BOTH official paths failed by ~9:31 (guarded)
+   Rate safety: quote = 2 batch calls/round; historical = ~3 req/s sequential; max 2 attempts.
+   ============================================================ */
+const ANGEL_QUOTE_URL = 'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/';
+let orbQuoteDoneDate = null;   // quote finalize ran for this date
+let orbHistDoneDate = null;    // historical exact overwrite ran for this date
+let orbOfficialRunning = false;
+const orbSleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function angelQuoteBatch(tokens) {
+  // batch FULL quotes in 200-token chunks → Map token -> {high, low, volume}
+  const out = new Map();
+  const chunks = [];
+  for (let i = 0; i < tokens.length; i += 200) chunks.push(tokens.slice(i, i + 200));
+  let jwt = await getAnyAngelJwt();
+  if (!jwt) throw new Error('No Angel JWT for quote');
+  for (const ch of chunks) {
+    const doReq = async j => {
+      const r = await fetch(ANGEL_QUOTE_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json', 'Accept': 'application/json',
+          'X-UserType': 'USER', 'X-SourceID': 'WEB', 'X-ClientLocalIP': '127.0.0.1',
+          'X-ClientPublicIP': '127.0.0.1', 'X-MACAddress': '00:00:00:00:00:00',
+          'X-PrivateKey': process.env.ANGEL_API_KEY, 'Authorization': 'Bearer ' + j
+        },
+        body: JSON.stringify({ mode: 'FULL', exchangeTokens: { NSE: ch } })
+      });
+      if (r.status === 401 || r.status === 403) return { authFail: true };
+      if (r.status === 429) return { rateFail: true };
+      if (!r.ok) throw new Error('quote HTTP ' + r.status);
+      const j2 = await r.json();
+      if (!j2.status || !Array.isArray(j2.data)) throw new Error(j2.message || 'quote no data');
+      return { data: j2.data };
+    };
+    let res = await doReq(jwt);
+    if (res.authFail) { jwt = await getAnyAngelJwt(); if (!jwt) throw new Error('quote re-login failed'); res = await doReq(jwt); }  // max 2 attempts
+    if (!res.data) throw new Error('quote batch failed (auth/rate), stopping');
+    for (const q of res.data) {
+      const tk = String(q.exchangeToken ?? q.exchFeedCode ?? q.symbol ?? '');
+      if (!tk) continue;
+      const h = +q.high, l = +q.low;
+      if (Number.isFinite(h) && Number.isFinite(l) && h > 0 && l > 0)
+        out.set(tk, { high: h, low: l, volume: +q.volume || +q.lastTradedQuantity || 0, open: +q.open || 0, close: +q.ltp || 0 });
+    }
+    await orbSleep(800);
+  }
+  return out;
+}
+
+async function saveOrbToDB(toks, hs, ls, szs, vols, date) {
+  if (!toks.length) return;
+  try {
+    await db.query(
+      `UPDATE strategy_bs_snapshot AS s
+       SET orb_high=v.h, orb_low=v.l, orb_size=v.sz, orb_volume=v.vol
+       FROM unnest($1::text[], $2::numeric[], $3::numeric[], $4::numeric[], $5::numeric[]) AS v(token, h, l, sz, vol)
+       WHERE s.date=$6 AND s.token=v.token AND s.strategy_id='momentum'`,
+      [toks, hs, ls, szs, vols, date]);
+  } catch (e) { console.error('🎯 ORB save failed:', e.message); }
+}
+
+/* v5.46: GetQuote standalone columns (quote-only, kabhi overwrite nahi by historical/WS) */
+async function saveGQToDB(toks, os, hs, ls, cs, vs, date) {
+  if (!toks.length) return;
+  try {
+    await db.query(
+      `UPDATE strategy_bs_snapshot AS s
+       SET gq_open=v.o, gq_high=v.h, gq_low=v.l, gq_close=v.c, gq_volume=v.vol
+       FROM unnest($1::text[], $2::numeric[], $3::numeric[], $4::numeric[], $5::numeric[], $6::numeric[]) AS v(token, o, h, l, c, vol)
+       WHERE s.date=$7 AND s.token=v.token AND s.strategy_id='momentum'`,
+      [toks, os, hs, ls, cs, vs, date]);
+  } catch (e) { console.error('🎯 gq_* save failed (ALTER pending?):', e.message); }
+}
+
+/* v5.46: 1-min candles → 15-min candle series (first candle = exact 9:15–9:30 ORB window) */
+function group15FromCandles(candles, date) {
+  const buckets = new Map();
+  for (const c of candles || []) {
+    let dstr, mins;
+    if (typeof c[0] === 'number') {
+      const d = new Date(c[0] + 5.5 * 3600 * 1000);
+      dstr = d.toISOString().slice(0, 10);
+      mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+    } else {
+      dstr = String(c[0]).slice(0, 10);
+      mins = +String(c[0]).slice(11, 13) * 60 + +String(c[0]).slice(14, 16);
+    }
+    if (dstr !== date || mins < 555 || mins > 930) continue;
+    const bStart = 555 + Math.floor((mins - 555) / 15) * 15;
+    if (!buckets.has(bStart)) buckets.set(bStart, { o: +c[1], h: +c[2], l: +c[3], c: +c[4], v: +c[5] || 0 });
+    else {
+      const b = buckets.get(bStart);
+      if (+c[2] > b.h) b.h = +c[2];
+      if (+c[3] < b.l) b.l = +c[3];
+      b.c = +c[4]; b.v += +c[5] || 0;
+    }
+  }
+  return [...buckets.entries()].sort((a, b) => a[0] - b[0]).map(([m, b]) => ({
+    ...b, ts: `${date}T${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}:00.000+05:30`
+  }));
+}
+
+/* v5.46: historical 15-min series → ws_15min_* (same UPSERT shape as fifteen.js) */
+async function save15MinToDB(tk, sym, rows15, date) {
+  if (!rows15.length) return;
+  try {
+    await db.query(
+      `INSERT INTO strategy_bs_snapshot AS s
+         (date, sym, token, strategy_id,
+          ws_15min_open, ws_15min_high, ws_15min_low, ws_15min_close, ws_15min_volume, ws_15min_ts, fetched_at)
+       VALUES ($1,$2,$3,'momentum',$4::numeric[],$5::numeric[],$6::numeric[],$7::numeric[],$8::numeric[],$9::timestamptz[],NOW())
+       ON CONFLICT (date, token, strategy_id) DO UPDATE SET
+         ws_15min_open=EXCLUDED.ws_15min_open, ws_15min_high=EXCLUDED.ws_15min_high,
+         ws_15min_low=EXCLUDED.ws_15min_low, ws_15min_close=EXCLUDED.ws_15min_close,
+         ws_15min_volume=EXCLUDED.ws_15min_volume, ws_15min_ts=EXCLUDED.ws_15min_ts, fetched_at=NOW()`,
+      [date, sym, tk, rows15.map(x => x.o), rows15.map(x => x.h), rows15.map(x => x.l),
+       rows15.map(x => x.c), rows15.map(x => x.v), rows15.map(x => x.ts)]);
+  } catch (e) { console.error('🎯 ws_15min save failed:', e.message); }
+}
+
+function pushOrb(entries, date, source, mode) {
+  // mode 'quote' → gq_* columns (quote-only) + cache FULL set (engine ka source)
+  // mode 'hist'  → orb_* columns (archive) + cache me sirf MISSING tokens (quote fail ho tab)
+  const toks = [], os = [], hs = [], ls = [], szs = [], cs = [], vols = [];
+  let changed = 0, cacheSet = 0;
+  for (const [tk, v] of entries) {
+    const sz = +(((v.high - v.low) / v.low) * 100).toFixed(2);
+    const prev = orbCache.get(tk);
+    if (!prev || Math.abs(prev.high - v.high) > 0.005 || Math.abs(prev.low - v.low) > 0.005) changed++;
+    toks.push(tk); hs.push(+v.high.toFixed(2)); ls.push(+v.low.toFixed(2)); szs.push(sz); vols.push(v.volume || 0);
+    os.push(v.open || 0); cs.push(v.close || 0);
+    if (mode === 'quote' || !prev) {
+      orbCache.set(tk, { high: +v.high.toFixed(2), low: +v.low.toFixed(2), size: sz, volume: v.volume || 0 });
+      cacheSet++;
+    }
+  }
+  if (mode === 'quote') saveGQToDB(toks, os, hs, ls, cs, vols, date);
+  else saveOrbToDB(toks, hs, ls, szs, vols, date);
+  console.log(`🎯 ORB official (${source}/${mode}): ${toks.length} stocks | cache set ${cacheSet} | changed vs prev ${changed} | size ≤1.5%: ${[...orbCache.values()].filter(x => x.size <= 1.5).length}`);
+  return toks.length;
+}
+
+async function orbFinalizeQuote(date) {
+  if (orbOfficialRunning) return false;
+  orbOfficialRunning = true;
+  try {
+    let q;
+    try { q = await angelQuoteBatch(STOCKS.map(s => String(s.token))); }
+    catch (e) { console.error('🎯 ORB quote attempt 1 failed:', e.message); q = await angelQuoteBatch(STOCKS.map(s => String(s.token))); }
+    if (!q || q.size < 50) throw new Error('quote too few: ' + (q ? q.size : 0));
+    pushOrb(q, date, 'quote@9:30', 'quote');   // gq_* columns + engine cache
+    orbQuoteDoneDate = date; orbDoneDate = date;
+    return true;
+  } catch (e) { console.error('🎯 ORB quote finalize failed twice:', e.message); return false; }
+  finally { orbOfficialRunning = false; }
+}
+
+function orbWindowFromCandles(candles, date) {
+  // [[ts,o,h,l,c,v],...] → exact IST 09:15–09:29 window (15 candles)
+  let h = -1, l = Infinity, v = 0, n = 0;
+  for (const c of candles || []) {
+    let hm, dstr;
+    if (typeof c[0] === 'number') {                       // epoch ms → IST
+      const d = new Date(c[0] + 5.5 * 3600 * 1000);
+      dstr = d.toISOString().slice(0, 10);
+      hm = String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+    } else {
+      dstr = String(c[0]).slice(0, 10);
+      hm = String(c[0]).slice(11, 16);
+    }
+    if (dstr !== date) continue;
+    if (hm < '09:15' || hm > '09:29') continue;
+    const ch = +c[2], cl = +c[3], cv = +c[5] || 0;
+    if (!(ch > 0) || !(cl > 0)) continue;
+    if (ch > h) h = ch;
+    if (cl < l) l = cl;
+    v += cv; n++;
+  }
+  if (n < 15 || !(h > 0) || !Number.isFinite(l) || !(l > 0)) return null;
+  return { high: h, low: l, volume: v };
+}
+
+async function orbRepairHistorical(date, source) {
+  if (orbOfficialRunning) return 0;
+  orbOfficialRunning = true;
+  try {
+    const entries = new Map(); let fails = 0;
+    const fifteenByToken = new Map();   // v5.46: historical → ws_15min_* series
+    const symOf = new Map(STOCKS.map(s => [String(s.token), s.sym]));
+    for (const s of STOCKS) {
+      const tk = String(s.token);
+      try {
+        const candles = await fetchAngelInterval(tk, 'ONE_MINUTE', 0);   // returns raw candle array
+        const w = orbWindowFromCandles(candles, date);
+        if (w) entries.set(tk, w); else fails++;
+        const r15 = group15FromCandles(candles, date);
+        if (r15.length) fifteenByToken.set(tk, r15);
+      } catch (e) { fails++; }
+      await orbSleep(340);   // ~3 req/s = historical rate limit
+    }
+    if (entries.size < 50) { console.error(`🎯 ORB historical (${source}): too few (${entries.size}, fails ${fails})`); return 0; }
+    pushOrb(entries, date, 'historical@' + source, 'hist');   // orb_* archive + cache gap-fill
+    for (const [tk, r15] of fifteenByToken) await save15MinToDB(tk, symOf.get(tk), r15, date);
+    console.log(`🎯 ws_15min_* updated from historical: ${fifteenByToken.size} stocks`);
+    orbHistDoneDate = date; orbDoneDate = date;
+    return entries.size;
+  } finally { orbOfficialRunning = false; }
+}
+
+/* v5.46 scheduler: forming poll · quote finalize · exact overwrite */
+setInterval(() => {
+  const ist = getIST();
+  if (!isTradingDay(ist)) return;   // weekends + trading holidays: no ORB jobs
+  const hh = ist.getUTCHours(), mm = ist.getUTCMinutes(), ss = ist.getUTCSeconds();
+  const hhmm = String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+  const today = ist.toISOString().split('T')[0];
+  const mins = hh * 60 + mm;
+
+  // 09:15–09:29 → official forming H/L for the pre-9:30 column (~every 30s)
+  if (mins >= 555 && mins <= 569 && ss < 4 && !orbOfficialRunning) {
+    angelQuoteBatch(STOCKS.map(s => String(s.token)))
+      .then(q => { for (const [tk, v] of q) orbForming.set(tk, { h: v.high, l: v.low }); })
+      .catch(e => console.error('🎯 ORB forming poll failed:', e.message));
+  }
+  // 09:30:05–09:30:35 → quote finalize (once/day)
+  if (hhmm === '09:30' && ss >= 5 && ss <= 35 && orbQuoteDoneDate !== today && !orbOfficialRunning) {
+    orbFinalizeQuote(today).then(ok => {
+      if (!ok) orbRepairHistorical(today, 'fallback-931').catch(() => {});
+    }).catch(() => {});
+  }
+  // 09:35 → exact historical overwrite (authoritative 9:15–9:30 window)
+  if (hhmm === '09:35' && ss < 10 && orbHistDoneDate !== today && !orbOfficialRunning) {
+    orbRepairHistorical(today, '935').catch(e => console.error('🎯 ORB 9:35 repair failed:', e.message));
+  }
+}, 2000);
+
+/* manual trigger: GET /api/orb/repair?date=YYYY-MM-DD */
+app.get('/api/orb/repair', auth, (req, res) => {
+  const date = String(req.query.date || getIST().toISOString().split('T')[0]);
+  res.json({ ok: true, started: true, date });
+  orbRepairHistorical(date, 'manual')
+    .then(n => console.log(`🎯 ORB manual repair done: ${n} stocks for ${date}`))
+    .catch(e => console.error('🎯 ORB manual repair failed:', e.message));
+});
 
 async function buildAutoUsers() {
   const { rows: dbUsers } = await db.query(`SELECT id, username, side_mode FROM users`);
@@ -2852,6 +3144,16 @@ app.listen(PORT, async () => {
   await loadChipListFromDB(getIST().toISOString().split('T')[0]);
   await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
   await loadOrbFromDB(getScreenerPhase().date);   // v5.45: ORB list survives restarts/after-hours
+
+  // v5.46: restart after 09:31 on a trading day → one-shot official repair (historical exact window).
+  // Heals: (a) mid-session-restart gaps, (b) stale WS-era orb_* values already in DB.
+  {
+    const i0 = getIST(); const m0 = i0.getUTCHours() * 60 + i0.getUTCMinutes();
+    if (isTradingDay(i0) && m0 >= 571) {
+      const d0 = i0.toISOString().split('T')[0];
+      setTimeout(() => orbRepairHistorical(d0, 'startup').catch(e => console.error('🎯 ORB startup repair failed:', e.message)), 45000);
+    }
+  }
   computeBuyersGroups();
   updateMarketBreadth();
 

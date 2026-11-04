@@ -3280,7 +3280,8 @@ app.listen(PORT, async () => {
     getUsers: buildAutoUsers,
     onVCChange: () => broadcastVC(),
     sectorByToken: SECTOR_BY_TOKEN,
-    getOrb: (t) => orbCache.get(String(t)) || null
+    getOrb: (t) => orbCache.get(String(t)) || null,
+    getRvol: (t) => bsCache.get(String(t))?.rvol ?? null
   });
   await loadOpenPositions(getIST().toISOString().split('T')[0]);
   await loadVCWatchlist(getIST().toISOString().split('T')[0], getVCWatchDate());

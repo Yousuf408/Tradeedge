@@ -1,16 +1,15 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.46 (ORB-15 official source: GetQuote + historical)
+   server.js — TradeAlgo Pro backend  |  v5.48 (Manual-Only Heavy Fetches)
    ============================================================
-   CHANGES vs v5.44 (NOTHING else touched):
-   15. Stock list loader now accepts BOTH formats: old flat array OR new
-       grouped sector-wise JSON — and tags every stock with .sector
-   16. SECTOR_BY_TOKEN map built at startup, passed to autoTrader
-       (powers the sector-majority entry gate)
-   17. NEW route GET /api/sectors — live sector-wise analysis
-       (direction vs DAY OPEN, ranked top performer → top loser)
-       for the new frontend/sectors.html page
-   All AI engine, 15-min backfill, progress APIs, VC engine, schedulers,
-   WS/BS/depth, margins, admin routes = exactly as v5.44.
+   CHANGES vs v5.47 (NOTHING else touched):
+   20. Historical 5-min backfill NO LONGER auto-fires at 16:00.
+       Manual only via POST /api/admin/fetch-historical (button).
+   21. Volume backfill NEVER auto-fires. Manual only via
+       POST /api/admin/fetch-volume-backfill (button).
+   22. Volume backfill route now checks pg_locks for 15-min
+       fetch (advisory 7452) to avoid rate-limit collisions.
+   Unchanged: HLC@15:31, BS@9:15, morning preload, AI, VC, margins,
+   WS/SSE, ORB, depth, all admin routes, all screener routes.
    ============================================================ */
 
 // === GLOBAL ERROR HANDLERS (Prevents crashes) ===
@@ -110,7 +109,6 @@ db.on('error', (err) => {
 const SECRET = process.env.JWT_SECRET;
 const __dir = dirname(fileURLToPath(import.meta.url));
 
-// v5.45: accepts BOTH old flat array and new grouped sector-wise JSON
 const RAW_STOCKS = JSON.parse(
   readFileSync(join(__dir, 'brokers/angelone/Angel_nifty500.json'), 'utf8')
 );
@@ -232,8 +230,6 @@ async function loadLastEodVolumeFromDB() {
 async function loadPrevCloseFromDB() {
   try {
     const activeTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
-    // v5.45 fix: on weekends/holidays the "previous close" baseline must come from
-    // the LAST TRADING DAY's prev_close — not today's row, not quote's same-day close
     const istNow = getIST();
     const todayStr = istNow.toISOString().split('T')[0];
     const baseDate = isTradingDay(istNow) ? todayStr : getPreviousTradingDay(istNow);
@@ -254,7 +250,6 @@ async function loadPrevCloseFromDB() {
     if (rows.length < activeTokens.length) {
       const missingTokens = activeTokens.filter(t => !prevCloseCache.has(String(t)));
       if (isTradingDay(istNow)) {
-        // trading day pre-open: quote API's close = previous day's close = correct baseline
         console.log(`🔄 Fetching prevClose via Quote API fallback for missing tokens...`);
         try {
           const quotes = await fetchQuotesForTokens(missingTokens);
@@ -275,7 +270,6 @@ async function loadPrevCloseFromDB() {
           console.error('⚠️ Quote API fallback failed:', apiErr.message);
         }
       } else {
-        // weekend/holiday: baseline = trading day before baseDate's day_close
         const P = getPreviousTradingDay(new Date(baseDate + 'T00:00:00Z'));
         try {
           const { rows: r2 } = await db.query(
@@ -347,10 +341,9 @@ const rsiState = new Map();
 const chipList = new Map();
 let chipDate = null;
 
-// v5.45 ORB-15: first 15-min candle (9:15–9:30) per stock, computed once at 9:30
-const orbCache = new Map();      // token -> { high, low, size, volume }
+const orbCache = new Map();
 let orbDoneDate = null;
-const orbForming = new Map();    // v5.45: live forming 9:15–9:30 candle (tick-built) for pre-9:30 display
+const orbForming = new Map();
 
 let latestBreadth = { adv: 0, dec: 0 };
 
@@ -913,8 +906,6 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     }
     if (RSI_SOURCE === 'ws') await updateRSIFromWS(date, prevKey);
 
-    // v5.46: OFFICIAL source primary (quote@9:30:05 + historical@9:35, see ORB OFFICIAL section).
-    // WS compute = last-resort fallback: only if by ~9:31 nothing official landed.
     if (prevKey === '09:29' && orbQuoteDoneDate !== date && orbHistDoneDate !== date) {
       setTimeout(() => {
         if (orbQuoteDoneDate !== date && orbHistDoneDate !== date && !orbOfficialRunning)
@@ -1135,7 +1126,6 @@ function handleTick(token, ltp, tickMs, extra) {
   if (!currentMinHighs.has(tk) || ltp > currentMinHighs.get(tk)) currentMinHighs.set(tk, ltp);
   if (!currentMinLows.has(tk) || ltp < currentMinLows.get(tk)) currentMinLows.set(tk, ltp);
 
-  // v5.45: live-forming first 15-min candle (9:15:00–9:29:59) for the ORB size column
   const minsNow = getIST().getUTCHours() * 60 + getIST().getUTCMinutes();
   if (minsNow >= 555 && minsNow <= 569 && ltp > 0) {
     const f = orbForming.get(tk) || { h: ltp, l: ltp };
@@ -1403,7 +1393,6 @@ app.get('/api/screener/vc', auth, (req, res) => {
   res.json({ ok: true, ...getVCStatus() });
 });
 
-// v5.45: ORB-15 list — only stocks whose first 15-min candle size <= 1.5%
 app.get('/api/screener/orb', auth, (req, res) => {
   const list = [];
   for (const [t, o] of orbCache) {
@@ -1416,17 +1405,16 @@ app.get('/api/screener/orb', auth, (req, res) => {
       });
     }
   }
-  list.sort((a, b) => a.size - b.size);   // tightest ORB first
+  list.sort((a, b) => a.size - b.size);
   res.json({ ok: true, done: orbDoneDate != null, count: list.length, list });
 });
 
-// v5.45: sector-wise live analysis (direction vs DAY OPEN, ranked best → worst)
 function orbSizeFor(t) {
   const done = orbCache.get(t);
   if (done) return done.size;
   const f = orbForming.get(t);
   if (f && f.l > 0) return +(((f.h - f.l) / f.l) * 100).toFixed(2);
-  return null;   // before 9:15 → blank
+  return null;
 }
 
 app.get('/api/sectors', auth, (req, res) => {
@@ -1726,7 +1714,7 @@ app.post('/api/admin/refresh-margins', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 7.2 — HISTORICAL BACKFILL (5-MIN ONLY)
+   SECTION 7.2 — HISTORICAL BACKFILL (5-MIN ONLY, MANUAL)
    ============================================================ */
 const HISTORICAL_DAYS_DEFAULT = 5;
 const ANGEL_HISTORICAL_URL = 'https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData';
@@ -1861,7 +1849,6 @@ async function backfillOneStock(stock, daysBack) {
   const sym = stock.sym;
   const token = String(stock.token);
 
-  // ONLY fetch 5-minute interval now
   const raw5m = await fetchAngelInterval(token, 'FIVE_MINUTE', daysBack);
   const by5m = fillMissingMinutes(groupCandlesByDate(raw5m, 4), 5, 559, 929);
 
@@ -1870,9 +1857,8 @@ async function backfillOneStock(stock, daysBack) {
 
   for (const date of dates) {
     const d5 = by5m[date];
-    if (!d5 || d5.closes.length < 15) continue; // Need at least 15 5-min candles for RSI
+    if (!d5 || d5.closes.length < 15) continue;
 
-    // Calculate RSI from 5-minute closes
     const rsi = computeRSIWilder(d5.closes);
 
     await db.query(
@@ -2077,7 +2063,160 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
 });
 
 /* ============================================================
-   SECTION 8 — DAY H/L/C FETCH
+   SECTION 7.3 — VOLUME-ONLY BACKFILL (ONE_DAY, MANUAL ONLY)
+   ------------------------------------------------------------
+   Writes ONLY strategy_bs_snapshot.volume. Never INSERTs rows.
+   Never touches OHLC / arrays / any other column.
+   Own advisory lock (7453) — 5-min uses 7451, 15-min uses 7452.
+   Refuses to run if 5-min historical OR 15-min fetch is active.
+   ============================================================ */
+const VOLUME_LOCK_KEY = 7453;
+let volumeBackfillRunning = false;
+let volumeBackfillProgress = { running: false, done: 0, total: 0, current: '', updated: 0, skipped: 0 };
+
+async function fetchDailyVolumes(token, daysBack) {
+  // ONE_DAY → [[ts, o, h, l, c, volume], ...] — one bar per trading day
+  const raw = await fetchAngelInterval(token, 'ONE_DAY', daysBack);
+  const out = {};
+  const today = getIST().toISOString().split('T')[0];
+  const nowMins = getIST().getUTCHours() * 60 + getIST().getUTCMinutes();
+
+  for (const b of raw) {
+    const ms = typeof b[0] === 'number' ? b[0] : new Date(b[0]).getTime();
+    if (!Number.isFinite(ms)) continue;
+    const date = new Date(ms + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+    const vol  = +b[5] || 0;
+    if (vol <= 0) continue;
+    if (date === today && nowMins < 15 * 60 + 35) continue;
+    out[date] = vol;
+  }
+  return out;
+}
+
+async function updateVolumeOnly(stock, byDate) {
+  let updated = 0, skipped = 0;
+  for (const date of Object.keys(byDate)) {
+    try {
+      const r = await db.query(
+        `UPDATE strategy_bs_snapshot
+         SET volume = $1
+         WHERE date = $2 AND token = $3 AND strategy_id = 'momentum'`,
+        [byDate[date], date, String(stock.token)]
+      );
+      if (r.rowCount > 0) updated++;
+      else skipped++;
+    } catch (e) {
+      console.warn(`vol update ${stock.sym} ${date}:`, e.message);
+    }
+  }
+  return { updated, skipped };
+}
+
+async function processVolumeBackfill(body) {
+  let lockClient = null;
+  try {
+    lockClient = await db.connect();
+    const lk = await lockClient.query(`SELECT pg_try_advisory_lock($1) AS got`, [VOLUME_LOCK_KEY]);
+    if (!lk.rows[0]?.got) {
+      lockClient.release(); lockClient = null;
+      volumeBackfillRunning = false;
+      console.log('📈 Volume backfill: another run holds the lock — skipping');
+      return;
+    }
+  } catch {
+    try { if (lockClient) lockClient.release(); } catch {}
+    volumeBackfillRunning = false;
+    return;
+  }
+
+  const days = Math.min(Math.max(+body?.days || 35, 5), 60);
+  const queue = [...STOCKS].sort((a, b) => String(a.sym).localeCompare(String(b.sym)));
+  volumeBackfillProgress = { running: true, total: queue.length, done: 0, current: '', updated: 0, skipped: 0 };
+
+  try {
+    try { await loginREST(); } catch (e) { console.error('vol backfill init login:', e.message); }
+
+    while (queue.length) {
+      const stock = queue.shift();
+      volumeBackfillProgress.current = stock.sym;
+
+      if (!getSessionStatusREST()?.loggedIn) {
+        try { await loginREST(); } catch {}
+      }
+
+      try {
+        const byDate = await fetchDailyVolumes(stock.token, days);
+        const { updated, skipped } = await updateVolumeOnly(stock, byDate);
+        volumeBackfillProgress.updated += updated;
+        volumeBackfillProgress.skipped += skipped;
+      } catch (e) {
+        if (isSessionError(e)) {
+          try { await forceReloginREST(); } catch {}
+          try {
+            const byDate = await fetchDailyVolumes(stock.token, days);
+            const { updated, skipped } = await updateVolumeOnly(stock, byDate);
+            volumeBackfillProgress.updated += updated;
+            volumeBackfillProgress.skipped += skipped;
+          } catch {}
+        } else if (isRateError(e)) {
+          await sleepMs(60000);
+          try {
+            const byDate = await fetchDailyVolumes(stock.token, days);
+            const { updated, skipped } = await updateVolumeOnly(stock, byDate);
+            volumeBackfillProgress.updated += updated;
+            volumeBackfillProgress.skipped += skipped;
+          } catch {}
+        }
+      }
+
+      volumeBackfillProgress.done++;
+      if (volumeBackfillProgress.done % 25 === 0) {
+        console.log(`📈 Volume backfill: ${volumeBackfillProgress.done}/${volumeBackfillProgress.total} | updated=${volumeBackfillProgress.updated} skipped=${volumeBackfillProgress.skipped}`);
+      }
+      await sleepMs(400);
+    }
+
+    console.log(`✅ Volume backfill DONE | updated=${volumeBackfillProgress.updated} skipped=${volumeBackfillProgress.skipped}`);
+  } catch (e) {
+    console.error('Volume backfill error:', e);
+  } finally {
+    volumeBackfillRunning = false;
+    volumeBackfillProgress.running = false;
+    volumeBackfillProgress.current = '';
+    try {
+      if (lockClient) {
+        await lockClient.query(`SELECT pg_advisory_unlock($1)`, [VOLUME_LOCK_KEY]).catch(() => {});
+        lockClient.release();
+      }
+    } catch {}
+  }
+}
+
+app.post('/api/admin/fetch-volume-backfill', auth, adminOnly, async (req, res) => {
+  if (volumeBackfillRunning) return res.status(409).json({ error: 'Volume backfill already running' });
+  if (historicalRunning) return res.status(409).json({ error: '5-min historical is running — wait for it to finish first' });
+  // 15-min fetch shares the same Angel rate bucket — refuse if it's active
+  try {
+    const { rows } = await db.query(
+      `SELECT 1 FROM pg_locks WHERE locktype='advisory' AND objid=7452 AND granted`
+    );
+    if (rows.length) return res.status(409).json({ error: '15-min fetch is running — wait for it to finish first' });
+  } catch {}
+  volumeBackfillRunning = true;
+  res.json({ ok: true, message: 'Volume backfill started' });
+  processVolumeBackfill(req.body).catch(e => {
+    console.error('🛑 Volume backfill bg error:', e.message);
+    volumeBackfillRunning = false;
+    volumeBackfillProgress.running = false;
+  });
+});
+
+app.get('/api/admin/fetch-volume-progress', auth, (req, res) => {
+  res.json({ running: volumeBackfillRunning || volumeBackfillProgress.running, ...volumeBackfillProgress });
+});
+
+/* ============================================================
+   SECTION 8 — DAY H/L/C FETCH (AUTO @ 15:31 — KEPT)
    ============================================================ */
 async function fetchDayHLC() {
   try {
@@ -2131,7 +2270,7 @@ async function fetchDayHLC() {
 }
 
 /* ============================================================
-   SECTION 11 — BS FETCH
+   SECTION 11 — BS FETCH (AUTO @ 9:15 + 1-min loop — KEPT)
    ============================================================ */
 let bsIntervalTimer = null;
 let bsRunning = false;
@@ -2392,13 +2531,10 @@ async function buildChipList(date) {
 
 
 /* ============================================================
-   v5.45 — ORB-15 (first 15-min candle 9:15–9:30)
-   Computed once at 9:30 from live 1-min memory, stored in DB
-   (orb_high/orb_low/orb_size/orb_volume), served via /api/screener/orb
+   ORB-15 (first 15-min candle 9:15–9:30)
    ============================================================ */
 async function computeOrbCandles(date) {
   if (orbDoneDate === date) return;
-  // v5.46: WS = last-resort only. Official (gq/orb archive) cache present ho to skip.
   if (orbCache.size >= 50) { console.log('🎯 ORB WS fallback skipped — official values already in cache'); return; }
   const toks = [], hs = [], ls = [], szs = [], vols = [];
   for (const s of STOCKS) {
@@ -2408,8 +2544,6 @@ async function computeOrbCandles(date) {
     const C = wsTodayCloses.get(tk) || [];
     const V = wsTodayVols.get(tk) || [];
     if (C.length < 15 || H.length < 15 || L.length < 15) continue;
-    // v5.46 guard: after a mid-session restart H/L arrays start late (DB stores closes only).
-    // Misaligned arrays would compute the WRONG window → never trust them.
     if (H.length !== C.length || L.length !== C.length) {
       console.warn(`🎯 ORB WS skip ${tk}: H/L misaligned (restart?) H=${H.length} L=${L.length} C=${C.length}`);
       continue;
@@ -2434,14 +2568,13 @@ async function computeOrbCandles(date) {
     } catch (e) { console.error('🎯 ORB save failed:', e.message); }
   }
   orbDoneDate = date;
-  orbForming.clear();   // forming candle no longer needed after finalize
+  orbForming.clear();
   const tight = [...orbCache.values()].filter(x => x.size <= 1.5).length;
   console.log(`🎯 ORB-15 candles computed: ${toks.length} stocks | size ≤1.5%: ${tight}`);
 }
 
 async function loadOrbFromDB(date) {
   if (!date) return;
-  // v5.46: PRIMARY = gq_* (GetQuote official). Fallback = orb_* (historical/WS archive).
   try {
     const { rows } = await db.query(
       `SELECT token, gq_high, gq_low, gq_volume
@@ -2478,28 +2611,15 @@ async function loadOrbFromDB(date) {
 }
 
 /* ============================================================
-   v5.46 — ORB-15 OFFICIAL SOURCE (GetQuote @9:30 + historical @9:35 / restart)
-   Why: WS tick-built H/L arrays are memory-only; a mid-session restart left them
-        empty/misaligned → slice(0,15) picked the WRONG 15-min window and garbage
-        got persisted to orb_* columns.
-   Now: broker-official values → same orb_* DB columns → restart-safe (loadOrbFromDB).
-   Flow:
-     09:15–09:29  forming column = quote poll every minute (official day high/low so far)
-     09:30:05     batch GetQuote FULL → orb_* (day H/L at 9:30 ≈ 9:15–9:30 window)
-     09:35:00     historical ONE_MINUTE exact 09:15–09:29 window → overwrite orb_* (authoritative)
-     restart      loadOrbFromDB restores values; if IST ≥09:31 on a trading day → one-shot
-                  historical repair at +45s (also heals stale WS-era values, e.g. today)
-     fallback     v5.45 WS compute only if BOTH official paths failed by ~9:31 (guarded)
-   Rate safety: quote = 2 batch calls/round; historical = ~3 req/s sequential; max 2 attempts.
+   ORB-15 OFFICIAL SOURCE (GetQuote @9:30 + historical @9:35 / restart)
    ============================================================ */
 const ANGEL_QUOTE_URL = 'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/';
-let orbQuoteDoneDate = null;   // quote finalize ran for this date
-let orbHistDoneDate = null;    // historical exact overwrite ran for this date
+let orbQuoteDoneDate = null;
+let orbHistDoneDate = null;
 let orbOfficialRunning = false;
 const orbSleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function angelQuoteBatch(tokens) {
-  // batch FULL quotes in 200-token chunks → Map token -> {high, low, volume}
   const out = new Map();
   const chunks = [];
   for (let i = 0; i < tokens.length; i += 200) chunks.push(tokens.slice(i, i + 200));
@@ -2525,7 +2645,7 @@ async function angelQuoteBatch(tokens) {
       return { data: j2.data };
     };
     let res = await doReq(jwt);
-    if (res.authFail) { jwt = await getAnyAngelJwt(); if (!jwt) throw new Error('quote re-login failed'); res = await doReq(jwt); }  // max 2 attempts
+    if (res.authFail) { jwt = await getAnyAngelJwt(); if (!jwt) throw new Error('quote re-login failed'); res = await doReq(jwt); }
     if (!res.data) throw new Error('quote batch failed (auth/rate), stopping');
     for (const q of res.data) {
       const tk = String(q.exchangeToken ?? q.exchFeedCode ?? q.symbol ?? '');
@@ -2551,7 +2671,6 @@ async function saveOrbToDB(toks, hs, ls, szs, vols, date) {
   } catch (e) { console.error('🎯 ORB save failed:', e.message); }
 }
 
-/* v5.46: GetQuote standalone columns (quote-only, kabhi overwrite nahi by historical/WS) */
 async function saveGQToDB(toks, os, hs, ls, cs, vs, date) {
   if (!toks.length) return;
   try {
@@ -2564,7 +2683,6 @@ async function saveGQToDB(toks, os, hs, ls, cs, vs, date) {
   } catch (e) { console.error('🎯 gq_* save failed (ALTER pending?):', e.message); }
 }
 
-/* v5.46: 1-min candles → 15-min candle series (first candle = exact 9:15–9:30 ORB window) */
 function group15FromCandles(candles, date) {
   const buckets = new Map();
   for (const c of candles || []) {
@@ -2592,7 +2710,6 @@ function group15FromCandles(candles, date) {
   }));
 }
 
-/* v5.46: historical 15-min series → ws_15min_* (same UPSERT shape as fifteen.js) */
 async function save15MinToDB(tk, sym, rows15, date) {
   if (!rows15.length) return;
   try {
@@ -2611,8 +2728,6 @@ async function save15MinToDB(tk, sym, rows15, date) {
 }
 
 function pushOrb(entries, date, source, mode) {
-  // mode 'quote' → gq_* columns (quote-only) + cache FULL set (engine ka source)
-  // mode 'hist'  → orb_* columns (archive) + cache me sirf MISSING tokens (quote fail ho tab)
   const toks = [], os = [], hs = [], ls = [], szs = [], cs = [], vols = [];
   let changed = 0, cacheSet = 0;
   for (const [tk, v] of entries) {
@@ -2640,7 +2755,7 @@ async function orbFinalizeQuote(date) {
     try { q = await angelQuoteBatch(STOCKS.map(s => String(s.token))); }
     catch (e) { console.error('🎯 ORB quote attempt 1 failed:', e.message); q = await angelQuoteBatch(STOCKS.map(s => String(s.token))); }
     if (!q || q.size < 50) throw new Error('quote too few: ' + (q ? q.size : 0));
-    pushOrb(q, date, 'quote@9:30', 'quote');   // gq_* columns + engine cache
+    pushOrb(q, date, 'quote@9:30', 'quote');
     orbQuoteDoneDate = date; orbDoneDate = date;
     return true;
   } catch (e) { console.error('🎯 ORB quote finalize failed twice:', e.message); return false; }
@@ -2648,11 +2763,10 @@ async function orbFinalizeQuote(date) {
 }
 
 function orbWindowFromCandles(candles, date) {
-  // [[ts,o,h,l,c,v],...] → exact IST 09:15–09:29 window (15 candles)
   let h = -1, l = Infinity, v = 0, n = 0;
   for (const c of candles || []) {
     let hm, dstr;
-    if (typeof c[0] === 'number') {                       // epoch ms → IST
+    if (typeof c[0] === 'number') {
       const d = new Date(c[0] + 5.5 * 3600 * 1000);
       dstr = d.toISOString().slice(0, 10);
       hm = String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
@@ -2677,21 +2791,21 @@ async function orbRepairHistorical(date, source) {
   orbOfficialRunning = true;
   try {
     const entries = new Map(); let fails = 0;
-    const fifteenByToken = new Map();   // v5.46: historical → ws_15min_* series
+    const fifteenByToken = new Map();
     const symOf = new Map(STOCKS.map(s => [String(s.token), s.sym]));
     for (const s of STOCKS) {
       const tk = String(s.token);
       try {
-        const candles = await fetchAngelInterval(tk, 'ONE_MINUTE', 0);   // returns raw candle array
+        const candles = await fetchAngelInterval(tk, 'ONE_MINUTE', 0);
         const w = orbWindowFromCandles(candles, date);
         if (w) entries.set(tk, w); else fails++;
         const r15 = group15FromCandles(candles, date);
         if (r15.length) fifteenByToken.set(tk, r15);
       } catch (e) { fails++; }
-      await orbSleep(340);   // ~3 req/s = historical rate limit
+      await orbSleep(340);
     }
     if (entries.size < 50) { console.error(`🎯 ORB historical (${source}): too few (${entries.size}, fails ${fails})`); return 0; }
-    pushOrb(entries, date, 'historical@' + source, 'hist');   // orb_* archive + cache gap-fill
+    pushOrb(entries, date, 'historical@' + source, 'hist');
     for (const [tk, r15] of fifteenByToken) await save15MinToDB(tk, symOf.get(tk), r15, date);
     console.log(`🎯 ws_15min_* updated from historical: ${fifteenByToken.size} stocks`);
     orbHistDoneDate = date; orbDoneDate = date;
@@ -2699,34 +2813,29 @@ async function orbRepairHistorical(date, source) {
   } finally { orbOfficialRunning = false; }
 }
 
-/* v5.46 scheduler: forming poll · quote finalize · exact overwrite */
 setInterval(() => {
   const ist = getIST();
-  if (!isTradingDay(ist)) return;   // weekends + trading holidays: no ORB jobs
+  if (!isTradingDay(ist)) return;
   const hh = ist.getUTCHours(), mm = ist.getUTCMinutes(), ss = ist.getUTCSeconds();
   const hhmm = String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
   const today = ist.toISOString().split('T')[0];
   const mins = hh * 60 + mm;
 
-  // 09:15–09:29 → official forming H/L for the pre-9:30 column (~every 30s)
   if (mins >= 555 && mins <= 569 && ss < 4 && !orbOfficialRunning) {
     angelQuoteBatch(STOCKS.map(s => String(s.token)))
       .then(q => { for (const [tk, v] of q) orbForming.set(tk, { h: v.high, l: v.low }); })
       .catch(e => console.error('🎯 ORB forming poll failed:', e.message));
   }
-  // 09:30:05–09:30:35 → quote finalize (once/day)
   if (hhmm === '09:30' && ss >= 5 && ss <= 35 && orbQuoteDoneDate !== today && !orbOfficialRunning) {
     orbFinalizeQuote(today).then(ok => {
       if (!ok) orbRepairHistorical(today, 'fallback-931').catch(() => {});
     }).catch(() => {});
   }
-  // 09:35 → exact historical overwrite (authoritative 9:15–9:30 window)
   if (hhmm === '09:35' && ss < 10 && orbHistDoneDate !== today && !orbOfficialRunning) {
     orbRepairHistorical(today, '935').catch(e => console.error('🎯 ORB 9:35 repair failed:', e.message));
   }
 }, 2000);
 
-/* manual trigger: GET /api/orb/repair?date=YYYY-MM-DD */
 app.get('/api/orb/repair', auth, (req, res) => {
   const date = String(req.query.date || getIST().toISOString().split('T')[0]);
   res.json({ ok: true, started: true, date });
@@ -2802,7 +2911,10 @@ function msUntil(targetHour, targetMin, dayOffsetIfPassed = 1) {
 function scheduleDailyHLC() {
   const ms = msUntil(15, 31);
   console.log(`⏰ Next HLC fetch in ${Math.round(ms / 60000)} min`);
-  setTimeout(async () => { await fetchDayHLC(); scheduleDailyHLC(); }, ms);
+  setTimeout(async () => {
+    await fetchDayHLC();
+    scheduleDailyHLC();
+  }, ms);
 }
 
 function msToNextMinute01() {
@@ -2968,27 +3080,14 @@ function scheduleVCWatchReload() {
   }, ms);
 }
 
-function scheduleDailyHistorical() {
-  const ms = msUntil(16, 0);
-  console.log(`⏰ Next auto-historical (4 PM) in ${Math.round(ms / 60000)} min`);
-  setTimeout(async () => {
-    const ist = getIST();
-    if (isTradingDay(ist) && !historicalRunning) {
-      historicalRunning = true;
-      console.log('📥 Scheduled 4 PM historical fetch starting (alphabetical order, 5-day window, 5-min only)');
-      processHistoricalFetch({ days: HISTORICAL_DAYS_DEFAULT })
-        .catch(e => { console.error('🛑 Scheduled historical error:', e.message); historicalRunning = false; });
-    } else {
-      console.log('⏭️ 4 PM historical skipped (weekend/holiday or a run is already in progress)');
-    }
-    scheduleDailyHistorical();
-  }, ms);
-}
+// ⚠️ v5.48: scheduleDailyHistorical REMOVED — 4 PM auto-historical no longer fires.
+// Historical 5-min backfill runs ONLY when user clicks "📥 Fetch Historical" button
+// (POST /api/admin/fetch-historical). Saves rate limit.
+
 // ============================================================
 // AI POST-MARKET ANALYSIS (4:30 PM)
 // ============================================================
 async function runAIPostMarket() {
-  // 👇 ADD THIS GUARD HERE 👇
   if (!process.env.DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY.trim() === '') {
     console.log('🛑 AI Engine: No API key found. Background run rejected.');
     return;
@@ -3010,18 +3109,16 @@ async function runAIPostMarket() {
     if (processed % 25 === 0) {
       console.log(`🧠 AI Engine Progress: ${processed}/${queue.length} stocks analyzed.`);
     }
-    // 500ms delay to avoid DeepSeek API rate limits
     await new Promise(r => setTimeout(r, 500)); 
   }
   console.log('🧠 AI Engine: Post-Market analysis complete!');
 }
 
 function scheduleAIPostMarket() {
-  const ms = msUntil(16, 30); // 4:30 PM IST
+  const ms = msUntil(16, 30);
   console.log(`⏰ Next AI Post-Market analysis in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
     await runAIPostMarket();
-    //scheduleAIPostMarket();
   }, ms);
 }
 
@@ -3063,7 +3160,7 @@ async function runAIPreMarketCheck() {
 }
 
 function scheduleAIPreMarketCheck() {
-  const ms = msUntil(9, 8); // 9:08 AM IST
+  const ms = msUntil(9, 8);
   console.log(`⏰ Next AI Pre-Open Check in ${Math.round(ms / 60000)} min`);
   setTimeout(async () => {
     await runAIPreMarketCheck();
@@ -3079,10 +3176,10 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    orbCache.clear();          // v5.45: fresh ORB for the new day
+    orbCache.clear();
     orbDoneDate = null;
     orbForming.clear();
-    console.log('🧹 v5.41 morning purge: bsCache + chipList cleared, bsFreshDate reset');
+    console.log('🧹 Morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
     await loadPrevClosesFromDB();
@@ -3114,7 +3211,6 @@ registerAdminRoutes(app, {
   loadHolidaysFromDB
 });
 
-// v5.45: plug in the separate 15-min backfill module (own button, own lock, own progress)
 registerFifteenRoutes(app, {
   db, auth, adminOnly, STOCKS,
   fetchAngelInterval, isRateError, isSessionError,
@@ -3124,7 +3220,7 @@ registerFifteenRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.45`);
+  console.log(`✅ Server on port ${PORT} — v5.48 (manual-only heavy fetches)`);
   initMarginService(db, getBrokerSession);
 
   try { 
@@ -3143,10 +3239,8 @@ app.listen(PORT, async () => {
   await loadTodayClosesFromDB();
   await loadChipListFromDB(getIST().toISOString().split('T')[0]);
   await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
-  await loadOrbFromDB(getScreenerPhase().date);   // v5.45: ORB list survives restarts/after-hours
+  await loadOrbFromDB(getScreenerPhase().date);
 
-  // v5.46: restart after 09:31 on a trading day → one-shot official repair (historical exact window).
-  // Heals: (a) mid-session-restart gaps, (b) stale WS-era orb_* values already in DB.
   {
     const i0 = getIST(); const m0 = i0.getUTCHours() * 60 + i0.getUTCMinutes();
     if (isTradingDay(i0) && m0 >= 571) {
@@ -3252,10 +3346,10 @@ app.listen(PORT, async () => {
     startBSInterval();
   }
 
-    scheduleDailyHLC();
+  // v5.48: Heavy backfills (historical + volume) are MANUAL-ONLY (no scheduler registered).
+  scheduleDailyHLC();
   scheduleBSAutoFetch();
   scheduleFinalFlush();
-  scheduleDailyHistorical();
   scheduleVCWatchReload();
   scheduleMorningPreload();
   scheduleAIPostMarket();
@@ -3266,5 +3360,6 @@ app.listen(PORT, async () => {
 
   setInterval(updateMarketBreadth, 5000);
 
-  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15 (30s) | Quote@9:30 | VC entries@9:16-14:30 | HLC@15:31 | FinalFlush@15:31 | AutoHistorical@16:00 | AI@16:30 | Preload@9:00 | Margins@30min');
+  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15 (every min) | ORB quote@9:30 | ORB hist@9:35 | VC@9:16-14:30 | HLC@15:31 | FinalFlush@15:31 | AI@16:30 | Preload@9:00 | Margins@5min');
+  console.log('⚠️  MANUAL-ONLY (button driven): 📥 Fetch Historical (5-min) | 📈 Fetch Volume History (ONE_DAY)');
 });

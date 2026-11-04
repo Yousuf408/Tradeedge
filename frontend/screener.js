@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.8.4 (Separate 15-Min OHLCV Fetch button)
+   SCREENER.JS  — v4.8.5 (Volume History button added)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -27,6 +27,7 @@ let DAYHLC_FETCHING = false;
 let EOD_FETCHING = false;
 let HISTORICAL_FETCHING = false;
 let FIFTEEN_FETCHING = false;   // v4.8.4: separate 15-min fetch guard
+let VOLUME_HIST_FETCHING = false;   // v4.8.5: separate volume-history fetch guard
 
 let SCREENER_MOMENTUM_FILTER = 'open_gain';
 let SCREENER_SORT_BY = 'change';
@@ -115,6 +116,7 @@ function renderStrategyControls() {
   let strategyButtons = `
     <button id="fetchBSBtn" class="btn btn-primary" ${btnStyle} onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
     <button id="fetchHistoricalBtn" class="btn btn-outline" ${btnStyle} onclick="startHistoricalFetch()">📥 Fetch Historical</button>
+    <button id="fetchVolumeHistBtn" class="btn btn-outline" ${btnStyle} onclick="startVolumeHistoryFetch()">📈 Fetch Volume History</button>
     <button id="fetch15Btn" class="btn btn-outline" ${btnStyle} onclick="startFifteenFetch()">📊 Fetch 15-Min</button>
     <button id="fetchEODBtn" class="btn btn-outline" ${btnStyle} onclick="startEODClosesFetch()">⚙️ Fetch EOD Closes</button>`;
 
@@ -830,6 +832,79 @@ async function startFifteenFetch() {
     FIFTEEN_FETCHING = false;
     btn.disabled = false;
     btn.textContent = '📊 Fetch 15-Min';
+    if (pb) pb.style.display = 'none';
+  }
+}
+
+/* ============================================================
+   SECTION 5.8 — FETCH VOLUME HISTORY (v4.8.5: separate button,
+   writes ONLY the volume column via ONE_DAY historical)
+   ============================================================ */
+async function startVolumeHistoryFetch() {
+  const btn = document.getElementById('fetchVolumeHistBtn');
+  if (!btn || VOLUME_HIST_FETCHING) return;
+
+  const ok = confirm(
+    '📈 Fetch last ~25 trading days of DAILY VOLUME\n\n' +
+    'Source: Angel ONE_DAY historical. Writes ONLY the volume column.\n' +
+    'OHLC / arrays / everything else untouched.\n\n' +
+    'Runs manually — safe to cancel/retry anytime. Continue?'
+  );
+  if (!ok) return;
+
+  VOLUME_HIST_FETCHING = true;
+  btn.disabled = true;
+  btn.textContent = '⏳ Volume history...';
+
+  const pb = document.getElementById('progressBar');
+  if (pb) pb.style.display = 'block';
+
+  try {
+    const r = await fetch(API + '/api/admin/fetch-volume-backfill', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
+      body: JSON.stringify({ days: 35 })
+    });
+    let d = {};
+    try { d = await r.json(); } catch { d = { error: 'Invalid response' }; }
+
+    if (!r.ok) {
+      showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
+      VOLUME_HIST_FETCHING = false;
+      btn.disabled = false;
+      btn.textContent = '📈 Fetch Volume History';
+      if (pb) pb.style.display = 'none';
+      return;
+    }
+
+    showToast('✅ Started', 'Volume history backfill running…');
+
+    const poll = setInterval(async () => {
+      try {
+        const pr = await fetch(API + '/api/admin/fetch-volume-progress', {
+          headers: { Authorization: 'Bearer ' + getToken() }
+        }).then(res => res.json());
+
+        if (pr.running) {
+          updateProgress(pr.done, pr.total);
+          btn.textContent = `⏳ ${pr.current || ''} (${pr.done}/${pr.total}) · upd ${pr.updated}`;
+        } else {
+          clearInterval(poll);
+          VOLUME_HIST_FETCHING = false;
+          btn.disabled = false;
+          btn.textContent = '📈 Fetch Volume History';
+          updateProgress(pr.total || 1, pr.total || 1);
+          showToast('🎉 Volume History Done', `${pr.updated} rows updated · ${pr.skipped} skipped`);
+          setTimeout(() => { if (pb) pb.style.display = 'none'; }, 3000);
+        }
+      } catch (e) { console.error('vol progress poll:', e); }
+    }, 2000);
+
+  } catch (e) {
+    showToast('⚠️ Network Error', 'Server not reachable.');
+    VOLUME_HIST_FETCHING = false;
+    btn.disabled = false;
+    btn.textContent = '📈 Fetch Volume History';
     if (pb) pb.style.display = 'none';
   }
 }

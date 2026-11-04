@@ -1,27 +1,5 @@
 /* ============================================================
-   autoTrader.js — v3.0 (VC "Sideways-PDC" engine + CTC stop)
-   ============================================================
-   NEW vs v2.1 (existing order/exit/paper/square-off logic untouched):
-   - VC ENGINE (replaces old server-side entry engine, which is now OFF by
-     default via ENTRY_ENGINE=vc):
-       1. Pre-market watchlist: previous day's last 30 five-min CLOSES
-          range <= 1.5%  (user's SQL spec)  → loadVCWatchlist()
-       2. 9:15 open vs PDC decides side (open>PDC=BUY, open<PDC=SELL);
-          gap > 3% (env) → stock dropped for the day.
-       3. First 1-min candle (from 9:15-9:16 onwards) that CLOSES on the
-          same side of PDC = signal candle.
-             - candle move from open >= 1%  → entry on signal-candle
-               high (BUY) / low (SELL) break.
-             - candle move < 1%             → entry once LTP grows 1%
-               from open (safer vs fake crosses).
-       4. SL = opposite end of signal candle. NO trailing.
-          At +1% from entry → SL moves to CTC (entry price). That's it.
-       5. One setup + one entry per stock per day. Entries until 14:30
-          (env VC_ENTRY_END_MIN). Restart-safe: rebuildVCState() replays
-          today's stored 1-min arrays.
-   - Positions created by VC carry strat='vc' → managed by the new SL/CTC
-     rules. Old v2.1 entry/SL/trail code has been fully removed from this
-     file and archived in DEAD_CODE_old_entry_engine.js (reference only).
+   autoTrader.js — v4.0 (VC + ORB + BIGPLAYER Engine)
    ============================================================ */
 
 /* ===== (legacy constants above used ONLY by legacy mgmt block below) ===== */
@@ -34,16 +12,21 @@ const VC_GAP_MAX_PCT    = Number(process.env.VC_GAP_MAX_PCT ?? 3.0);
 const VC_MIN_CANDLE_PCT = Number(process.env.VC_MIN_CANDLE_PCT ?? 1.0);
 const VC_CTC_PCT        = Number(process.env.VC_CTC_PCT ?? 1.0);
 const VC_ENTRY_END_MIN  = Number(process.env.VC_ENTRY_END_MIN ?? 14 * 60 + 30);
-const VC_SECTOR_GATE    = String(process.env.VC_SECTOR_GATE ?? 'true') === 'true';   // v3.1: sector-majority confirmation vs DAY OPEN
-const VC_ENTRIES        = String(process.env.VC_ENTRIES ?? 'false') === 'true';      // v3.3: VC entries OFF by default (ORB is the entry engine now)
+const VC_SECTOR_GATE    = String(process.env.VC_SECTOR_GATE ?? 'true') === 'true';
+const VC_ENTRIES        = String(process.env.VC_ENTRIES ?? 'false') === 'true';
 
 /* ---- v3.3 ORB ENTRY ENGINE (9:15–9:30 candle breakout) ---- */
-const ORB_MAX_SIZE      = Number(process.env.ORB_MAX_SIZE ?? 1.5);        // first 15-min candle size cap %
-const ORB_ENTRY_START   = 9 * 60 + 30;                                    // entries only after candle completes
+const ORB_MAX_SIZE      = Number(process.env.ORB_MAX_SIZE ?? 1.5);
+const ORB_ENTRY_START   = 9 * 60 + 30;
 const ORB_ENTRY_END_MIN = Number(process.env.ORB_ENTRY_END_MIN ?? 14 * 60 + 30);
 const ORB_SECTOR_GATE   = String(process.env.ORB_SECTOR_GATE ?? 'true') === 'true';
 const ORB_ENABLED       = String(process.env.ORB_ENGINE ?? 'true') === 'true';
-const orbEntered = new Set();   // token → already entered today (one entry per stock per day)
+const orbEntered = new Set();
+
+/* ---- v4.0 BIGPLAYER ENGINE (Open + RVOL) ---- */
+const BIGPLAYER_ENABLED = String(process.env.BIGPLAYER_ENGINE ?? 'true') === 'true';
+const BIGPLAYER_ENTRY_END_MIN = Number(process.env.BIGPLAYER_ENTRY_END_MIN ?? 14 * 60 + 30);
+const bigPlayerEntered = new Set(); // token -> already entered today
 
 let db = null;
 let getJwt = null;
@@ -55,8 +38,9 @@ let getLev = null;
 let getDayOpen = () => null;
 let getTodayMinutes = () => null;
 let getUsers = async () => [];
-let sectorByToken = {};   // v3.1: token -> sector (from grouped nifty500 file)
-let getOrb = () => null;  // v3.3: token -> { high, low, size, volume } of first 15-min candle
+let sectorByToken = {};
+let getOrb = () => null;
+let getRvol = () => null; // 🆕 For Bigplayer Engine
 let onVCChange = null;
 let live = false;
 
@@ -65,11 +49,10 @@ const liveOrdered = new Set();
 let posDate = null;
 let sqDoneDate = null;
 
-/* ---- VC in-memory state (no DB per tick) ---- */
-const vcWatch = new Map();   // token -> { sym, pdc, rangePct }
-const vcState = new Map();   // token -> setup state (see vcOnMinuteCandle)
+const vcWatch = new Map();
+const vcState = new Map();
 let vcDate = null;
-let vcWatchDateUsed = null;  // v3.0.3: which day's candles the watchlist was built from
+let vcWatchDateUsed = null;
 
 const getIST = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 const todayIST = () => getIST().toISOString().split('T')[0];
@@ -88,17 +71,16 @@ export function initAutoTrader(deps) {
   getUsers = deps.getUsers || (async () => []);
   sectorByToken = deps.sectorByToken || {};
   getOrb = deps.getOrb || (() => null);
+  getRvol = deps.getRvol || (() => null); // 🆕 Injecting RVOL getter
   onVCChange = deps.onVCChange || null;
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
-  console.log(`🤖 AutoTrader v3.0 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | VC engine: ${VC_ENABLED ? 'ON' : 'OFF'} | Dynamic MIX Enabled`);
+  
+  console.log(`🤖 AutoTrader v4.0 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | VC: ${VC_ENABLED ? 'ON' : 'OFF'} | ORB: ${ORB_ENABLED ? 'ON' : 'OFF'} | BIGPLAYER: ${BIGPLAYER_ENABLED ? 'ON' : 'OFF'}`);
   startSquareOffWatch();
 }
 
 function vcNotify() { if (onVCChange) { try { onVCChange(); } catch {} } }
 
-/* ---------- v3.1 SECTOR MAJORITY GATE (direction vs DAY OPEN only) ----------
-   Counts live: stocks of the sector above open (up) vs below open (down).
-   Returns { side:'BUY'|'SELL'|null, up, down } — null = tie or no data.      */
 function sectorBias(sector) {
   let up = 0, down = 0;
   for (const [t, sec] of Object.entries(sectorByToken)) {
@@ -113,7 +95,6 @@ function sectorBias(sector) {
   return { side: up > down ? 'BUY' : 'SELL', up, down };
 }
 
-/* ---------- Angel placeOrder (MARKET, INTRADAY) ---------- */
 async function placeOrder({ token, sym, side, qty }) {
   const jwt = getJwt ? getJwt() : null;
   if (!jwt) throw new Error('No Angel JWT');
@@ -143,7 +124,6 @@ async function placeOrder({ token, sym, side, qty }) {
 export async function loadVCWatchlist(date, watchDate) {
   if (!db || !VC_ENABLED) return;
   try {
-    // v3.0.2: pin ONE date (previous trading day) for ALL stocks — exact match with user's SQL
     const { rows } = await db.query(
       `SELECT token, sym, day_close, ws_5min_close
        FROM strategy_bs_snapshot
@@ -165,7 +145,7 @@ export async function loadVCWatchlist(date, watchDate) {
     vcDate = date;
     vcWatchDateUsed = watchDate;
     vcState.clear();
-    console.log(`🧿 VC watchlist: ${vcWatch.size} sideways stocks for ${date} (built from ${watchDate} candles, last-30 5m range ≤ ${VC_RANGE_MAX_PCT}%)`);
+    console.log(`🧿 VC watchlist: ${vcWatch.size} sideways stocks for ${date}`);
     vcNotify();
   } catch (e) {
     console.error('🧿 VC watchlist load failed:', e.message);
@@ -173,7 +153,7 @@ export async function loadVCWatchlist(date, watchDate) {
 }
 
 /* ============================================================
-   VC ENGINE — signal candle (called on every 1-min candle close)
+   VC ENGINE — signal candle
    ============================================================ */
 export function vcOnMinuteCandle(token, c) {
   if (!VC_ENABLED || !c) return;
@@ -181,8 +161,8 @@ export function vcOnMinuteCandle(token, c) {
   if (vcDate !== todayIST()) return;
   const w = vcWatch.get(tk);
   if (!w) return;
-  if (vcState.has(tk)) return;                 // first cross wins, one setup per day
-  if (!(c.minuteKey >= '09:15')) return;       // ignore anything before first candle
+  if (vcState.has(tk)) return;
+  if (!(c.minuteKey >= '09:15')) return;
 
   const open = getDayOpen(tk);
   if (!open || open <= 0) return;
@@ -197,9 +177,9 @@ export function vcOnMinuteCandle(token, c) {
   if (!side) return;
 
   const confirmed = side === 'BUY' ? c.close > pdc : c.close < pdc;
-  if (!confirmed) return;                      // wait for a candle that closes on our side
+  if (!confirmed) return;
 
-  const candleOpen = (c.open > 0) ? c.open : open;   // v3.0.1: 1% check = candle's OWN open vs close
+  const candleOpen = (c.open > 0) ? c.open : open;
   const movePct = Math.abs(c.close - candleOpen) / candleOpen * 100;
   const mode = movePct >= VC_MIN_CANDLE_PCT ? 'candle' : 'growth';
   const trigger = mode === 'candle'
@@ -208,43 +188,72 @@ export function vcOnMinuteCandle(token, c) {
   const sl = side === 'BUY' ? c.low : c.high;
 
   vcState.set(tk, { sym: w.sym, side, mode, trigger, sl0: sl, entered: false, open });
-  console.log(`🧿 VC setup ${w.sym} ${side} | candle ${c.minuteKey} close ${c.close} vs PDC ${pdc} | move ${movePct.toFixed(2)}% → mode=${mode} | trigger=${trigger} | SL=${sl}`);
+  console.log(`🧿 VC setup ${w.sym} ${side} | trigger=${trigger} | SL=${sl}`);
   vcNotify();
 }
 
-/* ============================================================
-   VC ENGINE — tick trigger (called from onTickPos for every tick)
-   ============================================================ */
 function vcOnTick(tk, ltp) {
-  if (!VC_ENABLED || !VC_ENTRIES) return;   // v3.3: VC entries off by default — ORB is the entry engine
+  if (!VC_ENABLED || !VC_ENTRIES) return;
   const st = vcState.get(tk);
   if (!st || st.entered || st.done) return;
   const ist = getIST();
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  if (mins < 9 * 60 + 16 || mins >= VC_ENTRY_END_MIN) return;   // v3.2: entries from 9:16 (first candle close), never 9:15
+  if (mins < 9 * 60 + 16 || mins >= VC_ENTRY_END_MIN) return;
   if (!Number.isFinite(ltp) || ltp <= 0) return;
 
   const hit = st.side === 'BUY' ? ltp >= st.trigger : ltp <= st.trigger;
   if (!hit) return;
 
-  // v3.1: sector-majority confirmation (vs DAY OPEN) before placing entry
   if (VC_SECTOR_GATE) {
     const sector = sectorByToken[tk] || 'MISC';
     const sb = sectorBias(sector);
     if (!sb.up && !sb.down) {
-      console.warn(`🧭 VC ${st.sym}: no open-data for sector ${sector} — gate skipped (fail-open)`);
+      console.warn(`🧭 VC ${st.sym}: no open-data for sector ${sector} — gate skipped`);
     } else if (sb.side !== st.side) {
-      console.log(`🚫 VC ${st.sym} ${st.side} held: sector ${sector} majority ${sb.side || 'TIE'} (${sb.up}↑/${sb.down}↓ vs open)`);
-      return;   // keep setup alive — re-checks on next ticks, can enter later if sector flips
-    } else {
-      console.log(`🧭 VC ${st.sym} ${st.side} confirmed: sector ${sector} ${sb.up}↑/${sb.down}↓ vs open`);
+      return;
     }
   }
 
   st.entered = true;
-  console.log(`🎯 VC TRIGGER ${st.sym} ${st.side} @${ltp} | trigger=${st.trigger} mode=${st.mode}`);
+  console.log(`🎯 VC TRIGGER ${st.sym} ${st.side} @${ltp}`);
   vcNotify();
   placeEntries(tk, { sym: st.sym, side: st.side, sl: st.sl0, strat: 'vc', tag: 'VC' }, ltp).catch(e => console.error('🤖 VC entry error:', e.message));
+}
+
+/* ============================================================
+   v4.0 BIGPLAYER ENGINE — (Open vs LTP + RVOL)
+   ============================================================ */
+function bigPlayerOnTick(tk, ltp) {
+  if (!BIGPLAYER_ENABLED || bigPlayerEntered.has(tk)) return;
+  
+  const ist = getIST();
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  if (mins < 9 * 60 + 15 || mins >= BIGPLAYER_ENTRY_END_MIN) return;
+  if (!Number.isFinite(ltp) || ltp <= 0) return;
+
+  const open = getDayOpen(tk);
+  if (!open || open <= 0) return;
+
+  // Condition 1: LTP > Open
+  if (ltp <= open) return;
+
+  // Condition 2: RVOL >= 0.05
+  const rvol = getRvol(tk);
+  if (rvol == null || rvol < 0.05) return;
+
+  // Condition 3: Move >= 0.5%
+  const movePct = ((ltp - open) / open) * 100;
+  if (movePct < 0.5) return;
+
+  // Execute Entry
+  bigPlayerEntered.add(tk);
+  
+  // 0.5% Stop Loss
+  const sl = ltp * 0.995; 
+  
+  console.log(`🚀 BIGPLAYER TRIGGER ${symByToken[tk] || tk} BUY @${ltp} | Move: ${movePct.toFixed(2)}% | RVOL: ${rvol}`);
+  placeEntries(tk, { sym: symByToken[tk] || '?', side: 'BUY', sl, strat: 'bigplayer', tag: 'BIGPLAYER' }, ltp)
+    .catch(e => console.error('🤖 Bigplayer entry error:', e.message));
 }
 
 async function placeEntries(tk, o, ltp) {
@@ -268,7 +277,7 @@ async function placeEntries(tk, o, ltp) {
     }
     if (already) continue;
 
-    const key = pkey(u.userId, tk, st.side);
+    const key = pkey(u.userId, tk, o.side);
     if (positions.has(key)) continue;
 
     const entryLtp = getLtp(tk) || ltp;
@@ -299,7 +308,7 @@ async function placeEntries(tk, o, ltp) {
         const oid = await placeOrder({ token: tk, sym: pos.sym, side: pos.side, qty: pos.qty });
         console.log(`🤖 ${o.tag} ${pos.side} ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} order=${oid}`);
       } catch (e) {
-        console.error(`🤖 VC ${pos.side} failed ${pos.sym}: ${e.message}`);
+        console.error(`🤖 ${o.tag} failed ${pos.sym}: ${e.message}`);
       }
     } else if (!live) {
       console.log(`🤖 [PAPER] ${o.tag} ${pos.side} ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} user=${u.userId}`);
@@ -309,7 +318,7 @@ async function placeEntries(tk, o, ltp) {
 }
 
 /* ============================================================
-   VC ENGINE — restart rebuild (replay today's stored 1-min arrays)
+   VC ENGINE — restart rebuild
    ============================================================ */
 export async function rebuildVCState(date) {
   if (!VC_ENABLED || !getTodayMinutes) return;
@@ -334,7 +343,7 @@ export async function rebuildVCState(date) {
       if (!ok) continue;
       const high = m.h?.[i] ?? m.c[i];
       const low  = m.l?.[i] ?? m.c[i];
-      const cOpen0 = i > 0 ? m.c[i - 1] : open;      // v3.0.1: candle's own open (prev close; day-open for 1st)
+      const cOpen0 = i > 0 ? m.c[i - 1] : open;
       const movePct = Math.abs(m.c[i] - cOpen0) / cOpen0 * 100;
       const mode = movePct >= VC_MIN_CANDLE_PCT ? 'candle' : 'growth';
       st = {
@@ -359,15 +368,11 @@ export async function rebuildVCState(date) {
     vcState.set(tk, st);
     setups++;
     if (st.entered) entered++;
-    for (const pos of positions.values()) {
-      if (pos.token === tk && pos.status === 'open') pos.strat = 'vc';   // restore mgmt rules after restart
-    }
   }
   console.log(`🧿 VC state rebuilt: ${setups} setups, ${entered} already triggered`);
   vcNotify();
 }
 
-/* ---------- VC status for screener UI (badge + chip) ---------- */
 export function getVCStatus() {
   const watch = {};
   for (const [t, w] of vcWatch) watch[t] = { sym: w.sym, pdc: w.pdc, rangePct: w.rangePct };
@@ -380,10 +385,9 @@ export function getVCStatus() {
   return { date: vcDate, watchDate: vcWatchDateUsed, watch, state };
 }
 
-/* ---------- v3.3 ORB ENTRY ENGINE ----------
-   Entry = LTP breaks the 9:15-9:30 candle high (BUY) / low (SELL).
-   Only candles with size <= ORB_MAX_SIZE qualify. SL = opposite end.
-   One entry per stock per day. Sector-majority gate optional.      */
+/* ============================================================
+   v3.3 ORB ENTRY ENGINE
+   ============================================================ */
 function orbOnTick(tk, ltp) {
   if (!ORB_ENABLED || orbEntered.has(tk)) return;
   const ist = getIST();
@@ -397,35 +401,41 @@ function orbOnTick(tk, ltp) {
   if (ltp >= orb.high) side = 'BUY';
   else if (ltp <= orb.low) side = 'SELL';
   if (!side) return;
+  
   if (ORB_SECTOR_GATE) {
     const sector = sectorByToken[tk] || 'MISC';
     const sb = sectorBias(sector);
     if (sb.up || sb.down) {
       if (sb.side !== side) {
-        console.log(`🚫 ORB ${symByToken[tk] || tk} ${side} held: sector ${sector} majority ${sb.side || 'TIE'} (${sb.up}↑/${sb.down}↓ vs open)`);
         return;
       }
     }
   }
   orbEntered.add(tk);
   const sl = side === 'BUY' ? orb.low : orb.high;
-  console.log(`🎯 ORB TRIGGER ${symByToken[tk] || tk} ${side} @${ltp} | ORB ${orb.low}–${orb.high} size ${orb.size}% | SL ${sl}`);
+  console.log(`🎯 ORB TRIGGER ${symByToken[tk] || tk} ${side} @${ltp} | SL ${sl}`);
   placeEntries(tk, { sym: symByToken[tk] || '?', side, sl, strat: 'orb', tag: 'ORB' }, ltp)
     .catch(e => console.error('🤖 ORB entry error:', e.message));
 }
 
+/* ============================================================
+   MAIN TICK HANDLER
+   ============================================================ */
 export function onTickPos(token, ltp) {
   const tk = String(token);
 
-  orbOnTick(tk, ltp);  // v3.3: ORB entry trigger (9:15-9:30 candle breakout)
-  vcOnTick(tk, ltp);   // v3.0: VC entry trigger check (OFF by default now)
+  // 🆕 1. Fire Entries
+  orbOnTick(tk, ltp);       
+  vcOnTick(tk, ltp);        
+  bigPlayerOnTick(tk, ltp); // <-- New Bigplayer Engine
 
+  // 2. Manage Open Positions
   for (const [key, pos] of positions) {
     if (pos.token !== tk || pos.status !== 'open') continue;
     let changed = false;
 
-    /* ---- v3.0: VC positions — candle SL → CTC at +1%, NO trail ---- */
-    if (pos.strat === 'vc' || pos.strat === 'orb') {
+    /* ---- VC, ORB & BIGPLAYER Positions — CTC at +1% ---- */
+    if (pos.strat === 'vc' || pos.strat === 'orb' || pos.strat === 'bigplayer') {
       if (pos.stage === 0) {
         const ctcHit = pos.side === 'BUY'
           ? ltp >= pos.entry * (1 + VC_CTC_PCT / 100)
@@ -436,7 +446,7 @@ export function onTickPos(token, ltp) {
             ? Math.max(pos.sl, +pos.entry.toFixed(2))
             : Math.min(pos.sl, +pos.entry.toFixed(2));
           changed = true;
-          console.log(`🤖 VC ${pos.sym}: +${VC_CTC_PCT}% reached → SL to CTC @${pos.sl}`);
+          console.log(`🤖 ${pos.strat.toUpperCase()} ${pos.sym}: +${VC_CTC_PCT}% reached → SL to CTC @${pos.sl}`);
         }
       }
       const hitSL = pos.side === 'BUY' ? ltp <= pos.sl : ltp >= pos.sl;
@@ -448,8 +458,7 @@ export function onTickPos(token, ltp) {
       continue;
     }
 
-    /* ---- legacy management (positions without strat) ---- */
-
+    /* ---- legacy management ---- */
     if (changed) savePos(pos, posDate).catch(() => {});
   }
 }
@@ -535,7 +544,10 @@ export async function loadOpenPositions(date, userId) {
       });
     }
     posDate = date;
-    for (const r of rows) orbEntered.add(String(r.token));   // v3.3: no re-entry on stocks already traded today
+    for (const r of rows) {
+      orbEntered.add(String(r.token));
+      bigPlayerEntered.add(String(r.token)); // 🆕 Restore Bigplayer state
+    }
     const open = rows.filter(r => r.status === 'open').length;
     console.log(`🤖 Positions loaded: ${rows.length} total, ${open} open${userId ? ` (user=${userId})` : ''}`);
   } catch (e) {

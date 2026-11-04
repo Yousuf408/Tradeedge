@@ -193,9 +193,10 @@ export async function fetchQuotesForTokens(tokens) {
           if (!Number.isFinite(high) || !Number.isFinite(low)) continue;
           if (high <= 0 || low <= 0) continue;
 
-          out.push({
+                   out.push({
             token: String(q.symbolToken),
-            open, high, low, close, ltp
+            open, high, low, close, ltp,
+            volume: +q.tradeVolume || 0
           });
         }
       }

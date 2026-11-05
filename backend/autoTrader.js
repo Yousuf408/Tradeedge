@@ -248,8 +248,8 @@ function bigPlayerOnTick(tk, ltp) {
   // Execute Entry
   bigPlayerEntered.add(tk);
   
-  // 0.5% Stop Loss
-  const sl = ltp * 0.995; 
+  // 2% Stop Loss
+  const sl = ltp * 0.98;
   
   console.log(`🚀 BIGPLAYER TRIGGER ${symByToken[tk] || tk} BUY @${ltp} | Move: ${movePct.toFixed(2)}% | RVOL: ${rvol}`);
   placeEntries(tk, { sym: symByToken[tk] || '?', side: 'BUY', sl, strat: 'bigplayer', tag: 'BIGPLAYER' }, ltp)
@@ -434,22 +434,27 @@ export function onTickPos(token, ltp) {
     if (pos.token !== tk || pos.status !== 'open') continue;
     let changed = false;
 
-    /* ---- VC, ORB & BIGPLAYER Positions — CTC at +1% ---- */
+       /* ---- VC, ORB & BIGPLAYER Positions — CTC at +1% ---- */
     if (pos.strat === 'vc' || pos.strat === 'orb' || pos.strat === 'bigplayer') {
       if (pos.stage === 0) {
+        // 🆕 Bigplayer ke liye 2% CTC, baaki ke liye purana VC_CTC_PCT (1%)
+        const ctcTarget = pos.strat === 'bigplayer' ? 2.0 : VC_CTC_PCT;
+        
         const ctcHit = pos.side === 'BUY'
-          ? ltp >= pos.entry * (1 + VC_CTC_PCT / 100)
-          : ltp <= pos.entry * (1 - VC_CTC_PCT / 100);
+          ? ltp >= pos.entry * (1 + ctcTarget / 100)
+          : ltp <= pos.entry * (1 - ctcTarget / 100);
+          
         if (ctcHit) {
           pos.stage = 1;
           pos.sl = pos.side === 'BUY'
             ? Math.max(pos.sl, +pos.entry.toFixed(2))
             : Math.min(pos.sl, +pos.entry.toFixed(2));
           changed = true;
-          console.log(`🤖 ${pos.strat.toUpperCase()} ${pos.sym}: +${VC_CTC_PCT}% reached → SL to CTC @${pos.sl}`);
+          console.log(`🤖 ${pos.strat.toUpperCase()} ${pos.sym}: +${ctcTarget}% reached → SL to CTC @${pos.sl}`);
         }
       }
-      const hitSL = pos.side === 'BUY' ? ltp <= pos.sl : ltp >= pos.sl;
+       
+       const hitSL = pos.side === 'BUY' ? ltp <= pos.sl : ltp >= pos.sl;
       if (hitSL) {
         exitPosition(pos, ltp, pos.stage >= 1 ? 'CTC' : 'SL');
         continue;

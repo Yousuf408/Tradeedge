@@ -625,6 +625,8 @@ async function loadTodayWSClosesFromDB() {
     wsTodayVols.clear();
     wsTodayHighs.clear();
     wsTodayLows.clear();
+    prevCumVol.clear(); 
+
     
     for (const r of rows) {
       if (Array.isArray(r.ws_1min_close) && r.ws_1min_close.length > 0) {
@@ -835,11 +837,15 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
 
     const cumRaw = lastWsVolume.get(token) ?? bsCache.get(token)?.volume ?? null;
     const cum = (cumRaw != null && cumRaw > 0) ? cumRaw : null;
-    const prev = prevCumVol.get(token) ?? null;
+    
+    const prev = prevCumVol.get(token) ?? 0;
     let mv = 0;
-    if (cum != null && prev != null && cum >= prev) mv = cum - prev;
+    if (cum != null) {
+      if (cum >= prev) mv = cum - prev;
+      else mv = cum; // Agar kal ka volume bada tha (naya din), toh poora volume aaj ka maano
+    }
     if (cum != null) prevCumVol.set(token, cum);
-
+         
     const histAvg = avgVolume5D.get(token) || 0;
     const officialCumVol = cum || bsCache.get(token)?.volume || 0;
     const rvol = histAvg > 0 ? +(officialCumVol / histAvg).toFixed(2) : 0;

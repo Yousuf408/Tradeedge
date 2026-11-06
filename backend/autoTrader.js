@@ -425,8 +425,8 @@ export function onTickPos(token, ltp) {
   const tk = String(token);
 
   // 🆕 1. Fire Entries
-  orbOnTick(tk, ltp);       
-  vcOnTick(tk, ltp);        
+ // orbOnTick(tk, ltp);       
+  // vcOnTick(tk, ltp);        
   bigPlayerOnTick(tk, ltp); // <-- New Bigplayer Engine
 
   // 2. Manage Open Positions

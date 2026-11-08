@@ -155,6 +155,7 @@ const getStrategy = id => STRATEGIES[id] || STRATEGIES.momentum;
 const getIST = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 
 let holidaySet = new Set();
+let specialDaySet = new Set();  // <--- ADD THIS
 
 async function loadHolidaysFromDB() {
   try {
@@ -164,10 +165,21 @@ async function loadHolidaysFromDB() {
   } catch (e) { console.error('Holiday load failed:', e.message); }
 }
 
+// <--- ADD THIS NEW FUNCTION
+async function loadSpecialDaysFromDB() {
+  try {
+    const { rows } = await db.query('SELECT date::text AS d FROM special_trading_days');
+    specialDaySet = new Set(rows.map(r => r.d));
+    console.log(`⭐ Loaded ${specialDaySet.size} special trading days`);
+  } catch (e) { console.error('Special days load failed:', e.message); }
+}
 const isHoliday = s => holidaySet.has(s);
-const isTradingDay = d =>
-  d.getUTCDay() !== 0 && d.getUTCDay() !== 6 &&
-  !isHoliday(d.toISOString().split('T')[0]);
+const isTradingDay = d => {
+  const ds = d.toISOString().split('T')[0];
+  if (isHoliday(ds)) return false;          // Holiday table wins
+  if (specialDaySet.has(ds)) return true;   // Special Sunday/Weekend overrides
+  return d.getUTCDay() !== 0 && d.getUTCDay() !== 6; // Default Mon-Fri
+};
 
 function getPreviousTradingDay(dateObj) {
   const d = new Date(dateObj);
@@ -3237,6 +3249,7 @@ app.listen(PORT, async () => {
   }
 
   await loadHolidaysFromDB();
+  await loadSpecialDaysFromDB();
   await loadPrevCloseFromDB();
   await loadAvgVolumeFromDB(); 
   await loadLastEodVolumeFromDB();

@@ -3338,14 +3338,13 @@ app.listen(PORT, async () => {
   const secs = nowIST.getUTCHours() * 3600 + nowIST.getUTCMinutes() * 60 + nowIST.getUTCSeconds();
   const dow = nowIST.getUTCDay();
 
-  if (dow >= 1 && dow <= 5 && mins >= 916 && mins <= 940) {
+   if (isTradingDay(nowIST) && mins >= 916 && mins <= 940) {
     console.log('🔔 Late startup — fetching day H/L/C');
     fetchDayHLC();
   }
-
   const bsStart = 9 * 3600 + 15 * 60;
   const bsEnd   = 15 * 3600 + 30 * 60;
-  if (dow >= 1 && dow <= 5 && isTradingDay(nowIST) && secs >= bsStart && secs < bsEnd) {
+  if (isTradingDay(nowIST) && secs >= bsStart && secs < bsEnd) {
     const pB = getScreenerPhase();
     if (pB.date) {
       try {

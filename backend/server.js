@@ -155,7 +155,6 @@ const getStrategy = id => STRATEGIES[id] || STRATEGIES.momentum;
 const getIST = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 
 let holidaySet = new Set();
-let specialDaySet = new Set();  // <--- ADD THIS
 
 async function loadHolidaysFromDB() {
   try {
@@ -165,20 +164,12 @@ async function loadHolidaysFromDB() {
   } catch (e) { console.error('Holiday load failed:', e.message); }
 }
 
-// <--- ADD THIS NEW FUNCTION
-async function loadSpecialDaysFromDB() {
-  try {
-    const { rows } = await db.query('SELECT date::text AS d FROM special_trading_days');
-    specialDaySet = new Set(rows.map(r => r.d));
-    console.log(`⭐ Loaded ${specialDaySet.size} special trading days`);
-  } catch (e) { console.error('Special days load failed:', e.message); }
-}
 const isHoliday = s => holidaySet.has(s);
+
+// SINGLE SOURCE OF TRUTH: If it's in the table, it's closed. Otherwise, open.
 const isTradingDay = d => {
   const ds = d.toISOString().split('T')[0];
-  if (isHoliday(ds)) return false;          // Holiday table wins
-  if (specialDaySet.has(ds)) return true;   // Special Sunday/Weekend overrides
-  return d.getUTCDay() !== 0 && d.getUTCDay() !== 6; // Default Mon-Fri
+  return !isHoliday(ds); 
 };
 
 function getPreviousTradingDay(dateObj) {
@@ -2234,8 +2225,130 @@ app.get('/api/admin/fetch-volume-progress', auth, (req, res) => {
 });
 
 /* ============================================================
+   NSE DIRECT OHLCV FETCH (Last 3 Days)
+   ============================================================ */
+let nseFetchRunning = false;
+let nseFetchProgress = { running: false, done: 0, total: 0, current: '', saved: 0 };
+
+async function getNSECookies() {
+  const res = await fetch('https://www.nseindia.com/report-detail/eq_security', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5'
+    }
+  });
+  const setCookies = res.headers.getSetCookie();
+  return setCookies.map(c => c.split(';')[0]).join('; ');
+}
+
+async function fetchNseHistoricalData(sym, fromDate, toDate, cookies) {
+  const url = `https://www.nseindia.com/api/historicalOR/generateSecurityWiseHistoricalData?from=${fromDate}&to=${toDate}&symbol=${encodeURIComponent(sym)}&type=priceVolumeDeliverable&series=EQ`;
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Referer': 'https://www.nseindia.com/report-detail/eq_security',
+      'Cookie': cookies
+    }
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  return json.data || [];
+}
+
+async function processNseFetch() {
+  if (nseFetchRunning) return;
+  nseFetchRunning = true;
+
+  const days = 3;
+  const today = getIST();
+  
+  // Format: DD-MM-YYYY for NSE
+  const toDateStr = `${String(today.getUTCDate()).padStart(2, '0')}-${String(today.getUTCMonth() + 1).padStart(2, '0')}-${today.getUTCFullYear()}`;
+  const fromDateObj = new Date(today.getTime() - (days * 24 * 3600 * 1000));
+  const fromDateStr = `${String(fromDateObj.getUTCDate()).padStart(2, '0')}-${String(fromDateObj.getUTCMonth() + 1).padStart(2, '0')}-${fromDateObj.getUTCFullYear()}`;
+
+  const queue = [...STOCKS].sort((a, b) => String(a.sym).localeCompare(String(b.sym)));
+  nseFetchProgress = { running: true, total: queue.length, done: 0, current: '', saved: 0 };
+
+  try {
+    console.log(`📥 NSE Fetch Start: ${fromDateStr} to ${toDateStr}`);
+    let cookies = await getNSECookies();
+    const monthMap = { Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06', Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12' };
+
+    while (queue.length) {
+      const stock = queue.shift();
+      nseFetchProgress.current = stock.sym;
+
+      try {
+        const data = await fetchNseHistoricalData(stock.sym, fromDateStr, toDateStr, cookies);
+        let savedRows = 0;
+
+        for (const bar of data) {
+          // NSE returns timestamp like "08-Nov-2026"
+          const parts = bar.mTIMESTAMP.split('-');
+          if (parts.length !== 3) continue;
+          const isoDate = `${parts[2]}-${monthMap[parts[1]]}-${parts[0].padStart(2, '0')}`;
+          
+          const vol = +bar.mTOTTRDQTY || 0;
+          if (vol <= 0) continue;
+
+          await db.query(
+            `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, day_open, day_high, day_low, day_close, volume)
+             VALUES ($1, $2, $3, 'momentum', $4, $5, $6, $7, $8)
+             ON CONFLICT (date, token, strategy_id) DO UPDATE SET
+             day_open = EXCLUDED.day_open,
+             day_high = EXCLUDED.day_high,
+             day_low = EXCLUDED.day_low,
+             day_close = EXCLUDED.day_close,
+             volume = EXCLUDED.volume`,
+            [isoDate, stock.sym, String(stock.token), +bar.mOPEN, +bar.mHIGH, +bar.mLOW, +bar.mCLOSE, vol]
+          );
+          savedRows++;
+        }
+        nseFetchProgress.saved += savedRows;
+      } catch (e) {
+        console.warn(`NSE fetch ${stock.sym} failed: ${e.message}`);
+        if (e.message.includes('401') || e.message.includes('403')) {
+          try { cookies = await getNSECookies(); } catch {}
+        }
+      }
+
+      nseFetchProgress.done++;
+      if (nseFetchProgress.done % 25 === 0) {
+        console.log(`📥 NSE Fetch: ${nseFetchProgress.done}/${nseFetchProgress.total} | saved=${nseFetchProgress.saved}`);
+      }
+      await new Promise(r => setTimeout(r, 1500)); // 1.5s delay to bypass IP block
+    }
+    console.log(`✅ NSE Fetch DONE | saved=${nseFetchProgress.saved} rows`);
+  } catch (e) {
+    console.error('NSE Fetch Error:', e);
+  } finally {
+    nseFetchRunning = false;
+    nseFetchProgress.running = false;
+  }
+}
+
+app.post('/api/admin/fetch-nse-ohlcv', auth, adminOnly, (req, res) => {
+  if (nseFetchRunning) return res.status(409).json({ error: 'NSE Fetch already running' });
+  nseFetchRunning = true;
+  res.json({ ok: true, message: 'NSE Fetch started' });
+  processNseFetch().catch(e => {
+    console.error('🛑 NSE bg error:', e.message);
+    nseFetchRunning = false;
+  });
+});
+
+app.get('/api/admin/fetch-nse-progress', auth, (req, res) => {
+  res.json(nseFetchProgress);
+});
+
+/* ============================================================
    SECTION 8 — DAY H/L/C FETCH (AUTO @ 15:31 — KEPT)
    ============================================================ */
+
 async function fetchDayHLC() {
   try {
     const p = getScreenerPhase();
@@ -3249,7 +3362,6 @@ app.listen(PORT, async () => {
   }
 
   await loadHolidaysFromDB();
-  await loadSpecialDaysFromDB();
   await loadPrevCloseFromDB();
   await loadAvgVolumeFromDB(); 
   await loadLastEodVolumeFromDB();

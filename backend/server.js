@@ -1,15 +1,10 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.48 (Manual-Only Heavy Fetches)
+   server.js — TradeAlgo Pro backend  |  v5.49 (Angel 3D Fetch)
    ============================================================
-   CHANGES vs v5.47 (NOTHING else touched):
-   20. Historical 5-min backfill NO LONGER auto-fires at 16:00.
-       Manual only via POST /api/admin/fetch-historical (button).
-   21. Volume backfill NEVER auto-fires. Manual only via
-       POST /api/admin/fetch-volume-backfill (button).
-   22. Volume backfill route now checks pg_locks for 15-min
-       fetch (advisory 7452) to avoid rate-limit collisions.
-   Unchanged: HLC@15:31, BS@9:15, morning preload, AI, VC, margins,
-   WS/SSE, ORB, depth, all admin routes, all screener routes.
+   CHANGES vs v5.48 (NOTHING else touched):
+   23. Removed NSE Direct Fetch (blocked by VPS IP).
+   24. Added Angel One 3-Day OHLCV Fetch (Manual button only).
+       Fetches last 3 days of ONE_DAY candles directly from Angel.
    ============================================================ */
 
 // === GLOBAL ERROR HANDLERS (Prevents crashes) ===
@@ -2225,94 +2220,41 @@ app.get('/api/admin/fetch-volume-progress', auth, (req, res) => {
 });
 
 /* ============================================================
-   NSE DIRECT OHLCV FETCH (Last 3 Days)
+   ANGEL ONE 3-DAY OHLCV FETCH (Manual Button)
    ============================================================ */
-let nseFetchRunning = false;
-let nseFetchProgress = { running: false, done: 0, total: 0, current: '', saved: 0 };
+let angel3dRunning = false;
+let angel3dProgress = { running: false, done: 0, total: 0, current: '', saved: 0 };
 
-async function getNSECookies() {
-  const res = await fetch('https://www.nseindia.com/report-detail/eq_security', {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.5'
-    }
-  });
-  const setCookies = res.headers.getSetCookie();
-  return setCookies.map(c => c.split(';')[0]).join('; ');
-}
-
-async function fetchNseHistoricalData(sym, fromDate, toDate, cookies) {
-  const url = `https://www.nseindia.com/api/historicalOR/generateSecurityWiseHistoricalData?from=${fromDate}&to=${toDate}&symbol=${encodeURIComponent(sym)}&type=priceVolumeDeliverable&series=EQ`;
-  const res = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'application/json, text/plain, */*',
-      'Accept-Language': 'en-US,en;q=0.5',
-      'Referer': 'https://www.nseindia.com/report-detail/eq_security',
-      'Cookie': cookies
-    }
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
-  return json.data || [];
-}
-
-async function processNseFetch() {
-  if (nseFetchRunning) return;
-  nseFetchRunning = true;
-
-  const days = 3;
-  const today = getIST();
-  
-  // Format: DD-MM-YYYY for NSE
-  const toDateStr = `${String(today.getUTCDate()).padStart(2, '0')}-${String(today.getUTCMonth() + 1).padStart(2, '0')}-${today.getUTCFullYear()}`;
-  const fromDateObj = new Date(today.getTime() - (days * 24 * 3600 * 1000));
-  const fromDateStr = `${String(fromDateObj.getUTCDate()).padStart(2, '0')}-${String(fromDateObj.getUTCMonth() + 1).padStart(2, '0')}-${fromDateObj.getUTCFullYear()}`;
+async function processAngel3dFetch() {
+  if (angel3dRunning) return;
+  angel3dRunning = true;
 
   const queue = [...STOCKS].sort((a, b) => String(a.sym).localeCompare(String(b.sym)));
-  nseFetchProgress = { running: true, total: queue.length, done: 0, current: '', saved: 0 };
+  angel3dProgress = { running: true, total: queue.length, done: 0, current: '', saved: 0 };
 
   try {
-    console.log(`📥 NSE Fetch Start: ${fromDateStr} to ${toDateStr}`);
-    let cookies = await getNSECookies();
-    const monthMap = { Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06', Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12' };
+    console.log(`📥 Angel 3-Day Fetch Start`);
+    try { await loginREST(); } catch (e) { console.error('init login:', e.message); }
 
-        while (queue.length) {
+    while (queue.length) {
       const stock = queue.shift();
-      nseFetchProgress.current = stock.sym;
+      angel3dProgress.current = stock.sym;
+
+      if (!getSessionStatusREST()?.loggedIn) {
+        try { await loginREST(); } catch {}
+      }
 
       try {
-        // --- DEBUG: Fetch raw text first to see what NSE returns ---
-        const url = `https://www.nseindia.com/api/historicalOR/generateSecurityWiseHistoricalData?from=${fromDateStr}&to=${toDateStr}&symbol=${encodeURIComponent(stock.sym)}&type=priceVolumeDeliverable&series=EQ`;
-        const rawRes = await fetch(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Cookie': cookies
-          }
-        });
+        const raw = await fetchAngelInterval(stock.token, 'ONE_DAY', 3);
         
-        const textData = await rawRes.text();
-        
-        // Print the first stock's raw response to the console
-        if (nseFetchProgress.done === 0) {
-          console.log(`\n🔍 [DEBUG NSE RESPONSE for ${stock.sym}]:`, textData.substring(0, 300));
-        }
-
-        let json;
-        try { json = JSON.parse(textData); } catch (e) { throw new Error('Not JSON (Probably blocked by NSE)'); }
-        
-        const data = json.data || [];
         let savedRows = 0;
-
-        for (const bar of data) {
-          // NSE returns timestamp like "08-Nov-2026"
-          const parts = bar.mTIMESTAMP.split('-');
-          if (parts.length !== 3) continue;
-          const isoDate = `${parts[2]}-${monthMap[parts[1]]}-${parts[0].padStart(2, '0')}`;
+        for (const b of raw) {
+          const ms = typeof b[0] === 'number' ? b[0] : new Date(b[0]).getTime();
+          if (!Number.isFinite(ms)) continue;
           
-          const vol = +bar.mTOTTRDQTY || 0;
+          // Convert epoch to IST date string (YYYY-MM-DD)
+          const date = new Date(ms + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+          const vol = +b[5] || 0;
           if (vol <= 0) continue;
 
           await db.query(
@@ -2324,45 +2266,45 @@ async function processNseFetch() {
              day_low = EXCLUDED.day_low,
              day_close = EXCLUDED.day_close,
              volume = EXCLUDED.volume`,
-            [isoDate, stock.sym, String(stock.token), +bar.mOPEN, +bar.mHIGH, +bar.mLOW, +bar.mCLOSE, vol]
+            [date, stock.sym, String(stock.token), +b[1], +b[2], +b[3], +b[4], vol]
           );
           savedRows++;
         }
-        nseFetchProgress.saved += savedRows;
+        angel3dProgress.saved += savedRows;
       } catch (e) {
-        console.warn(`NSE fetch ${stock.sym} failed: ${e.message}`);
-        if (e.message.includes('401') || e.message.includes('403')) {
-          try { cookies = await getNSECookies(); } catch {}
+        if (isSessionError(e)) {
+          try { await forceReloginREST(); } catch {}
         }
+        console.warn(`Angel 3D fetch ${stock.sym} failed: ${e.message}`);
       }
 
-      nseFetchProgress.done++;
-      if (nseFetchProgress.done % 25 === 0) {
-        console.log(`📥 NSE Fetch: ${nseFetchProgress.done}/${nseFetchProgress.total} | saved=${nseFetchProgress.saved}`);
+      angel3dProgress.done++;
+      if (angel3dProgress.done % 25 === 0) {
+        console.log(`📥 Angel 3D Fetch: ${angel3dProgress.done}/${angel3dProgress.total} | saved=${angel3dProgress.saved}`);
       }
-      await new Promise(r => setTimeout(r, 1500)); // 1.5s delay to bypass IP block
+      await sleepMs(400); // Safe delay
     }
-    console.log(`✅ NSE Fetch DONE | saved=${nseFetchProgress.saved} rows`);
+    console.log(`✅ Angel 3D Fetch DONE | saved=${angel3dProgress.saved} rows`);
   } catch (e) {
-    console.error('NSE Fetch Error:', e);
+    console.error('Angel 3D Fetch Error:', e);
   } finally {
-    nseFetchRunning = false;
-    nseFetchProgress.running = false;
+    angel3dRunning = false;
+    angel3dProgress.running = false;
   }
 }
 
-app.post('/api/admin/fetch-nse-ohlcv', auth, adminOnly, (req, res) => {
-  if (nseFetchRunning) return res.status(409).json({ error: 'NSE Fetch already running' });
-  nseFetchRunning = true;
-  res.json({ ok: true, message: 'NSE Fetch started' });
-  processNseFetch().catch(e => {
-    console.error('🛑 NSE bg error:', e.message);
-    nseFetchRunning = false;
+app.post('/api/admin/fetch-angel-3d', auth, adminOnly, (req, res) => {
+  if (angel3dRunning) return res.status(409).json({ error: 'Fetch already running' });
+  angel3dRunning = true;
+  res.json({ ok: true, message: 'Angel 3D Fetch started' });
+  processAngel3dFetch().catch(e => {
+    console.error('🛑 Angel 3D bg error:', e.message);
+    angel3dRunning = false;
   });
 });
 
-app.get('/api/admin/fetch-nse-progress', auth, (req, res) => {
-  res.json(nseFetchProgress);
+app.get('/api/admin/fetch-angel-3d-progress', auth, (req, res) => {
+  res.json(angel3dProgress);
 });
 
 /* ============================================================

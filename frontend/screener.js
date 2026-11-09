@@ -117,6 +117,7 @@ function renderStrategyControls() {
     <button id="fetchBSBtn" class="btn btn-primary" ${btnStyle} onclick="startBSFetch()">💹 Fetch Buy/Sell</button>
     <button id="fetchHistoricalBtn" class="btn btn-outline" ${btnStyle} onclick="startHistoricalFetch()">📥 Fetch Historical</button>
     <button id="fetchVolumeHistBtn" class="btn btn-outline" ${btnStyle} onclick="startVolumeHistoryFetch()">📈 Fetch Volume History</button>
+    <button id="fetchNseBtn" class="btn btn-outline" ${btnStyle} onclick="startNseFetch()">📥 Fetch NSE 3D</button>
     <button id="fetch15Btn" class="btn btn-outline" ${btnStyle} onclick="startFifteenFetch()">📊 Fetch 15-Min</button>
     <button id="fetchEODBtn" class="btn btn-outline" ${btnStyle} onclick="startEODClosesFetch()">⚙️ Fetch EOD Closes</button>`;
 
@@ -900,6 +901,7 @@ async function startVolumeHistoryFetch() {
       } catch (e) { console.error('vol progress poll:', e); }
     }, 2000);
 
+ // ... end of startVolumeHistoryFetch() ...
   } catch (e) {
     showToast('⚠️ Network Error', 'Server not reachable.');
     VOLUME_HIST_FETCHING = false;
@@ -909,8 +911,68 @@ async function startVolumeHistoryFetch() {
   }
 }
 
+let NSE_FETCHING = false;
+
+async function startNseFetch() {
+  const btn = document.getElementById('fetchNseBtn');
+  if (!btn || NSE_FETCHING) return;
+
+  const ok = confirm('📥 Fetch last 3 days OHLCV directly from NSE website?\n\nThis takes ~10 minutes (1.5s delay per stock to bypass NSE IP blocks).\nContinue?');
+  if (!ok) return;
+
+  NSE_FETCHING = true;
+  btn.disabled = true;
+  btn.textContent = '⏳ NSE Fetch...';
+
+  const pb = document.getElementById('progressBar');
+  if (pb) pb.style.display = 'block';
+
+  try {
+    const r = await fetch(API + '/api/admin/fetch-nse-ohlcv', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() }
+    });
+    
+    if (!r.ok) {
+      showToast('⚠️ Failed', 'Could not start NSE fetch');
+      NSE_FETCHING = false; btn.disabled = false; btn.textContent = '📥 Fetch NSE 3D';
+      if (pb) pb.style.display = 'none';
+      return;
+    }
+
+    showToast('✅ Started', 'Fetching from NSE in background...');
+
+    const poll = setInterval(async () => {
+      try {
+        const pr = await fetch(API + '/api/admin/fetch-nse-progress', {
+          headers: { Authorization: 'Bearer ' + getToken() }
+        }).then(res => res.json());
+
+        if (pr.running) {
+          updateProgress(pr.done, pr.total);
+          btn.textContent = `⏳ NSE ${pr.current} (${pr.done}/${pr.total}) · ${pr.saved} rows`;
+        } else {
+          clearInterval(poll);
+          NSE_FETCHING = false;
+          btn.disabled = false;
+          btn.textContent = '📥 Fetch NSE 3D';
+          updateProgress(pr.total || 1, pr.total || 1);
+          showToast('🎉 NSE Fetch Done', `${pr.saved} rows saved to DB`);
+          setTimeout(() => { if (pb) pb.style.display = 'none'; }, 3000);
+        }
+      } catch (e) { console.error('NSE progress poll:', e); }
+    }, 2000);
+
+  } catch (e) {
+    showToast('⚠️ Network Error', 'Server not reachable.');
+    NSE_FETCHING = false; btn.disabled = false; btn.textContent = '📥 Fetch NSE 3D';
+    if (pb) pb.style.display = 'none';
+  }
+}
+
 function updateProgress(done, total) {
-  const fill = document.getElementById('progressFill');
+   
+   const fill = document.getElementById('progressFill');
   const text = document.getElementById('progressText');
   const pct = total ? Math.round((done / total) * 100) : 0;
   if (fill) fill.style.width = pct + '%';

@@ -118,8 +118,11 @@ export function registerAdminRoutes(app, deps) {
       }
 
       // 2. DELETE: Jitne saal NSE se aaye hain, DB se un saalo ke purane (galat) holidays delete karo
-      for (const year of yearSet) {
-        await db.query(`DELETE FROM trading_holidays WHERE EXTRACT(YEAR FROM date) = $1`, [year]);
+     for (const year of yearSet) {
+        await db.query(
+          `DELETE FROM trading_holidays WHERE EXTRACT(YEAR FROM date) = $1 AND reason <> 'Weekend'`, 
+          [year]
+        );
       }
 
       // 3. INSERT: Ab fresh NSE data insert karo

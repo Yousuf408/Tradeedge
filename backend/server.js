@@ -2278,12 +2278,32 @@ async function processNseFetch() {
     let cookies = await getNSECookies();
     const monthMap = { Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06', Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12' };
 
-    while (queue.length) {
+        while (queue.length) {
       const stock = queue.shift();
       nseFetchProgress.current = stock.sym;
 
       try {
-        const data = await fetchNseHistoricalData(stock.sym, fromDateStr, toDateStr, cookies);
+        // --- DEBUG: Fetch raw text first to see what NSE returns ---
+        const url = `https://www.nseindia.com/api/historicalOR/generateSecurityWiseHistoricalData?from=${fromDateStr}&to=${toDateStr}&symbol=${encodeURIComponent(stock.sym)}&type=priceVolumeDeliverable&series=EQ`;
+        const rawRes = await fetch(url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Cookie': cookies
+          }
+        });
+        
+        const textData = await rawRes.text();
+        
+        // Print the first stock's raw response to the console
+        if (nseFetchProgress.done === 0) {
+          console.log(`\n🔍 [DEBUG NSE RESPONSE for ${stock.sym}]:`, textData.substring(0, 300));
+        }
+
+        let json;
+        try { json = JSON.parse(textData); } catch (e) { throw new Error('Not JSON (Probably blocked by NSE)'); }
+        
+        const data = json.data || [];
         let savedRows = 0;
 
         for (const bar of data) {

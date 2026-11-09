@@ -2233,8 +2233,13 @@ async function processAngel3dFetch() {
   angel3dProgress = { running: true, total: queue.length, done: 0, current: '', saved: 0 };
 
   try {
-    console.log(`📥 Angel 3-Day Fetch Start`);
+    console.log(`📥 Angel 3D Fetch Start`);
     try { await loginREST(); } catch (e) { console.error('init login:', e.message); }
+
+    const nowIST = getIST();
+    const toDate = nowIST.toISOString().split('T')[0];
+    const fromMs = nowIST.getTime() - 4 * 24 * 3600 * 1000; // Exactly 4 days back
+    const fromDate = new Date(fromMs).toISOString().split('T')[0];
 
     while (queue.length) {
       const stock = queue.shift();
@@ -2245,36 +2250,50 @@ async function processAngel3dFetch() {
       }
 
       try {
-        const raw = await fetchAngelInterval(stock.token, 'ONE_DAY', 3);
+        const jwt = await getAnyAngelJwt();
         
-        let savedRows = 0;
-        for (const b of raw) {
-          const ms = typeof b[0] === 'number' ? b[0] : new Date(b[0]).getTime();
-          if (!Number.isFinite(ms)) continue;
-          
-          // Convert epoch to IST date string (YYYY-MM-DD)
-          const date = new Date(ms + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
-          const vol = +b[5] || 0;
-          if (vol <= 0) continue;
+        // Direct fetch exactly like our test script
+        const res = await fetch('https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json', 'X-UserType': 'USER', 'X-SourceID': 'WEB',
+            'X-ClientLocalIP': '127.0.0.1', 'X-ClientPublicIP': '127.0.0.1', 'X-MACAddress': '00:00:00:00:00:00',
+            'X-PrivateKey': process.env.ANGEL_API_KEY, 'Authorization': 'Bearer ' + jwt
+          },
+          body: JSON.stringify({
+            exchange: 'NSE', symboltoken: String(stock.token), interval: 'ONE_DAY',
+            fromdate: `${fromDate} 09:15`, todate: `${toDate} 15:30`
+          })
+        });
+        
+        const json = await res.json();
+        
+        if (json.status && json.data) {
+          let savedRows = 0;
+          for (const b of json.data) {
+            const ms = typeof b[0] === 'number' ? b[0] : new Date(b[0]).getTime();
+            if (!Number.isFinite(ms)) continue;
+            
+            const date = new Date(ms + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+            const vol = +b[5] || 0;
+            if (vol <= 0) continue;
 
-          await db.query(
-            `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, day_open, day_high, day_low, day_close, volume)
-             VALUES ($1, $2, $3, 'momentum', $4, $5, $6, $7, $8)
-             ON CONFLICT (date, token, strategy_id) DO UPDATE SET
-             day_open = EXCLUDED.day_open,
-             day_high = EXCLUDED.day_high,
-             day_low = EXCLUDED.day_low,
-             day_close = EXCLUDED.day_close,
-             volume = EXCLUDED.volume`,
-            [date, stock.sym, String(stock.token), +b[1], +b[2], +b[3], +b[4], vol]
-          );
-          savedRows++;
+            await db.query(
+              `INSERT INTO strategy_bs_snapshot (date, sym, token, strategy_id, day_open, day_high, day_low, day_close, volume)
+               VALUES ($1, $2, $3, 'momentum', $4, $5, $6, $7, $8)
+               ON CONFLICT (date, token, strategy_id) DO UPDATE SET
+               day_open = EXCLUDED.day_open,
+               day_high = EXCLUDED.day_high,
+               day_low = EXCLUDED.day_low,
+               day_close = EXCLUDED.day_close,
+               volume = EXCLUDED.volume`,
+              [date, stock.sym, String(stock.token), +b[1], +b[2], +b[3], +b[4], vol]
+            );
+            savedRows++;
+          }
+          angel3dProgress.saved += savedRows;
         }
-        angel3dProgress.saved += savedRows;
       } catch (e) {
-        if (isSessionError(e)) {
-          try { await forceReloginREST(); } catch {}
-        }
         console.warn(`Angel 3D fetch ${stock.sym} failed: ${e.message}`);
       }
 
@@ -2282,7 +2301,7 @@ async function processAngel3dFetch() {
       if (angel3dProgress.done % 25 === 0) {
         console.log(`📥 Angel 3D Fetch: ${angel3dProgress.done}/${angel3dProgress.total} | saved=${angel3dProgress.saved}`);
       }
-      await sleepMs(400); // Safe delay
+      await sleepMs(400);
     }
     console.log(`✅ Angel 3D Fetch DONE | saved=${angel3dProgress.saved} rows`);
   } catch (e) {

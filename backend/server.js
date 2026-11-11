@@ -1,13 +1,8 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.49 (Angel 3D Fetch)
-   ============================================================
-   CHANGES vs v5.48 (NOTHING else touched):
-   23. Removed NSE Direct Fetch (blocked by VPS IP).
-   24. Added Angel One 3-Day OHLCV Fetch (Manual button only).
-       Fetches last 3 days of ONE_DAY candles directly from Angel.
+   server.js — TradeAlgo Pro backend  |  v5.50 (Clean Fix)
    ============================================================ */
 
-// === GLOBAL ERROR HANDLERS (Prevents crashes) ===
+// === GLOBAL ERROR HANDLERS ===
 process.on('unhandledRejection', (reason) => {
   console.error('⚠️ Unhandled Rejection:', reason);
 });
@@ -161,7 +156,6 @@ async function loadHolidaysFromDB() {
 
 const isHoliday = s => holidaySet.has(s);
 
-// SINGLE SOURCE OF TRUTH: If it's in the table, it's closed. Otherwise, open.
 const isTradingDay = d => {
   const ds = d.toISOString().split('T')[0];
   return !isHoliday(ds); 
@@ -268,66 +262,6 @@ async function loadPrevCloseFromDB() {
       }
     }
 
-    const { rows: hlRows } = await db.query(
-      `SELECT token, day_high, day_low
-       FROM strategy_bs_snapshot
-       WHERE date = $1 AND token = ANY($2)`,
-      [prevDate, activeTokens]
-    );
-    for (const r of hlRows) {
-      if (r.day_high) prevHighCache.set(String(r.token), +r.day_high);
-      if (r.day_low) prevLowCache.set(String(r.token), +r.day_low);
-    }
-    console.log(`📈 Loaded PDH/PDL for ${hlRows.length} tokens (from ${prevDate})`);
-
-  } catch (e) { 
-    console.error('prevClose load failed:', e.message); 
-  }
-}
-
-
-    for (const r of rows) prevCloseCache.set(String(r.token), +r.prev_close);
-    console.log(`💾 prevClose (BS source, base=${baseDate}): ${rows.length} tokens`);
-
-    if (rows.length < activeTokens.length) {
-      const missingTokens = activeTokens.filter(t => !prevCloseCache.has(String(t)));
-      if (isTradingDay(istNow)) {
-        console.log(`🔄 Fetching prevClose via Quote API fallback for missing tokens...`);
-        try {
-          const quotes = await fetchQuotesForTokens(missingTokens);
-          if (quotes && quotes.length > 0) {
-            let count = 0;
-            for (const q of quotes) {
-              if (q.close && q.close > 0) {
-                prevCloseCache.set(String(q.token), +q.close);
-                count++;
-              }
-              if (q.ltp && q.ltp > 0) {
-                setCachedLTP(String(q.token), +q.ltp);
-              }
-            }
-            console.log(`✅ Quote API Fallback: Fetched data for ${count} tokens`);
-          }
-        } catch (apiErr) {
-          console.error('⚠️ Quote API fallback failed:', apiErr.message);
-        }
-      } else {
-        const P = getPreviousTradingDay(new Date(baseDate + 'T00:00:00Z'));
-        try {
-          const { rows: r2 } = await db.query(
-            `SELECT DISTINCT ON (token) token, day_close
-             FROM strategy_bs_snapshot
-             WHERE day_close IS NOT NULL AND token = ANY($1) AND date = $2
-             ORDER BY token, date DESC`,
-            [missingTokens, P]
-          );
-          for (const r of r2) prevCloseCache.set(String(r.token), +r.day_close);
-          console.log(`💾 prevClose weekend baseline from ${P}: ${r2.length} tokens`);
-        } catch (e2) { console.error('weekend baseline failed:', e2.message); }
-      }
-    }
-
-    const prevDate = getPreviousTradingDay(getIST());
     const { rows: hlRows } = await db.query(
       `SELECT token, day_high, day_low
        FROM strategy_bs_snapshot
@@ -884,7 +818,7 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     let mv = 0;
     if (cum != null) {
       if (cum >= prev) mv = cum - prev;
-      else mv = cum; // Agar kal ka volume bada tha (naya din), toh poora volume aaj ka maano
+      else mv = cum; 
     }
     if (cum != null) prevCumVol.set(token, cum);
          
@@ -2125,18 +2059,12 @@ app.post('/api/admin/fetch-historical', auth, adminOnly, async (req, res) => {
 
 /* ============================================================
    SECTION 7.3 — VOLUME-ONLY BACKFILL (ONE_DAY, MANUAL ONLY)
-   ------------------------------------------------------------
-   Writes ONLY strategy_bs_snapshot.volume. Never INSERTs rows.
-   Never touches OHLC / arrays / any other column.
-   Own advisory lock (7453) — 5-min uses 7451, 15-min uses 7452.
-   Refuses to run if 5-min historical OR 15-min fetch is active.
    ============================================================ */
 const VOLUME_LOCK_KEY = 7453;
 let volumeBackfillRunning = false;
 let volumeBackfillProgress = { running: false, done: 0, total: 0, current: '', updated: 0, skipped: 0 };
 
 async function fetchDailyVolumes(token, daysBack) {
-  // ONE_DAY → [[ts, o, h, l, c, volume], ...] — one bar per trading day
   const raw = await fetchAngelInterval(token, 'ONE_DAY', daysBack);
   const out = {};
   const today = getIST().toISOString().split('T')[0];
@@ -2256,7 +2184,6 @@ async function processVolumeBackfill(body) {
 app.post('/api/admin/fetch-volume-backfill', auth, adminOnly, async (req, res) => {
   if (volumeBackfillRunning) return res.status(409).json({ error: 'Volume backfill already running' });
   if (historicalRunning) return res.status(409).json({ error: '5-min historical is running — wait for it to finish first' });
-  // 15-min fetch shares the same Angel rate bucket — refuse if it's active
   try {
     const { rows } = await db.query(
       `SELECT 1 FROM pg_locks WHERE locktype='advisory' AND objid=7452 AND granted`
@@ -2295,7 +2222,7 @@ async function processAngel3dFetch() {
 
     const nowIST = getIST();
     const toDate = nowIST.toISOString().split('T')[0];
-    const fromMs = nowIST.getTime() - 4 * 24 * 3600 * 1000; // Exactly 4 days back
+    const fromMs = nowIST.getTime() - 4 * 24 * 3600 * 1000;
     const fromDate = new Date(fromMs).toISOString().split('T')[0];
 
     while (queue.length) {
@@ -2309,7 +2236,6 @@ async function processAngel3dFetch() {
       try {
         const jwt = await getAnyAngelJwt();
         
-        // Direct fetch exactly like our test script
         const res = await fetch('https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData', {
           method: 'POST',
           headers: {
@@ -2386,7 +2312,6 @@ app.get('/api/admin/fetch-angel-3d-progress', auth, (req, res) => {
 /* ============================================================
    SECTION 8 — DAY H/L/C FETCH (AUTO @ 15:31 — KEPT)
    ============================================================ */
-
 async function fetchDayHLC() {
   try {
     const p = getScreenerPhase();
@@ -3389,7 +3314,7 @@ registerFifteenRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.48 (manual-only heavy fetches)`);
+  console.log(`✅ Server on port ${PORT} — v5.50 (Clean Fix)`);
   initMarginService(db, getBrokerSession);
 
   try { 
@@ -3515,7 +3440,6 @@ app.listen(PORT, async () => {
     startBSInterval();
   }
 
-  // v5.48: Heavy backfills (historical + volume) are MANUAL-ONLY (no scheduler registered).
   scheduleDailyHLC();
   scheduleBSAutoFetch();
   scheduleFinalFlush();

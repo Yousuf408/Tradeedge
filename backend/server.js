@@ -1243,7 +1243,7 @@ function startWebSocketForReadyPhase() {
     }, 2000);
     return; 
   }
-   
+
   const tokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
   try {
     startWS({
@@ -1262,7 +1262,9 @@ function startWebSocketForReadyPhase() {
       setTimeout(() => startDepthLive(feedToken), 45000);
       console.log('🧿 Depth engine scheduled (45s delay)');
     }
-  } catch (e) { console.error('WS start failed:', e.message); }
+  } catch (e) { 
+    console.error('WS start failed:', e.message); 
+  }
 }
 
 function stopWebSocketIfNeeded() {

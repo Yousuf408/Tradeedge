@@ -229,18 +229,64 @@ async function loadPrevCloseFromDB() {
   try {
     const activeTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
     const istNow = getIST();
-    const todayStr = istNow.toISOString().split('T')[0];
-    const baseDate = isTradingDay(istNow) ? todayStr : getPreviousTradingDay(istNow);
-
+    
+    // Always find the true previous trading day (skips weekends/holidays)
+    const prevDate = getPreviousTradingDay(istNow);
+    
+    // Fetch the day_close of that previous trading day
     const { rows } = await db.query(
-      `SELECT DISTINCT ON (token) token, prev_close
+      `SELECT DISTINCT ON (token) token, day_close AS prev_close
        FROM strategy_bs_snapshot
-       WHERE prev_close IS NOT NULL
+       WHERE day_close IS NOT NULL
          AND token = ANY($1)
          AND date = $2
        ORDER BY token, date DESC`,
-      [activeTokens, baseDate]
+      [activeTokens, prevDate]
     );
+
+    for (const r of rows) prevCloseCache.set(String(r.token), +r.prev_close);
+    console.log(`💾 prevClose (from prev day ${prevDate}): ${rows.length} tokens`);
+
+    if (rows.length < activeTokens.length) {
+      const missingTokens = activeTokens.filter(t => !prevCloseCache.has(String(t)));
+      console.log(`🔄 Fetching prevClose via Quote API for ${missingTokens.length} missing tokens...`);
+      try {
+        const quotes = await fetchQuotesForTokens(missingTokens);
+        if (quotes && quotes.length > 0) {
+          let count = 0;
+          for (const q of quotes) {
+            if (q.close && q.close > 0) {
+              prevCloseCache.set(String(q.token), +q.close);
+              count++;
+            }
+            if (q.ltp && q.ltp > 0) {
+              setCachedLTP(String(q.token), +q.ltp);
+            }
+          }
+          console.log(`✅ Quote API Fallback: Fetched data for ${count} tokens`);
+        }
+      } catch (apiErr) {
+        console.error('⚠️ Quote API fallback failed:', apiErr.message);
+      }
+    }
+
+    const { rows: hlRows } = await db.query(
+      `SELECT token, day_high, day_low
+       FROM strategy_bs_snapshot
+       WHERE date = $1 AND token = ANY($2)`,
+      [prevDate, activeTokens]
+    );
+    for (const r of hlRows) {
+      if (r.day_high) prevHighCache.set(String(r.token), +r.day_high);
+      if (r.day_low) prevLowCache.set(String(r.token), +r.day_low);
+    }
+    console.log(`📈 Loaded PDH/PDL for ${hlRows.length} tokens (from ${prevDate})`);
+
+  } catch (e) { 
+    console.error('prevClose load failed:', e.message); 
+  }
+}
+
 
     for (const r of rows) prevCloseCache.set(String(r.token), +r.prev_close);
     console.log(`💾 prevClose (BS source, base=${baseDate}): ${rows.length} tokens`);
@@ -1184,9 +1230,20 @@ function startWebSocketForReadyPhase() {
   if (!shouldStartWS()) return;
 
   const restSession = getSessionStatusREST();
-  const feedToken = restSession.loggedIn ? getFeedTokenREST() : getFeedTokenQuote();
-  if (!feedToken) { console.log('⚠️  WS skipped — no feed token'); return; }
-
+  let feedToken = restSession.loggedIn ? getFeedTokenREST() : getFeedTokenQuote();
+  
+  if (!feedToken) { 
+    console.log('⚠️  WS skipped — no feed token. Attempting re-login in 2s...'); 
+    setTimeout(async () => {
+      try {
+        await loginREST();
+        console.log('✅ WS Re-login successful, starting WS...');
+        startWebSocketForReadyPhase();
+      } catch(e) { console.error('WS relogin failed:', e.message); }
+    }, 2000);
+    return; 
+  }
+   
   const tokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
   try {
     startWS({

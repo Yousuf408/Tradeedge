@@ -230,10 +230,8 @@ async function loadPrevCloseFromDB() {
     const activeTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
     const istNow = getIST();
     
-    // Always find the true previous trading day (skips weekends/holidays)
     const prevDate = getPreviousTradingDay(istNow);
     
-    // Fetch the day_close of that previous trading day
     const { rows } = await db.query(
       `SELECT DISTINCT ON (token) token, day_close AS prev_close
        FROM strategy_bs_snapshot

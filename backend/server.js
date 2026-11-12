@@ -1438,12 +1438,20 @@ app.get('/api/sectors', auth, (req, res) => {
     } else {
       e.noData++;
     }
-    if (pc && pc > 0) {
+         if (pc && pc > 0) {
       prevPct = +(((ltp - pc) / pc) * 100).toFixed(2);
       e.sumPrev += prevPct;
       e.nPrev++;
     }
-    e.stocks.push({ sym: s.sym, token: t, ltp, open, prev: pc, openPct, prevPct, orbSize });
+
+    // NEW: Fetch Volume & RVOL for Sector tab
+    const bs = bsCache.get(t) || null;
+    const wsVol = (wsTodayVols.get(t) || []).reduce((a, b) => a + (+b || 0), 0);
+    const eodVol = lastEodVolume.get(t) > 0 ? lastEodVolume.get(t) : null;
+    const vol = (bs?.volume > 0 ? +bs.volume : (wsVol > 0 ? wsVol : eodVol));
+    const rvol = vol && avgVolume5D.get(t) ? +(vol / avgVolume5D.get(t)).toFixed(1) : (bs?.rvol ?? null);
+
+    e.stocks.push({ sym: s.sym, token: t, ltp, open, prev: pc, openPct, prevPct, orbSize, volume: vol, rvol });
   }
   const sectors = Object.values(by).map(e => ({
     ...e,

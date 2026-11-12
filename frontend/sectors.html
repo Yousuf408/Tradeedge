@@ -184,17 +184,21 @@ function renderStocks() {
     </div>
     <div class="sp-body">
       <table>
-        <thead><tr>
+               <thead><tr>
           <th>STOCK</th><th>LTP</th>
+          <th>VOLUME</th>
+          <th>RVOL</th>
           <th class="sortable" onclick="setSort('prevPct')">CHANGE % · PREV ${SORT_KEY === 'prevPct' ? '<span class=arr>▼</span>' : ''}</th>
           <th class="sortable" onclick="setSort('openPct')">OPEN GAIN % ${SORT_KEY === 'openPct' ? '<span class=arr>▼</span>' : ''}</th>
           <th>CANDLE SIZE ≤9:30</th>
         </tr></thead>
         <tbody>
           ${stocks.map(st => `
-            <tr data-tk="${st.token}">
+                       <tr data-tk="${st.token}">
               <td class="sym">${st.sym}</td>
               <td class="mono c-ltp"></td>
+              <td class="mono c-vol"></td>
+              <td class="mono c-rvol"></td>
               <td class="mono c-prev"></td>
               <td class="mono c-open"></td>
               <td class="mono c-orb"></td>
@@ -204,9 +208,13 @@ function renderStocks() {
     </div>`;
   ROWS = {};
   el.querySelectorAll('tbody tr[data-tk]').forEach(tr => {
-    ROWS[tr.dataset.tk] = {
-      ltp: tr.querySelector('.c-ltp'), prev: tr.querySelector('.c-prev'),
-      open: tr.querySelector('.c-open'), orb: tr.querySelector('.c-orb')
+        ROWS[tr.dataset.tk] = {
+      ltp: tr.querySelector('.c-ltp'), 
+      vol: tr.querySelector('.c-vol'), 
+      rvol: tr.querySelector('.c-rvol'),
+      prev: tr.querySelector('.c-prev'),
+      open: tr.querySelector('.c-open'), 
+      orb: tr.querySelector('.c-orb')
     };
   });
   paintRows();
@@ -239,6 +247,15 @@ function paintRows() {
     r.open.textContent = sgn(st.openPct); r.open.className = 'mono c-open ' + cls(st.openPct);
     r.orb.textContent = st.orbSize == null ? '—' : st.orbSize.toFixed(2) + '%';
     r.orb.style.color = st.orbSize == null ? 'var(--muted)' : (st.orbSize <= 1 ? 'var(--green)' : st.orbSize <= 1.5 ? '#F5A623' : 'var(--red)');
+    
+    // NEW: Volume & RVOL Logic
+    const fmtQty = n => n == null ? '—' : (n >= 10000000 ? (n/10000000).toFixed(1)+'Cr' : n >= 100000 ? (n/100000).toFixed(1)+'L' : n >= 1000 ? (n/1000).toFixed(1)+'K' : n);
+    
+    r.vol.textContent = st.volume ? fmtQty(st.volume) : '—';
+    r.rvol.textContent = st.rvol ? st.rvol + 'x' : '—';
+    
+    // Color RVOL: Green if >= 2x, Orange if >= 1x, Muted if < 1x
+    r.rvol.style.color = st.rvol >= 2 ? 'var(--green)' : (st.rvol >= 1 ? '#F5A623' : 'var(--muted)');
   }
 }
 

@@ -1,5 +1,5 @@
 /* ============================================================
-   SCREENER.JS  — v4.8.6 (Angel 3D button added)
+   SCREENER.JS  — v5.0 (Bigplayer Focus)
    ============================================================ */
 
 let SCREENER_ALL_STOCKS = [];
@@ -9,16 +9,11 @@ let SCREENER_PIVOT = {};
 let SCREENER_BS = {};
 let SCREENER_PREOPEN = {};
 let SCREENER_DAY_OPEN = {};
-let SCREENER_RSI = {};
 let SCREENER_LEVERAGE = {};
 let SCREENER_MARGIN_PS = {};
-let SCREENER_CHIPS = [];
-let SCREENER_VC = { watch: {}, state: {}, date: null };   // v5.43: VC candidates badge/chip
-let SCREENER_ORB = [];          // v5.45: ORB-15 list (size <= 1.5%)
-let SCREENER_ORB_DONE = false;
 let SCREENER_LASTUPD = {};
 let SCREENER_VWAP = {};
-let SCREENER_RSI_FIRST = {};
+
 let SCREENER_INIT_DONE = false;
 let SCREENER_SSE = null;
 let FETCHING = false;
@@ -26,9 +21,9 @@ let QUOTE_FETCHING = false;
 let DAYHLC_FETCHING = false;
 let EOD_FETCHING = false;
 let HISTORICAL_FETCHING = false;
-let FIFTEEN_FETCHING = false;       // v4.8.4: separate 15-min fetch guard
-let VOLUME_HIST_FETCHING = false;   // v4.8.5: separate volume-history fetch guard
-let ANGEL_3D_FETCHING = false;      // v4.8.6: separate Angel 3D fetch guard
+let FIFTEEN_FETCHING = false;       
+let VOLUME_HIST_FETCHING = false;   
+let ANGEL_3D_FETCHING = false;      
 
 let SCREENER_MOMENTUM_FILTER = 'open_gain';
 let SCREENER_SORT_BY = 'change';
@@ -37,13 +32,10 @@ let SCREENER_SORT_DIR = 'desc';
 const OPEN_GAIN_MIN_PCT = 0.95;
 const OPEN_GAIN_MAX_GAP_PCT = 3.0;
 const OPEN_GAIN_REQUIRE_POSITIVE_CHANGE = true;
-let OPEN_GAIN_RANK = {};
-let OPEN_GAIN_RERENDER_TIMER = null;
 
 const SELL_OPEN_GAIN_MAX_PCT = -1.0;
 const SELL_GAP_MAX_PCT = 3.0;
 const SELL_REQUIRE_NEGATIVE_CHANGE = true;
-let SELL_CANDIDATE_RANK = {};
 
 let SCREENER_ACTIVE_STRATEGY = 'momentum';
 
@@ -62,9 +54,6 @@ let TICKER_BREADTH = { adv: 0, dec: 0 };
 let PER_TRADE = Number(localStorage.getItem('ta_capital') || 25000);
 let SIDE_MODE = localStorage.getItem('ta_side_mode') || 'MIX';
 
-const BATCH_SIZE = 20;
-const BATCH_DELAY = 150;
-
 /* ============================================================
    SECTION 1 — INIT
    ============================================================ */
@@ -79,10 +68,6 @@ async function initScreener() {
   postSideMode();
   await loadStockList();
   await loadLTP();
-  await loadChips();
-  await loadVC();
-  await loadORB();
-  setInterval(loadORB, 10000);   // v5.45: keep ORB list fresh (light route)
   SCREENER_INIT_DONE = true;
   startSSE();
 }
@@ -202,47 +187,6 @@ function postSideMode() {
   }, 400);
 }
 
-async function loadChips() {
-  try {
-    const r = await fetch(API + '/api/screener/chips', {
-      headers: { Authorization: 'Bearer ' + getToken() }
-    });
-    const d = await r.json();
-    if (d && d.chips) { SCREENER_CHIPS = d.chips; renderScreenerTable(); }
-  } catch (e) { console.error('Chips load failed:', e); }
-}
-
-// v5.43: VC sideways candidates + live setup state
-async function loadVC() {
-  try {
-    const r = await fetch(API + '/api/screener/vc', {
-      headers: { Authorization: 'Bearer ' + getToken() }
-    });
-    const d = await r.json();
-    if (d && d.watch) {
-      SCREENER_VC = { watch: d.watch || {}, state: d.state || {}, date: d.date || null, watchDate: d.watchDate || null };
-      renderChips();
-      renderScreenerTable();
-    }
-  } catch (e) { console.error('VC load failed:', e); }
-}
-
-// v5.45: ORB-15 list (first 15-min candle size <= 1.5%)
-async function loadORB() {
-  try {
-    const r = await fetch(API + '/api/screener/orb', {
-      headers: { Authorization: 'Bearer ' + getToken() }
-    });
-    const d = await r.json();
-    if (d && d.list) {
-      SCREENER_ORB = d.list;
-      SCREENER_ORB_DONE = !!d.done;
-      renderChips();
-      if (SCREENER_MOMENTUM_FILTER === 'orb15') renderScreenerTable();
-    }
-  } catch (e) { console.error('ORB load failed:', e); }
-}
-
 /* ============================================================
    SECTION 2.1 — FILTERS + CHIPS
    ============================================================ */
@@ -255,30 +199,11 @@ function setMomentumFilter(key) {
   } else if (key === 'sell_candidates') {
     SCREENER_SORT_BY = 'change';
     SCREENER_SORT_DIR = 'asc';   
-  } else if (key === 'vc_candidates') {
-    SCREENER_SORT_BY = 'vc_range';
-    SCREENER_SORT_DIR = 'asc';
-  } else if (key === 'orb15') {
-    SCREENER_SORT_BY = 'change';
-    SCREENER_SORT_DIR = 'desc';
   } else {
     SCREENER_SORT_BY = 'change';
     SCREENER_SORT_DIR = 'desc';
   }
   renderScreenerTable();
-}
-
-function scheduleOpenGainRerender() {
-  if (SCREENER_MOMENTUM_FILTER !== 'open_gain' &&
-      SCREENER_MOMENTUM_FILTER !== 'sell_candidates') return;
-  if (OPEN_GAIN_RERENDER_TIMER) return;
-  OPEN_GAIN_RERENDER_TIMER = setTimeout(() => {
-    OPEN_GAIN_RERENDER_TIMER = null;
-    if (SCREENER_MOMENTUM_FILTER === 'open_gain' ||
-        SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
-      renderScreenerTable();
-    }
-  }, 2000);
 }
 
 function countOpenGainStocks() {
@@ -293,15 +218,6 @@ function countSellCandidates() {
   return n;
 }
 
-function vcWatchLabel() {
-  const wd = SCREENER_VC.watchDate;
-  if (!wd) return 'VC';
-  try {
-    const d = new Date(wd + 'T00:00:00');
-    return `VC ${d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}`;
-  } catch { return 'VC'; }
-}
-
 function renderChips() {
   const el = document.getElementById('stageChips');
   if (!el) return;
@@ -313,15 +229,11 @@ function renderChips() {
     };
     const ogCount = countOpenGainStocks();
     const scCount = countSellCandidates();
-    const vcCount = Object.keys(SCREENER_VC.watch || {}).length;
     
     el.innerHTML =
       chip('open_gain', `🏆 Top Performing (${ogCount})`) +
       chip('sell_candidates', `📉 Top Shorts (${scCount})`) +
-      chip('all', 'All') +
-      chip('rsi_chips', '🔒 RSI Chips') +
-      chip('vc_candidates', `🎯 ${vcWatchLabel()} (${vcCount})`) +
-      chip('orb15', `🎯 ORB-15 (${SCREENER_ORB.length})`);
+      chip('all', 'All');
       
     el.style.display = '';
     return;
@@ -360,9 +272,7 @@ function getSortValue(stock, field) {
     return og === null ? -Infinity : og;
   }
   if (field === 'ltp') return SCREENER_LTP[stock.token] ?? -Infinity;
-  if (field === 'rsi') return SCREENER_RSI[stock.token] ?? -Infinity;
   if (field === 'rvol') return SCREENER_BS[stock.token]?.rvol ?? -Infinity;
-  if (field === 'vc_range') return SCREENER_VC.watch[String(stock.token)]?.rangePct ?? 999;
   return 0;
 }
 
@@ -442,20 +352,6 @@ function computeMaxQty(token, ltp) {
   return qty > 0 ? qty : '—';
 }
 
-function formatPriceINR(v) {
-  if (v === null || v === undefined) return '—';
-  return v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function formatTimeOnly(d) {
-  if (!d) return '';
-  try {
-    const dt = new Date(d);
-    const ist = new Date(dt.getTime() + 5.5 * 3600 * 1000);
-    return ist.toISOString().slice(11, 16);
-  } catch { return ''; }
-}
-
 function formatTimeIST(isoStr) {
   if (!isoStr) return '—';
   try {
@@ -524,7 +420,7 @@ function renderTicker() {
 /* ============================================================
    SECTION 3.3 — FAST CELL UPDATE (SSE LTP)
    ============================================================ */
-function updateLTPCells(ticks, vwaps, rsis) {
+function updateLTPCells(ticks, vwaps) {
   const rows = document.querySelectorAll('#screenerBody tr[data-token]');
   if (!rows.length) return;
   const rowMap = {};
@@ -563,12 +459,6 @@ function updateLTPCells(ticks, vwaps, rsis) {
       const vwEl = row.querySelector('.vwap-cell');
       if (vwEl) vwEl.textContent = '₹' + (+vwaps[token]).toFixed(2);
     }
-
-    if (rsis && rsis[token] != null) {
-      SCREENER_RSI[token] = rsis[token];
-      const rsiEl = row.querySelector('.rsi-cell');
-      if (rsiEl) rsiEl.innerHTML = renderRSICell(token);
-    }
   }
 }
 
@@ -600,24 +490,7 @@ function renderBuySellCell(token) {
 }
 
 /* ============================================================
-   SECTION 3.5 — RSI CELL
-   ============================================================ */
-function renderRSICell(token) {
-  const rsi = SCREENER_RSI[token];
-  if (rsi == null) return '<span style="color:var(--text-muted)">—</span>';
-
-  const v = +rsi;
-  let color = 'var(--text-primary)';
-  let badge = '';
-  if (v >= 70) { color = 'var(--danger)'; badge = ' 🔥'; }
-  else if (v >= 65) { color = '#F5A623'; }
-  else if (v <= 30) { color = 'var(--success)'; }
-
-  return `<span style="color:${color};font-weight:700">${v.toFixed(1)}${badge}</span>`;
-}
-
-/* ============================================================
-   SECTION 4 — LOAD STOCK LIST + CACHED DATA
+   SECTION 4 — LOAD STOCK LIST
    ============================================================ */
 async function loadStockList() {
   try {
@@ -686,7 +559,7 @@ async function startEODClosesFetch() {
     if (!r.ok) {
       showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
     } else {
-      showToast('✅ EOD Closes Saved', 'RSI-ready for next trading day');
+      showToast('✅ EOD Closes Saved', 'Ready for next trading day');
       await loadLTP();
     }
   } catch (e) {
@@ -714,7 +587,7 @@ async function startHistoricalFetch() {
   btn.textContent = '⏳ Fetching...';
   
   const pb = document.getElementById('progressBar');
-  if (pb) pb.style.display = 'block'; // Show progress bar
+  if (pb) pb.style.display = 'block'; 
 
   try {
     const r = await fetch(API + '/api/admin/fetch-historical', {
@@ -737,7 +610,6 @@ async function startHistoricalFetch() {
 
     showToast('✅ Fetch Started', 'Background process running. Watch progress bar.');
 
-    // Start polling progress every 2 seconds
     const poll = setInterval(async () => {
       try {
         const pr = await fetch(API + '/api/admin/fetch-progress', {
@@ -752,7 +624,7 @@ async function startHistoricalFetch() {
           HISTORICAL_FETCHING = false;
           btn.disabled = false;
           btn.textContent = '📥 Fetch Historical';
-          updateProgress(pr.total || 1, pr.total || 1); // 100%
+          updateProgress(pr.total || 1, pr.total || 1); 
           showToast('🎉 Fetch Complete', 'All 5-min candles updated.');
           setTimeout(() => { if (pb) pb.style.display = 'none'; }, 3000);
         }
@@ -769,8 +641,7 @@ async function startHistoricalFetch() {
 }
 
 /* ============================================================
-   SECTION 5.7 — FETCH 15-MIN CANDLES (v4.8.4: separate button,
-   own runner on server, OHLCV, ~2 months, never touches 5-min)
+   SECTION 5.7 — FETCH 15-MIN CANDLES
    ============================================================ */
 async function startFifteenFetch() {
   const btn = document.getElementById('fetch15Btn');
@@ -839,8 +710,7 @@ async function startFifteenFetch() {
 }
 
 /* ============================================================
-   SECTION 5.8 — FETCH VOLUME HISTORY (v4.8.5: separate button,
-   writes ONLY the volume column via ONE_DAY historical)
+   SECTION 5.8 — FETCH VOLUME HISTORY
    ============================================================ */
 async function startVolumeHistoryFetch() {
   const btn = document.getElementById('fetchVolumeHistBtn');
@@ -912,13 +782,13 @@ async function startVolumeHistoryFetch() {
 }
 
 /* ============================================================
-   SECTION 5.9 — FETCH ANGEL 3D (v4.8.6: fetches last 3 days OHLCV)
+   SECTION 5.9 — FETCH ANGEL 3D
    ============================================================ */
 async function startAngel3dFetch() {
   const btn = document.getElementById('fetchAngel3dBtn');
   if (!btn || ANGEL_3D_FETCHING) return;
 
-  const ok = confirm('📥 Fetch last 3 days OHLCV directly from Angel One?\n\nThis will take ~3 minutes. It will grab Friday, Sunday (Muhurat), and Monday data.\nContinue?');
+  const ok = confirm('📥 Fetch last 3 days OHLCV directly from Angel One?\n\nThis will take ~3 minutes. Continue?');
   if (!ok) return;
 
   ANGEL_3D_FETCHING = true;
@@ -999,7 +869,7 @@ async function loadLTP() {
       body: JSON.stringify({ tokens })
     });
     const d = await r.json();
-    if (d.breadth) TICKER_BREADTH = d.breadth;   // v5.43: Adv/Dec survives after market close
+    if (d.breadth) TICKER_BREADTH = d.breadth;  
     if (d.results) {
       for (const item of d.results) {
         if (item.ltp) SCREENER_LTP[item.token] = item.ltp;
@@ -1007,21 +877,18 @@ async function loadLTP() {
         if (item.pivot) SCREENER_PIVOT[item.token] = item.pivot;
         if (item.preopenPrice != null) SCREENER_PREOPEN[item.token] = { price: item.preopenPrice };
         if (item.dayOpen != null) SCREENER_DAY_OPEN[item.token] = item.dayOpen;
-        if (item.rsi != null) SCREENER_RSI[item.token] = item.rsi;
         if (item.serverTime) SCREENER_LASTUPD[item.token] = item.serverTime;
         if (item.vwap != null) SCREENER_VWAP[item.token] = item.vwap;
-        if (item.rsiFirst != null) SCREENER_RSI_FIRST[item.token] = item.rsiFirst;
         if (item.leverage != null) SCREENER_LEVERAGE[item.token] = item.leverage;
         if (item.marginPerShare != null) SCREENER_MARGIN_PS[item.token] = item.marginPerShare;
 
-        if (item.buyQty != null || item.sellQty != null || item.rank != null || item.rvol != null) {
+        if (item.buyQty != null || item.sellQty != null || item.rvol != null) {
           const existing = SCREENER_BS[item.token] || {};
           SCREENER_BS[item.token] = {
             buyQty: item.buyQty ?? existing.buyQty,
             sellQty: item.sellQty ?? existing.sellQty,
             volume: item.bsVolume ?? existing.volume,
-            rvol: item.rvol ?? existing.rvol,
-            rank: item.rank ?? existing.rank
+            rvol: item.rvol ?? existing.rvol
           };
         }
 
@@ -1071,8 +938,7 @@ function startSSE() {
         }
         
         renderTicker();
-        updateLTPCells(msg.ticks, msg.vwaps, msg.rsis);
-        scheduleOpenGainRerender();
+        updateLTPCells(msg.ticks, msg.vwaps);
       }
       else if (msg.type === 'bs' && msg.bs) {
         for (const [token, v] of Object.entries(msg.bs)) {
@@ -1080,27 +946,15 @@ function startSSE() {
             buyQty: v.buyQty, 
             sellQty: v.sellQty, 
             volume: v.volume, 
-            rvol: v.rvol, 
-            rank: v.rank 
+            rvol: v.rvol
           };
           if (v.preopenPrice != null) SCREENER_PREOPEN[token] = { price: v.preopenPrice };
           if (v.dayOpen != null) SCREENER_DAY_OPEN[token] = v.dayOpen;
-          if (v.rsi != null) SCREENER_RSI[token] = v.rsi;
           if (v.leverage != null) SCREENER_LEVERAGE[token] = v.leverage;
           if (v.marginPerShare != null) SCREENER_MARGIN_PS[token] = v.marginPerShare;
           if (v.vwap != null) SCREENER_VWAP[token] = v.vwap;
-          if (v.rsiFirst != null) SCREENER_RSI_FIRST[token] = v.rsiFirst;
           if (v.prevClose != null) SCREENER_PREV_CLOSE[token] = v.prevClose;
         }
-        renderScreenerTable();
-      }
-      else if (msg.type === 'chip' && msg.chips) {
-        SCREENER_CHIPS = msg.chips;
-        renderScreenerTable();
-      }
-      else if (msg.type === 'vc' && msg.vc) {
-        SCREENER_VC = { watch: msg.vc.watch || {}, state: msg.vc.state || {}, date: msg.vc.date || null, watchDate: msg.vc.watchDate || null };
-        renderChips();
         renderScreenerTable();
       }
     } catch {}
@@ -1128,48 +982,16 @@ function renderScreenerTable() {
   if (!head || !body) return;
 
   if (SCREENER_ACTIVE_STRATEGY === 'momentum') {
-    // v5.45: ORB-15 section — its own 4-column table
-    if (SCREENER_MOMENTUM_FILTER === 'orb15') {
-      head.innerHTML = `<tr>
-        <th>SYMBOL</th>
-        <th>LTP</th>
-        <th>9:15 CANDLE SIZE %</th>
-        <th>VOLUME (first 15-min)</th>
-      </tr>`;
-      if (!SCREENER_ORB.length) {
-        body.innerHTML = `<tr><td colspan="4" style="text-align:center;padding:60px;color:var(--text-muted)">
-          ${SCREENER_ORB_DONE ? 'No stocks with first 15-min candle ≤ 1.5% today.' : '🎯 ORB forms at 9:30 — list appears automatically.'}
-        </td></tr>`;
-      } else {
-        body.innerHTML = SCREENER_ORB.map(o => `
-          <tr data-token="${o.token}">
-            <td><span class="sym">${o.sym}</span><span class="tok">${o.token}</span></td>
-            <td style="white-space:nowrap"><span class="cell-primary ltp-cell">${o.ltp ? '₹' + (+o.ltp).toFixed(2) : '—'}</span></td>
-            <td style="font-weight:800;color:${o.size <= 1 ? 'var(--success)' : '#F5A623'}">${o.size.toFixed(2)}%</td>
-            <td style="font-family:ui-monospace,monospace;font-size:12px">${formatQty(o.volume)}</td>
-          </tr>`).join('');
-      }
-      if (count) count.textContent = `${SCREENER_ORB.length} ORB stocks (candle ≤ 1.5%)`;
-      renderChips();
-      return;
-    }
     const isOpenGainTab = SCREENER_MOMENTUM_FILTER === 'open_gain';
     const isSellTab = SCREENER_MOMENTUM_FILTER === 'sell_candidates';
-    const showRankCol = isOpenGainTab || isSellTab;
     
-    // ✅ UPDATED COLSPAN (Removed Pre-Open, 20 EMA, Action)
-    const COLSPAN = showRankCol ? 11 : 10;
+    const COLSPAN = 9;
 
-    // ✅ REMOVED: PRE-OPEN, 20 EMA, ACTION Headers
     head.innerHTML = `<tr>
-      ${showRankCol ? `<th class="th-sortable" style="width:46px" onclick="setSort('change')"
-          title="${isSellTab ? 'Short rank — Change % (Lowest first)' : 'Top Performing rank — Change % (Highest first)'}">#${sortIndicator('change')}</th>` : ''}
       <th>Stock / Company</th>
       <th class="th-sortable" onclick="setSort('ltp')">LTP ${sortIndicator('ltp')}<br>
           <span class="th-sub" onclick="event.stopPropagation();setSort('change')">Change % ${sortIndicator('change')}</span></th>
       <th>DAY OPEN</th>
-      <th class="th-sortable" onclick="setSort('rsi')">RSI ${sortIndicator('rsi')}</th>
-      <th>RSI 9:15 🔒</th>
       <th>B/S VOLUME</th>
       <th class="th-sortable" onclick="setSort('rvol')">VOLUME ${sortIndicator('rvol')}</th>
       <th>VWAP</th>
@@ -1183,40 +1005,13 @@ function renderScreenerTable() {
       filtered = filtered.filter(s => passesOpenGain(s.token));
     } else if (SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
       filtered = filtered.filter(s => passesSellCandidate(s.token));
-    } else if (SCREENER_MOMENTUM_FILTER === 'vc_candidates') {
-      filtered = filtered.filter(s => SCREENER_VC.watch[String(s.token)]);
-    } else if (SCREENER_MOMENTUM_FILTER === 'rsi_chips') {
-      const chipTokens = new Set(SCREENER_CHIPS.map(c => String(c.token)));
-      filtered = filtered.filter(s => chipTokens.has(String(s.token)));
-      const rankBy = {};
-      SCREENER_CHIPS.forEach(c => { rankBy[String(c.token)] = c.rank; });
-      filtered.sort((a, b) => (rankBy[String(a.token)] ?? 999) - (rankBy[String(b.token)] ?? 999));
-    }
-
-    OPEN_GAIN_RANK = {};
-    SELL_CANDIDATE_RANK = {};
-
-    if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
-      [...filtered]
-        .sort((a, b) => getSortValue(b, 'change') - getSortValue(a, 'change'))
-        .forEach((s, i) => { OPEN_GAIN_RANK[String(s.token)] = i + 1; });
-    } else if (SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
-      [...filtered]
-        .sort((a, b) => getSortValue(a, 'change') - getSortValue(b, 'change'))
-        .forEach((s, i) => { SELL_CANDIDATE_RANK[String(s.token)] = i + 1; });
     }
 
     const sorted = sortStocks(filtered);
 
     if (!sorted.length) {
       let emptyMsg;
-      if (SCREENER_MOMENTUM_FILTER === 'rsi_chips') {
-        emptyMsg = `🔒 No RSI chips locked today.<br>
-            <span style="font-size:11px">Chips lock at 9:15 (top-10 rank · gap ≤3% · RSI ≥70)</span>`;
-      } else if (SCREENER_MOMENTUM_FILTER === 'vc_candidates') {
-        emptyMsg = `🎯 No sideways candidates today.<br>
-            <span style="font-size:11px">Watchlist = yesterday's last-30 5-min closes within 1.5% range</span>`;
-      } else if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
+      if (SCREENER_MOMENTUM_FILTER === 'open_gain') {
         emptyMsg = `🏆 Abhi koi stock DAY OPEN se <b>+${OPEN_GAIN_MIN_PCT.toFixed(2)}%</b> (change% positive, gap-up < ${OPEN_GAIN_MAX_GAP_PCT}%) nahi hai.<br>
             <span style="font-size:11px">Live ticks pe har 2 second auto-refresh</span>`;
       } else if (SCREENER_MOMENTUM_FILTER === 'sell_candidates') {
@@ -1250,39 +1045,19 @@ function renderScreenerTable() {
         changeLine = `<span style="color:${color};font-weight:700">${isPos ? '+' : ''}${changePct.toFixed(2)}%</span>`;
       }
 
-      // ✅ REMOVED preopenCell logic
       const dayOpenCell = dayOpen
         ? `<span style="font-weight:700">₹${(+dayOpen).toFixed(2)}</span><span class="ogain-cell">${renderOpenGainSub(s.token)}</span>`
         : '<span style="color:var(--text-muted)">—</span><span class="ogain-cell"></span>';
 
       const lastUpdate = formatTimeIST(SCREENER_LASTUPD[s.token]);
-      const rowClass = '';
 
-      const rankNum = (isSellTab ? SELL_CANDIDATE_RANK : OPEN_GAIN_RANK)[String(s.token)];
-
-      // v5.43: VC badge — 🎯 candidate | ▲/▼ live setup | ✓ entered
-      const vcW = SCREENER_VC.watch[String(s.token)];
-      const vcS = SCREENER_VC.state[String(s.token)];
-      let vcBadge = '';
-      if (vcS && vcS.entered) {
-        vcBadge = '<span title="VC: entered today" style="color:var(--text-muted);font-size:10px;margin-left:4px">✓</span>';
-      } else if (vcS && vcS.side) {
-        vcBadge = `<span title="VC ${vcS.side} setup | trigger ${vcS.trigger} | SL ${vcS.sl}" style="color:${vcS.side === 'BUY' ? 'var(--success)' : 'var(--danger)'};font-size:10px;font-weight:800;margin-left:4px">${vcS.side === 'BUY' ? '▲' : '▼'}</span>`;
-      } else if (vcW) {
-        vcBadge = `<span title="VC sideways candidate | based on ${SCREENER_VC.watchDate || '-'} | range ${vcW.rangePct}% | PDC ${vcW.pdc}" style="color:#6C5CE7;font-size:10px;margin-left:4px">🎯</span>`;
-      }
-
-      // ✅ REMOVED PRE-OPEN, 20 EMA, ACTION <td> elements
-      return `<tr class="${rowClass}" data-token="${s.token}">
-        ${showRankCol ? `<td style="font-weight:800;color:${isSellTab ? 'var(--danger)' : '#6C5CE7'};font-size:12px;text-align:center">${rankNum ?? '—'}</td>` : ''}
-        <td><span class="sym">${s.sym}</span>${vcBadge}<span class="tok">${s.token}</span></td>
+      return `<tr data-token="${s.token}">
+        <td><span class="sym">${s.sym}</span><span class="tok">${s.token}</span></td>
         <td style="white-space:nowrap">
           <span class="cell-primary ltp-cell">${ltp ? '₹' + (+ltp).toFixed(2) : '—'}</span>
           <span class="cell-sub change-cell">${changeLine}</span>
         </td>
         <td style="white-space:nowrap">${dayOpenCell}</td>
-        <td class="rsi-cell" style="white-space:nowrap">${renderRSICell(s.token)}</td>
-        <td style="white-space:nowrap;font-weight:700;color:#F5A623">${SCREENER_RSI_FIRST[s.token] != null ? (+SCREENER_RSI_FIRST[s.token]).toFixed(1) : '—'}</td>
         <td style="white-space:nowrap">${renderBuySellCell(s.token)}</td>
         <td style="white-space:nowrap;font-family:ui-monospace,monospace;font-size:12px">
           ${bs?.volume ? formatQty(bs.volume) : '—'} 
@@ -1301,24 +1076,17 @@ function renderScreenerTable() {
 }
 
 /* ============================================================
-   SECTION 9 — ORDER PLACEHOLDER
-   ============================================================ */
-function placeOrder(sym) {
-  showToast('📝 Order', `Buy signal for ${sym} — order placement coming soon`);
-}
-
-/* ============================================================
-   SECTION 10.1 — SAFETY STUBS
+   SECTION 9 — SAFETY STUBS
    ============================================================ */
 function loadCachedData() { return Promise.resolve(); }
 function startFetch() { if (typeof showToast === 'function') showToast('⚠️ Removed', 'Advance ORB fetch hata diya gaya'); }
 function startQuoteFetch() { if (typeof showToast === 'function') showToast('⚠️ Removed', 'Advance ORB fetch hata diya gaya'); }
 function startDayHLCFetch() { if (typeof showToast === 'function') showToast('⚠️ Removed', 'Advance ORB fetch hata diya gaya'); }
-function startPreopenFetch() { } // ✅ Safety Stub
+function startPreopenFetch() { } 
 function onStrategyChange() { }
 function setStageFilter() { }
 function renderChipBar() { }
-function updateNiftyHeader() { } // Safety stub
+function updateNiftyHeader() { } 
 
 /* ============================================================
    SECTION 10 — HELPERS

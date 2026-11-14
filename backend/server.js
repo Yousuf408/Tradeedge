@@ -402,7 +402,7 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     minRvols.push(rvol);
 
     // Save the 1st minute RVOL to memory
-    if (prevKey === '09:16') {
+    if (prevKey === '09:15') {
       firstMinuteRvol.set(token, rvol);
     }
 

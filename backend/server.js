@@ -1,6 +1,6 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.52 (Ultra Clean)
-   Removed: VC, ORB, Rank, RSI. Focus: Bigplayer + Data.
+   server.js — TradeAlgo Pro backend  |  v5.53 (Ultra Clean)
+   Removed: VC, ORB, Rank, RSI, 1-Min Flush, REST Cache, Strategies
    ============================================================ */
 
 // === GLOBAL ERROR HANDLERS ===
@@ -24,9 +24,6 @@ import { dirname, join } from 'path';
 
 import {
   loginPlatform as loginREST,
-  getCandlesForTokens,
-  getCachedCandles,
-  setCachedCandle,
   setCachedLTP,
   getCachedLTP,
   getSessionStatus as getSessionStatusREST,
@@ -129,16 +126,6 @@ const INDEX_SYMS = {
   [INDIAVIX_TOKEN]: 'INDIA VIX'
 };
 
-const STRATEGIES = {
-  momentum: {
-    id: 'momentum',
-    name: 'Momentum',
-    filters: { maxRangePct: 1.5, minPrice: 150, maxPrice: 3500 }
-  },
-};
-
-const getStrategy = id => STRATEGIES[id] || STRATEGIES.momentum;
-
 /* ============================================================
    SECTION 3 — TIME / PHASES / HOLIDAYS
    ============================================================ */
@@ -188,11 +175,6 @@ function shouldStartWS() {
   const start = 9 * 3600 + 14 * 60 + 55;
   const end   = 15 * 3600 + 30 * 60;
   return secs >= start && secs < end;
-}
-
-function countFilled(date) {
-  const cached = getCachedCandles(STOCKS.map(s => s.token), date);
-  return cached.filter(c => c.candle && !c.candle.error && Array.isArray(c.candle)).length;
 }
 
 /* ============================================================
@@ -294,12 +276,9 @@ async function loadAvgVolumeFromDB() {
 }
 
 /* ============================================================
-   SECTION 4.4 — BUY/SELL CACHE + MINUTE SELF-COLLECT
+   SECTION 4.4 — BUY/SELL CACHE + WS SHADOW SAMPLER
    ============================================================ */
 const bsCache = new Map();
-const todayCloses = new Map();
-const minuteBuffer = new Map();
-
 const wsTodayCloses = new Map();
 const wsTodayVols = new Map();
 const wsTodayHighs = new Map();
@@ -308,90 +287,11 @@ const wsTodayLows = new Map();
 const currentMinHighs = new Map();
 const currentMinLows = new Map();
 
-const CHIP_TEST_MODE = String(process.env.CHIP_TEST_MODE || 'true') === 'true';
 const chipList = new Map();
 let chipDate = null;
 
 let latestBreadth = { adv: 0, dec: 0 };
-
 const firstMinuteRvol = new Map(); // For Bigplayer
-
-function updateMinuteBuffer(token, ltp) {
-  if (!Number.isFinite(ltp) || ltp <= 0) return null;
-  const ist = getIST();
-  const hh = String(ist.getUTCHours()).padStart(2, '0');
-  const mm = String(ist.getUTCMinutes()).padStart(2, '0');
-  const minuteKey = `${hh}:${mm}`;
-
-  ist.setUTCSeconds(0, 0);
-  const ts = ist.toISOString().replace('Z', '+05:30');
-
-  const key = String(token);
-  const existing = minuteBuffer.get(key);
-  if (!existing) {
-    minuteBuffer.set(key, { minuteKey, ts, close: ltp });
-    return null;
-  }
-  if (existing.minuteKey === minuteKey) {
-    existing.close = ltp;
-    return null;
-  }
-  const flushed = { ts: existing.ts, close: existing.close };
-  minuteBuffer.set(key, { minuteKey, ts, close: ltp });
-  return flushed;
-}
-
-async function bulkFlushMinuteChanges(changes, date) {
-  if (!changes.length) return;
-
-  const tokens1 = [], closes1 = [], tss1 = [];
-  const tokens5 = [], closes5 = [], tss5 = [];
-
-  for (const c of changes) {
-    const close = Number(c.close);
-    tokens1.push(String(c.token));
-    closes1.push(close);
-    tss1.push(c.ts);
-
-    const minute = new Date(c.ts).getUTCMinutes();
-    if (minute % 5 === 4) {
-      tokens5.push(String(c.token));
-      closes5.push(close);
-      tss5.push(c.ts);
-    }
-  }
-
-  try {
-    await db.query(
-      `UPDATE strategy_bs_snapshot AS s
-       SET min_1_close = COALESCE(s.min_1_close, ARRAY[]::numeric[]) || v.close_val,
-           min_1_ts    = COALESCE(s.min_1_ts,    ARRAY[]::timestamptz[]) || v.ts_val
-       FROM unnest($1::text[], $2::numeric[], $3::timestamptz[])
-         AS v(token, close_val, ts_val)
-       WHERE s.date = $4 AND s.token = v.token AND s.strategy_id = 'momentum'`,
-      [tokens1, closes1, tss1, date]
-    );
-
-    if (tokens5.length) {
-      await db.query(
-        `UPDATE strategy_bs_snapshot AS s
-         SET min_5_close = COALESCE(s.min_5_close, ARRAY[]::numeric[]) || v.close_val,
-             min_5_ts    = COALESCE(s.min_5_ts,    ARRAY[]::timestamptz[]) || v.ts_val
-         FROM unnest($1::text[], $2::numeric[], $3::timestamptz[])
-           AS v(token, close_val, ts_val)
-         WHERE s.date = $4 AND s.token = v.token AND s.strategy_id = 'momentum'`,
-        [tokens5, closes5, tss5, date]
-      );
-    }
-
-    for (const c of changes) {
-      const key = String(c.token);
-      const arr = todayCloses.get(key) || [];
-      arr.push(Number(c.close));
-      todayCloses.set(key, arr);
-    }
-  } catch (e) { console.error('Minute bulk flush failed:', e.message); }
-}
 
 async function loadBSCacheFromDB() {
   try {
@@ -416,26 +316,6 @@ async function loadBSCacheFromDB() {
     }
     console.log(`💹 Loaded buy/sell for ${rows.length} tokens`);
   } catch (e) { console.error('BS cache load failed:', e.message); }
-}
-
-async function loadTodayClosesFromDB() {
-  try {
-    const today = getIST().toISOString().split('T')[0];
-    const activeTokens = STOCKS.map(s => String(s.token));
-    const { rows } = await db.query(
-      `SELECT token, min_1_close FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL
-         AND token = ANY($2)`,
-      [today, activeTokens]
-    );
-    todayCloses.clear();
-    for (const r of rows) {
-      if (Array.isArray(r.min_1_close) && r.min_1_close.length > 0) {
-        todayCloses.set(String(r.token), r.min_1_close.map(c => +c));
-      }
-    }
-    console.log(`📊 Loaded today closes for ${todayCloses.size} tokens`);
-  } catch (e) { console.error('todayCloses load failed:', e.message); }
 }
 
 async function loadTodayWSClosesFromDB() {
@@ -477,10 +357,6 @@ function computeVWAP(token) {
   }
   return vv > 0 ? +(pv / vv).toFixed(2) : null;
 }
-
-/* ============================================================
-   TRADINGVIEW EXACT RSI VIA PYTHON (MICROSERVICE) - REMOVED
-   ============================================================ */
 
 /* ============================================================
    SECTION 4.6 — WS MINUTE-CLOSE SHADOW SAMPLER
@@ -1001,38 +877,12 @@ app.get('/api/broker/status', auth, (req, res) => {
 
 app.get('/api/ws/status', auth, (req, res) => res.json(getWSStatus()));
 
-app.get('/api/strategies', auth, (req, res) => {
-  res.json(Object.values(STRATEGIES).map(s => ({ id: s.id, name: s.name, filters: s.filters })));
-});
-
 app.get('/api/screener/status', auth, (req, res) => {
   const p = getScreenerPhase();
   res.json({
     phase: p.phase, date: p.date || null,
-    filled: p.date ? countFilled(p.date) : 0, total: STOCKS.length,
-    ws: getWSStatus()
-  });
-});
-
-app.get('/api/screener/data', auth, (req, res) => {
-  const strategy = getStrategy(req.query.strategy || 'momentum');
-  const p = getScreenerPhase();
-  if (p.phase === 'closed' && !p.date)  return res.json({ ok: false, phase: 'closed' });
-  if (!p.date) return res.json({ ok: false, phase: p.phase });
-
-  const allCandles = getCachedCandles(STOCKS.map(s => s.token), p.date);
-  const cachedTokens = allCandles
-    .filter(c => Array.isArray(c.candle) && c.candle.length >= 5)
-    .map(c => String(c.token));
-
-  const allCached = allCandles.filter(c => Array.isArray(c.candle) && c.candle.length >= 5);
-
-  res.json({
-    ok: true, phase: p.phase, date: p.date,
-    strategy: strategy.id, strategyName: strategy.name, filters: strategy.filters,
     total: STOCKS.length,
-    cachedTokens,
-    results: allCached, stocks: []
+    ws: getWSStatus()
   });
 });
 
@@ -1971,7 +1821,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
     }
 
     const dbErrors = [];
-    const minuteChanges = [];
 
     const bTokens = [], bSyms = [], bBuy = [], bSell = [], bLtp = [], bVol = [], bOpen = [];
     const bHigh = [], bLow = [], bClose = [], bPivot = [], bPrevClose = [];
@@ -2004,9 +1853,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
         if (r.prevClose && r.prevClose > 0) {
           prevCloseCache.set(String(r.token), +r.prevClose);
         }
-
-        const flushed = updateMinuteBuffer(r.token, r.ltp);
-        if (flushed) minuteChanges.push({ token: String(r.token), ts: flushed.ts, close: flushed.close });
 
         const pivot = (r.dayHigh && r.dayLow && r.ltp)
           ? +(((r.dayHigh + r.dayLow + r.ltp) / 3).toFixed(4))
@@ -2080,11 +1926,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
       prevSyncDate = p.date;
     }
 
-    if (minuteChanges.length) {
-      await bulkFlushMinuteChanges(minuteChanges, p.date);
-      if (!silent) console.log(`💾 Minute flush: ${minuteChanges.length} tokens`);
-    }
-
     if (dbErrors.length) console.log(`❌ [BS] DB errors (first 5):`, dbErrors.slice(0, 5));
 
     broadcastBS(fetchedAt);
@@ -2105,20 +1946,6 @@ async function buildAutoUsers() {
   });
   if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000), sideMode: 'MIX' });
   return users;
-}
-
-async function flushFinalMinuteBuffer() {
-  const p = getScreenerPhase();
-  if (!p.date) return;
-  const changes = [];
-  for (const [token, buf] of minuteBuffer.entries()) {
-    if (buf && Number.isFinite(buf.close)) changes.push({ token, ts: buf.ts, close: buf.close });
-  }
-  minuteBuffer.clear();
-  if (changes.length) {
-    await bulkFlushMinuteChanges(changes, p.date);
-    console.log(`💾 Final minute flush: ${changes.length} tokens`);
-  }
 }
 
 function msUntil(targetHour, targetMin, dayOffsetIfPassed = 1) {
@@ -2280,15 +2107,6 @@ function scheduleBSAutoFetch() {
   }, ms);
 }
 
-function scheduleFinalFlush() {
-  const ms = msUntil(15, 31);
-  console.log(`⏰ Next final minute flush in ${Math.round(ms / 60000)} min`);
-  setTimeout(async () => {
-    await flushFinalMinuteBuffer();
-    scheduleFinalFlush();
-  }, ms);
-}
-
 // ============================================================
 // AI POST-MARKET ANALYSIS (4:30 PM)
 // ============================================================
@@ -2384,9 +2202,7 @@ function scheduleMorningPreload() {
     console.log('🧹 Morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
-    await loadTodayClosesFromDB();
     await loadTodayWSClosesFromDB();
-    const today = getIST().toISOString().split('T')[0];
     scheduleMorningPreload();
   }, ms);
 }
@@ -2416,7 +2232,7 @@ registerFifteenRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.52 (Ultra Clean)`);
+  console.log(`✅ Server on port ${PORT} — v5.53 (Ultra Clean)`);
   initMarginService(db, getBrokerSession);
 
   try { 
@@ -2431,7 +2247,6 @@ app.listen(PORT, async () => {
   await loadAvgVolumeFromDB(); 
   await loadLastEodVolumeFromDB();
   await loadBSCacheFromDB();
-  await loadTodayClosesFromDB();
   await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
 
   computeBuyersGroups();
@@ -2519,7 +2334,6 @@ app.listen(PORT, async () => {
 
   scheduleDailyHLC();
   scheduleBSAutoFetch();
-  scheduleFinalFlush();
   scheduleMorningPreload();
   scheduleAIPostMarket();
   scheduleAIPreMarketCheck();
@@ -2529,6 +2343,6 @@ app.listen(PORT, async () => {
 
   setInterval(updateMarketBreadth, 5000);
 
-  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15 (every min) | HLC@15:31 | FinalFlush@15:31 | AI@16:30 | Preload@9:00 | Margins@5min');
+  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15 (every min) | HLC@15:31 | AI@16:30 | Preload@9:00 | Margins@5min');
   console.log('⚠️  MANUAL-ONLY (button driven): 📥 Fetch Historical (5-min) | 📈 Fetch Volume History (ONE_DAY)');
 });

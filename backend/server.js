@@ -1,5 +1,6 @@
 /* ============================================================
-   server.js — TradeAlgo Pro backend  |  v5.50 (Clean Fix)
+   server.js — TradeAlgo Pro backend  |  v5.52 (Ultra Clean)
+   Removed: VC, ORB, Rank, RSI. Focus: Bigplayer + Data.
    ============================================================ */
 
 // === GLOBAL ERROR HANDLERS ===
@@ -54,8 +55,7 @@ import { startDepthWS, resubscribeDepth, getDepthStatus } from './brokers/angelo
 import * as AngelDepth from './brokers/angelone/Angel_Depth.js';
 
 import {
-  initAutoTrader, onTickPos, loadOpenPositions, getPositions, getPositionDate,
-  loadVCWatchlist, rebuildVCState, vcOnMinuteCandle, getVCStatus
+  initAutoTrader, onTickPos, loadOpenPositions, getPositions, getPositionDate
 } from './autoTrader.js';
 
 import { registerAdminRoutes } from './admin.js';
@@ -294,15 +294,12 @@ async function loadAvgVolumeFromDB() {
 }
 
 /* ============================================================
-   SECTION 4.4 — BUY/SELL CACHE + RSI + MINUTE SELF-COLLECT
+   SECTION 4.4 — BUY/SELL CACHE + MINUTE SELF-COLLECT
    ============================================================ */
 const bsCache = new Map();
-const prevClosesCache = new Map();
 const todayCloses = new Map();
 const minuteBuffer = new Map();
 
-const RSI_SOURCE = process.env.RSI_SOURCE || 'ws';
-const wsPrevCloses = new Map();
 const wsTodayCloses = new Map();
 const wsTodayVols = new Map();
 const wsTodayHighs = new Map();
@@ -312,75 +309,12 @@ const currentMinHighs = new Map();
 const currentMinLows = new Map();
 
 const CHIP_TEST_MODE = String(process.env.CHIP_TEST_MODE || 'true') === 'true';
-const rsiState = new Map();
-
 const chipList = new Map();
 let chipDate = null;
 
-const orbCache = new Map();
-let orbDoneDate = null;
-const orbForming = new Map();
-
 let latestBreadth = { adv: 0, dec: 0 };
 
-function computeRSI(prevCloses, currentClose) {
-  if (!Array.isArray(prevCloses) || prevCloses.length < 13) return null;
-  if (!Number.isFinite(currentClose) || currentClose <= 0) return null;
-
-  const closes = [...prevCloses, currentClose];
-  let gains = 0, losses = 0;
-  for (let i = 1; i < closes.length; i++) {
-    const d = closes[i] - closes[i - 1];
-    if (d > 0) gains += d; else losses -= d;
-  }
-  const n = closes.length - 1;
-  const avgGain = gains / n;
-  const avgLoss = losses / n;
-  if (avgLoss === 0) return 100;
-  return 100 - (100 / (1 + avgGain / avgLoss));
-}
-
-function computeRSIFromArray(closes14) {
-  if (!Array.isArray(closes14) || closes14.length !== 14) return null;
-  return computeRSI(closes14.slice(0, 13), closes14[13]);
-}
-
-function computeRSIWilderState(closes) {
-  if (!Array.isArray(closes) || closes.length < 15) return null;
-  let avgGain = 0, avgLoss = 0;
-  for (let i = 1; i <= 14; i++) {
-    const d = closes[i] - closes[i - 1];
-    if (d > 0) avgGain += d; else avgLoss -= d;
-  }
-  avgGain /= 14;
-  avgLoss /= 14;
-  for (let i = 15; i < closes.length; i++) {
-    const d = closes[i] - closes[i - 1];
-    const gain = d > 0 ? d : 0;
-    const loss = d < 0 ? -d : 0;
-    avgGain = (avgGain * 13 + gain) / 14;
-    avgLoss = (avgLoss * 13 + loss) / 14;
-  }
-  const rsi = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
-  return { rsi, avgGain, avgLoss, prevClose: closes[closes.length - 1] };
-}
-
-function computeRSIWilder(closes) {
-  const st = computeRSIWilderState(closes);
-  return st ? st.rsi : null;
-}
-
-function buildCloses14(token) {
-  const todayArr = todayCloses.get(String(token)) || [];
-  if (todayArr.length >= 14) return todayArr.slice(-14);
-
-  const prevArr = prevClosesCache.get(String(token)) || [];
-  const needed = 14 - todayArr.length;
-  if (prevArr.length < needed) return null;
-
-  const prevSlice = prevArr.slice(-needed).map(x => x.close);
-  return [...prevSlice, ...todayArr];
-}
+const firstMinuteRvol = new Map(); // For Bigplayer
 
 function updateMinuteBuffer(token, ltp) {
   if (!Number.isFinite(ltp) || ltp <= 0) return null;
@@ -466,7 +400,7 @@ async function loadBSCacheFromDB() {
     
     const activeTokens = [...STOCKS.map(s => String(s.token)), ...INDEX_TOKENS];
     const { rows } = await db.query(
-      `SELECT token, buy_qty, sell_qty, ltp, volume, rank_no, day_open, rsi, rsi_first
+      `SELECT token, buy_qty, sell_qty, ltp, volume, day_open
        FROM strategy_bs_snapshot
        WHERE date=$1 AND strategy_id=$2 AND token = ANY($3)`,
       [p.date, 'momentum', activeTokens]
@@ -477,36 +411,11 @@ async function loadBSCacheFromDB() {
         sellQty: r.sell_qty != null ? +r.sell_qty : null,
         ltp: r.ltp != null ? +r.ltp : null,
         volume: r.volume != null ? +r.volume : null,
-        rank: r.rank_no != null ? +r.rank_no : null,
-        dayOpen: r.day_open != null ? +r.day_open : null,
-        rsi: r.rsi != null ? +r.rsi : null,
-        rsiFirst: r.rsi_first != null ? +r.rsi_first : null
+        dayOpen: r.day_open != null ? +r.day_open : null
       });
     }
     console.log(`💹 Loaded buy/sell for ${rows.length} tokens`);
   } catch (e) { console.error('BS cache load failed:', e.message); }
-}
-
-async function loadPrevClosesFromDB() {
-  try {
-    const prevDate = getPreviousTradingDay(getIST());
-    const activeTokens = STOCKS.map(s => String(s.token));
-    const { rows } = await db.query(
-      `SELECT token, min_1_close, min_1_ts FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL
-         AND token = ANY($2)`,
-      [prevDate, activeTokens]
-    );
-    prevClosesCache.clear();
-    for (const r of rows) {
-      if (Array.isArray(r.min_1_close) && r.min_1_close.length >= 13) {
-        const closes = r.min_1_close.map(c => +c);
-        const ts = Array.isArray(r.min_1_ts) ? r.min_1_ts : [];
-        prevClosesCache.set(String(r.token), closes.map((c, i) => ({ ts: ts[i] || null, close: c })));
-      }
-    }
-    console.log(`📈 Loaded prev closes for ${prevClosesCache.size} tokens (from ${prevDate})`);
-  } catch (e) { console.error('prevCloses load failed:', e.message); }
 }
 
 async function loadTodayClosesFromDB() {
@@ -529,64 +438,6 @@ async function loadTodayClosesFromDB() {
   } catch (e) { console.error('todayCloses load failed:', e.message); }
 }
 
-async function recomputeAllRSI(date) {
-  if (RSI_SOURCE === 'ws') return recomputeRSIFromWS(date);
-  try {
-    const { rows } = await db.query(
-      `SELECT token, min_1_close FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id='momentum' AND min_1_close IS NOT NULL
-         AND array_length(min_1_close, 1) >= 14`,
-      [date]
-    );
-    let count = 0;
-    for (const r of rows) {
-      const closes = r.min_1_close.map(Number);
-      const last14 = closes.slice(-14);
-      const rsi = computeRSIFromArray(last14);
-      if (rsi == null) continue;
-      const v = +rsi.toFixed(2);
-      try {
-        await db.query(
-          `UPDATE strategy_bs_snapshot SET rsi=$1 WHERE date=$2 AND token=$3 AND strategy_id='momentum'`,
-          [v, date, r.token]
-        );
-        const existing = bsCache.get(String(r.token)) || {};
-        existing.rsi = v;
-        bsCache.set(String(r.token), existing);
-        count++;
-      } catch {}
-    }
-    console.log(`🧪 recomputeAllRSI: ${count} stocks updated for ${date}`);
-  } catch (e) { console.error('recomputeAllRSI failed:', e.message); }
-}
-
-async function loadPrevWSClosesFromDB() {
-  try {
-    const activeTokens = STOCKS.map(s => String(s.token));
-    const today = getIST().toISOString().split('T')[0];
-    const { rows } = await db.query(
-      `SELECT token, ws_1min_close
-       FROM strategy_bs_snapshot
-       WHERE strategy_id='momentum' AND ws_1min_close IS NOT NULL
-         AND array_length(ws_1min_close, 1) > 0
-         AND token = ANY($1) AND date < $2
-         AND date >= CURRENT_DATE - 2
-       ORDER BY date ASC`,
-      [activeTokens, today]
-    );
-    wsPrevCloses.clear();
-    for (const r of rows) {
-      const arr = wsPrevCloses.get(String(r.token)) || [];
-      for (const c of r.ws_1min_close) arr.push(+c);
-      wsPrevCloses.set(String(r.token), arr);
-    }
-    for (const [t, arr] of wsPrevCloses) {
-      if (arr.length > 1000) wsPrevCloses.set(t, arr.slice(-1000));
-    }
-    console.log(`📈 WS prev closes: ${wsPrevCloses.size} tokens (multi-day seed)`);
-  } catch (e) { console.error('WS prev closes load failed:', e.message); }
-}
-
 async function loadTodayWSClosesFromDB() {
   try {
     const today = getIST().toISOString().split('T')[0];
@@ -603,7 +454,6 @@ async function loadTodayWSClosesFromDB() {
     wsTodayLows.clear();
     prevCumVol.clear(); 
 
-    
     for (const r of rows) {
       if (Array.isArray(r.ws_1min_close) && r.ws_1min_close.length > 0) {
         wsTodayCloses.set(String(r.token), r.ws_1min_close.map(c => +c));
@@ -613,20 +463,6 @@ async function loadTodayWSClosesFromDB() {
     }
     console.log(`📊 WS today closes: ${wsTodayCloses.size} tokens`);
   } catch (e) { console.error('WS today closes load failed:', e.message); }
-}
-
-function seedRSIStateFromMemory() {
-  let n = 0;
-  for (const s of STOCKS) {
-    const token = String(s.token);
-    const todayArr = wsTodayCloses.get(token) || [];
-    const prevArr = wsPrevCloses.get(token) || [];
-    const series = todayArr.length ? prevArr.concat(todayArr) : prevArr;
-    const st = computeRSIWilderState(series);
-    if (st) { rsiState.set(token, st); n++; }
-    else rsiState.delete(token);
-  }
-  console.log(`🧮 RSI live state seeded: ${n} tokens`);
 }
 
 function computeVWAP(token) {
@@ -642,151 +478,9 @@ function computeVWAP(token) {
   return vv > 0 ? +(pv / vv).toFixed(2) : null;
 }
 
-async function backfillRsiFirst(date) {
-  try {
-    const activeTokens = STOCKS.map(s => String(s.token));
-    const { rows } = await db.query(
-      `SELECT token, ws_1min_close FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id='momentum' AND rsi_first IS NULL
-         AND ws_1min_close IS NOT NULL AND array_length(ws_1min_close,1) > 0
-         AND token = ANY($2)`,
-      [date, activeTokens]
-    );
-    const toks = [], rsis = [];
-    for (const r of rows) {
-      const series = (wsPrevCloses.get(String(r.token)) || []).concat([+r.ws_1min_close[0]]);
-      const rsi = computeRSIWilder(series);
-      if (rsi == null) continue;
-      toks.push(String(r.token)); rsis.push(+rsi.toFixed(2));
-    }
-    if (toks.length) {
-      await db.query(
-        `UPDATE strategy_bs_snapshot AS s SET rsi_first=v.rsi
-         FROM unnest($1::text[], $2::numeric[]) AS v(token, rsi)
-         WHERE s.date=$3 AND s.token=v.token AND s.strategy_id='momentum' AND s.rsi_first IS NULL`,
-        [toks, rsis, date]
-      );
-      console.log(`🥇 rsi_first backfill: ${toks.length} tokens for ${date}`);
-    }
-  } catch (e) { console.error('rsi_first backfill failed:', e.message); }
-}
-
-async function updateRSIFromWS(date, prevKey) {
-  const toks = [], rsis = [];
-  for (const s of STOCKS) {
-    const token = String(s.token);
-    const todayArr = wsTodayCloses.get(token) || [];
-    const prevArr = wsPrevCloses.get(token) || [];
-    const series = todayArr.length ? prevArr.concat(todayArr) : prevArr;
-    const st = computeRSIWilderState(series);
-    if (!st) continue;
-    rsiState.set(token, st);
-    const v = +st.rsi.toFixed(2);
-    toks.push(token); rsis.push(v);
-    const cached = bsCache.get(token) || {};
-    cached.rsi = v;
-    bsCache.set(token, cached);
-  }
-  if (!toks.length) return;
-  try {
-    await db.query(
-      `UPDATE strategy_bs_snapshot AS s SET rsi=v.rsi
-       FROM unnest($1::text[], $2::numeric[]) AS v(token, rsi)
-       WHERE s.date=$3 AND s.token=v.token AND s.strategy_id='momentum'`,
-      [toks, rsis, date]
-    );
-    if (prevKey === '09:15' && toks.length) {
-      try {
-        await db.query(
-          `UPDATE strategy_bs_snapshot AS s SET rsi_first = v.rsi
-           FROM unnest($1::text[], $2::numeric[]) AS v(token, rsi)
-           WHERE s.date=$3 AND s.token=v.token AND s.strategy_id='momentum' AND s.rsi_first IS NULL`,
-          [toks, rsis, date]
-        );
-        for (let i = 0; i < toks.length; i++) {
-          const c = bsCache.get(toks[i]) || {};
-          c.rsiFirst = rsis[i];
-          bsCache.set(toks[i], c);
-        }
-        console.log(`🥇 RSI-first (9:15 candle) locked: ${toks.length} tokens`);
-        broadcastBS(new Date());
-      } catch (e) { console.error('rsi_first write failed:', e.message); }
-    }
-  } catch (e) { console.error('WS RSI update failed:', e.message); }
-}
-
-async function recomputeRSIFromWS(date) {
-  try {
-    const activeTokens = STOCKS.map(s => String(s.token));
-    const { rows: prevRows } = await db.query(
-      `SELECT token, ws_1min_close
-       FROM strategy_bs_snapshot
-       WHERE strategy_id='momentum' AND ws_1min_close IS NOT NULL
-         AND array_length(ws_1min_close, 1) > 0
-         AND token = ANY($1) AND date < $2
-         AND date >= CURRENT_DATE - 2
-       ORDER BY date ASC`,
-      [activeTokens, date]
-    );
-    const prevMap = new Map();
-    for (const r of prevRows) {
-      const arr = prevMap.get(String(r.token)) || [];
-      for (const c of r.ws_1min_close) arr.push(+c);
-      prevMap.set(String(r.token), arr);
-    }
-    const { rows } = await db.query(
-      `SELECT token, ws_1min_close FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id='momentum' AND ws_1min_close IS NOT NULL
-         AND token = ANY($2)`,
-      [date, activeTokens]
-    );
-    const toks = [], rsis = [];
-    for (const r of rows) {
-      const dayArr = r.ws_1min_close.map(Number);
-      const series = (prevMap.get(String(r.token)) || []).concat(dayArr);
-      const rsi = computeRSIWilder(series);
-      if (rsi == null) continue;
-      toks.push(String(r.token)); rsis.push(+rsi.toFixed(2));
-    }
-    if (toks.length) {
-      await db.query(
-        `UPDATE strategy_bs_snapshot AS s SET rsi=v.rsi
-         FROM unnest($1::text[], $2::numeric[]) AS v(token, rsi)
-         WHERE s.date=$3 AND s.token=v.token AND s.strategy_id='momentum'`,
-        [toks, rsis, date]
-      );
-      if (date === getIST().toISOString().split('T')[0]) {
-        for (let i = 0; i < toks.length; i++) {
-          const cached = bsCache.get(toks[i]) || {};
-          cached.rsi = rsis[i];
-          bsCache.set(toks[i], cached);
-        }
-      }
-    }
-    console.log(`🧪 recomputeRSIFromWS: ${toks.length} stocks updated for ${date}`);
-  } catch (e) { console.error('recomputeRSIFromWS failed:', e.message); }
-}
-
 /* ============================================================
-   TRADINGVIEW EXACT RSI VIA PYTHON (MICROSERVICE)
+   TRADINGVIEW EXACT RSI VIA PYTHON (MICROSERVICE) - REMOVED
    ============================================================ */
-async function fetchTvRsiFromPython(symbols) {
-  const baseUrl = process.env.PYTHON_RSI_URL;
-  if (!baseUrl) {
-    console.error('❌ PYTHON_RSI_URL missing in .env');
-    return null;
-  }
-
-  try {
-    const query = Array.isArray(symbols) ? `symbols=${symbols.join(',')}` : `symbol=${symbols}`;
-    const res = await fetch(`${baseUrl}/rsi?${query}`);
-    const data = await res.json();
-    return data;
-  } catch (err) {
-    console.error('❌ Python RSI fetch failed:', err.message);
-    return null;
-  }
-}
 
 /* ============================================================
    SECTION 4.6 — WS MINUTE-CLOSE SHADOW SAMPLER
@@ -830,6 +524,11 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     closes.push(close);
     minVols.push(mv);
     minRvols.push(rvol);
+
+    // Save the 1st minute RVOL to memory
+    if (prevKey === '09:16') {
+      firstMinuteRvol.set(token, rvol);
+    }
 
     const ring = minVolRing.get(token) || [];
     ring.push(mv);
@@ -880,19 +579,8 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
       const arrH = wsTodayHighs.get(tk) || []; arrH.push(h); wsTodayHighs.set(tk, arrH);
       const arrL = wsTodayLows.get(tk) || []; arrL.push(l); wsTodayLows.set(tk, arrL);
       
-      const cOpen = i > 0 ? closes[i - 1] : (bsCache.get(tk)?.dayOpen ?? closes[i]);
-      vcOnMinuteCandle(tk, { high: h, low: l, close: closes[i], open: cOpen, minuteKey: prevKey });
-
       currentMinHighs.delete(tk);
       currentMinLows.delete(tk);
-    }
-    if (RSI_SOURCE === 'ws') await updateRSIFromWS(date, prevKey);
-
-    if (prevKey === '09:29' && orbQuoteDoneDate !== date && orbHistDoneDate !== date) {
-      setTimeout(() => {
-        if (orbQuoteDoneDate !== date && orbHistDoneDate !== date && !orbOfficialRunning)
-          computeOrbCandles(date).catch(e => console.error('🎯 ORB WS fallback failed:', e.message));
-      }, 70000);
     }
 
     console.log(`🕐 WS minute-close: ${tokens.length} tokens @ ${prevKey}${isFive ? ' (5m)' : ''}`);
@@ -1018,7 +706,6 @@ function sseSend(payload) {
 }
 
 const ssePendingVwap = new Map();
-const ssePendingRsi = new Map();
 const ssePendingPrevClose = new Map();
 
 function updateMarketBreadth() {
@@ -1040,8 +727,6 @@ function broadcastLTP(token, ltp) {
   ssePending.set(String(token), ltp);
   const vw = lastWsAvg.get(String(token));
   if (vw != null) ssePendingVwap.set(String(token), vw);
-  const rs = bsCache.get(String(token))?.rsi;
-  if (rs != null) ssePendingRsi.set(String(token), rs);
   
   const pc = prevCloseCache.get(String(token));
   if (pc != null) ssePendingPrevClose.set(String(token), pc);
@@ -1054,13 +739,11 @@ function broadcastLTP(token, ltp) {
       type: 'ltp',
       ticks: Object.fromEntries(ssePending),
       vwaps: Object.fromEntries(ssePendingVwap),
-      rsis: Object.fromEntries(ssePendingRsi),
       prevCloses: Object.fromEntries(ssePendingPrevClose),
       breadth: latestBreadth
     })}\n\n`;
     ssePending.clear();
     ssePendingVwap.clear();
-    ssePendingRsi.clear();
     ssePendingPrevClose.clear();
     sseSend(payload);
   }, 50);
@@ -1078,13 +761,10 @@ function broadcastBS(fetchedAt) {
       return [t, {
         buyQty: v.buyQty, sellQty: v.sellQty, ltp: v.ltp,
         volume: volV,
-        rvol: volV && avgVolume5D.get(t) ? +(volV / avgVolume5D.get(t)).toFixed(1) : (v.rvol ?? null),
-        rank: v.rank,
+        rvol: volV && avgVolume5D.get(t) ? +(volV / avgVolume5D.get(t)).toFixed(1) : null,
         dayOpen: v.dayOpen ?? null,
-        rsi: v.rsi ?? null,
         leverage: lev ?? null,
         marginPerShare: lev && v.ltp ? +(v.ltp / lev).toFixed(4) : null,
-        rsiFirst: v.rsiFirst ?? null,
         prevClose: prevCloseCache.get(t) ?? null
       }];
     }))
@@ -1096,25 +776,12 @@ function broadcastChip() {
   sseSend(`data: ${JSON.stringify({ type: 'chip', chips: [...chipList.values()] })}\n\n`);
 }
 
-function broadcastVC() {
-  if (!sseClients.size) return;
-  sseSend(`data: ${JSON.stringify({ type: 'vc', vc: getVCStatus() })}\n\n`);
-}
-
 function handleTick(token, ltp, tickMs, extra) {
   if (!Number.isFinite(ltp) || ltp < 1 || ltp > 1000000) return;
   
   const tk = String(token);
   if (!currentMinHighs.has(tk) || ltp > currentMinHighs.get(tk)) currentMinHighs.set(tk, ltp);
   if (!currentMinLows.has(tk) || ltp < currentMinLows.get(tk)) currentMinLows.set(tk, ltp);
-
-  const minsNow = getIST().getUTCHours() * 60 + getIST().getUTCMinutes();
-  if (minsNow >= 555 && minsNow <= 569 && ltp > 0) {
-    const f = orbForming.get(tk) || { h: ltp, l: ltp };
-    if (ltp > f.h) f.h = ltp;
-    if (ltp < f.l) f.l = ltp;
-    orbForming.set(tk, f);
-  }
 
   if (extra && Number.isFinite(extra.volume) && extra.volume > 0) {
     const today = getIST().toISOString().split('T')[0];
@@ -1140,21 +807,6 @@ function handleTick(token, ltp, tickMs, extra) {
   broadcastLTP(token, ltp);
   lastLtpAt.set(String(token), Date.now());
   onTickPos(token, ltp);
-
-  if (RSI_SOURCE === 'ws') {
-    const st = rsiState.get(String(token));
-    if (st && st.prevClose > 0) {
-      const d = ltp - st.prevClose;
-      const gain = d > 0 ? d : 0;
-      const loss = d < 0 ? -d : 0;
-      const lg = (st.avgGain * 13 + gain) / 14;
-      const ll = (st.avgLoss * 13 + loss) / 14;
-      const live = ll === 0 ? 100 : 100 - (100 / (1 + lg / ll));
-      const cached = bsCache.get(String(token)) || {};
-      cached.rsi = +live.toFixed(2);
-      bsCache.set(String(token), cached);
-    }
-  }
 }
 
 function startWebSocketForReadyPhase() {
@@ -1384,34 +1036,6 @@ app.get('/api/screener/data', auth, (req, res) => {
   });
 });
 
-app.get('/api/screener/vc', auth, (req, res) => {
-  res.json({ ok: true, ...getVCStatus() });
-});
-
-app.get('/api/screener/orb', auth, (req, res) => {
-  const list = [];
-  for (const [t, o] of orbCache) {
-    if (o.size <= 1.5) {
-      list.push({
-        token: t,
-        sym: SYM_BY_TOKEN[t] || '?',
-        ltp: getCachedLTP(t) ?? bsCache.get(t)?.ltp ?? null,
-        size: o.size, volume: o.volume, high: o.high, low: o.low
-      });
-    }
-  }
-  list.sort((a, b) => a.size - b.size);
-  res.json({ ok: true, done: orbDoneDate != null, count: list.length, list });
-});
-
-function orbSizeFor(t) {
-  const done = orbCache.get(t);
-  if (done) return done.size;
-  const f = orbForming.get(t);
-  if (f && f.l > 0) return +(((f.h - f.l) / f.l) * 100).toFixed(2);
-  return null;
-}
-
 app.get('/api/sectors', auth, (req, res) => {
   const by = {};
   for (const s of STOCKS) {
@@ -1421,10 +1045,9 @@ app.get('/api/sectors', auth, (req, res) => {
     const open = bsCache.get(t)?.dayOpen ?? null;
     const pc = prevCloseCache.get(t) || null;
     const e = by[sec] || (by[sec] = { sector: sec, up: 0, down: 0, flat: 0, noData: 0, sumOpen: 0, nOpen: 0, sumPrev: 0, nPrev: 0, stocks: [] });
-    const orbSize = orbSizeFor(t);
     if (!ltp || ltp <= 0) {
       e.noData++;
-      e.stocks.push({ sym: s.sym, token: t, ltp: null, open, prev: pc, openPct: null, prevPct: null, orbSize });
+      e.stocks.push({ sym: s.sym, token: t, ltp: null, open, prev: pc, openPct: null, prevPct: null });
       continue;
     }
     let openPct = null, prevPct = null;
@@ -1444,14 +1067,13 @@ app.get('/api/sectors', auth, (req, res) => {
       e.nPrev++;
     }
 
-    // NEW: Fetch Volume & RVOL for Sector tab
     const bs = bsCache.get(t) || null;
     const wsVol = (wsTodayVols.get(t) || []).reduce((a, b) => a + (+b || 0), 0);
     const eodVol = lastEodVolume.get(t) > 0 ? lastEodVolume.get(t) : null;
     const vol = (bs?.volume > 0 ? +bs.volume : (wsVol > 0 ? wsVol : eodVol));
-    const rvol = vol && avgVolume5D.get(t) ? +(vol / avgVolume5D.get(t)).toFixed(1) : (bs?.rvol ?? null);
+    const rvol = vol && avgVolume5D.get(t) ? +(vol / avgVolume5D.get(t)).toFixed(1) : null;
 
-    e.stocks.push({ sym: s.sym, token: t, ltp, open, prev: pc, openPct, prevPct, orbSize, volume: vol, rvol });
+    e.stocks.push({ sym: s.sym, token: t, ltp, open, prev: pc, openPct, prevPct, volume: vol, rvol });
   }
   const sectors = Object.values(by).map(e => ({
     ...e,
@@ -1468,8 +1090,6 @@ app.get('/api/screener/chips', auth, (req, res) => {
     sym: c.sym,
     rank: c.rank,
     gapPct: c.gapPct,
-    rsiAtLock: c.rsiAtLock,
-    rsiLive: bsCache.get(c.token)?.rsi ?? null,
     ltp: getCachedLTP(c.token) ?? null
   }));
   res.json({ ok: true, date: chipDate, locked: chipDate != null, chips });
@@ -1479,15 +1099,6 @@ app.get('/api/ai-plans', auth, async (req, res) => {
     const { rows } = await db.query(`SELECT * FROM ai_trade_plans WHERE date = CURRENT_DATE ORDER BY sym`);
     res.json({ ok: true, plans: rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/api/tv-rsi/:sym', auth, async (req, res) => {
-  const symbol = req.params.sym;
-  const rsiData = await fetchTvRsiFromPython(symbol);
-  if (!rsiData || !rsiData.ok) {
-    return res.status(500).json({ error: 'Failed to fetch from Python', detail: rsiData });
-  }
-  res.json(rsiData);
 });
 
 const userCapital = new Map();
@@ -1613,20 +1224,17 @@ app.post('/api/screener/ltp', auth, async (req, res) => {
     const wsVol = (wsTodayVols.get(token) || []).reduce((a, b) => a + (+b || 0), 0);
     const eodVol = lastEodVolume.get(token) > 0 ? lastEodVolume.get(token) : null;
     const vol = (bs?.volume > 0 ? +bs.volume : (wsVol > 0 ? wsVol : eodVol));
-    const rvol = vol && avgVolume5D.get(token) ? +(vol / avgVolume5D.get(token)).toFixed(1) : (bs?.rvol ?? null);
+    const rvol = vol && avgVolume5D.get(token) ? +(vol / avgVolume5D.get(token)).toFixed(1) : null;
     return {
       token, ltp, prevClose,
       buyQty: bs?.buyQty ?? null,
       sellQty: bs?.sellQty ?? null,
       bsVolume: vol,
       rvol,
-      rank: bs?.rank ?? null,
       dayOpen: bs?.dayOpen ?? null,
-      rsi: bs?.rsi ?? null,
       leverage: lev ?? null,
       marginPerShare: lev && ltp ? +(ltp / lev).toFixed(4) : null,
       vwap: lastWsAvg.get(token) ?? computeVWAP(token),
-      rsiFirst: bs?.rsiFirst ?? null,
       serverTime
     };
   });
@@ -1676,35 +1284,6 @@ app.post('/api/admin/force-bs', auth, adminOnly, async (req, res) => {
       [p.date, 'momentum']
     );
     res.json({ ok: true, date: p.date, saved: +rows[0].cnt, total: STOCKS.length });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/admin/compute-rsi', auth, adminOnly, async (req, res) => {
-  try {
-    const dateParam = req.body?.date || req.query?.date;
-    let targetDate = dateParam;
-
-    if (!targetDate) {
-      const src = RSI_SOURCE === 'ws' ? 'ws_1min_close' : 'min_1_close';
-      const { rows } = await db.query(
-        `SELECT date::text AS d FROM strategy_bs_snapshot
-         WHERE strategy_id='momentum' AND ${src} IS NOT NULL
-         ORDER BY date DESC LIMIT 1`
-      );
-      if (!rows.length) return res.json({ ok: false, error: 'No candle data found' });
-      targetDate = rows[0].d;
-    }
-
-    await recomputeAllRSI(targetDate);
-
-    const { rows: out } = await db.query(
-      `SELECT sym, rsi FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id='momentum' AND rsi IS NOT NULL
-       ORDER BY rsi DESC`,
-      [targetDate]
-    );
-    console.log(`🧪 Compute-RSI: ${out.length} saved for ${targetDate}`);
-    res.json({ ok: true, date: targetDate, count: out.length, top10: out.slice(0, 10), bottom10: out.slice(-10) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1862,26 +1441,22 @@ async function backfillOneStock(stock, daysBack) {
     const d5 = by5m[date];
     if (!d5 || d5.closes.length < 15) continue;
 
-    const rsi = computeRSIWilder(d5.closes);
-
     await db.query(
       `INSERT INTO strategy_bs_snapshot
          (date, sym, token, strategy_id,
           ws_5min_close, ws_5min_ts, ws_5min_volume,
-          rsi, fetched_at)
+          fetched_at)
        VALUES ($1, $2, $3, 'momentum',
                $4::numeric[], $5::timestamptz[], $6::numeric[],
-               $7, NOW())
+               NOW())
        ON CONFLICT (date, token, strategy_id) DO UPDATE SET
          ws_5min_close  = EXCLUDED.ws_5min_close,
          ws_5min_ts     = EXCLUDED.ws_5min_ts,
          ws_5min_volume = EXCLUDED.ws_5min_volume,
-         rsi            = EXCLUDED.rsi,
          fetched_at     = NOW()`,
       [
         date, sym, token,
-        d5.closes, d5.ts, d5.vols,
-        rsi != null ? +rsi.toFixed(2) : null
+        d5.closes, d5.ts, d5.vols
       ]
     );
     saved++;
@@ -2022,7 +1597,6 @@ async function processHistoricalFetch(body) {
     console.log(`✅ Historical DONE ${elapsed}s | ok=${summary.ok} skip=${summary.skipped} fail=${summary.failed} days=${summary.days_saved} | retry_pending=${historicalFailed.size}`);
 
     try {
-      await loadPrevWSClosesFromDB();
       await loadTodayWSClosesFromDB();
       const t0 = getIST().toISOString().split('T')[0];
       vwapDate = t0;
@@ -2032,8 +1606,6 @@ async function processHistoricalFetch(body) {
         for (let i = 0; i < closes.length; i++) { const v = vols[i] || 0; pv += closes[i] * v; vv += v; }
         if (vv > 0) { vwapPV.set(tk, pv); vwapV.set(tk, vv); lastWsAvg.set(tk, +(pv / vv).toFixed(2)); }
       }
-      await backfillRsiFirst(getIST().toISOString().split('T')[0]);
-      seedRSIStateFromMemory();
       console.log('🔄 WS caches reloaded after backfill');
     } catch (e) { console.error('Post-backfill reload failed:', e.message); }
 
@@ -2402,7 +1974,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
     const minuteChanges = [];
 
     const bTokens = [], bSyms = [], bBuy = [], bSell = [], bLtp = [], bVol = [], bOpen = [];
-    const bHigh = [], bLow = [], bClose = [], bPivot = [], bPrevClose = [], bRsi = [];
+    const bHigh = [], bLow = [], bClose = [], bPivot = [], bPrevClose = [];
     const vTokens = [], vVols = [];
 
     for (const r of results) {
@@ -2416,12 +1988,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
       } else {
         const existing = bsCache.get(String(r.token)) || {};
 
-        let rsi = existing.rsi ?? null;
-        if (RSI_SOURCE === 'bs' && rsi == null) {
-          const closes14 = buildCloses14(r.token);
-          if (closes14) rsi = computeRSIFromArray(closes14);
-        }
-
         const todayVol = r.volume || 0;
         const histAvg = avgVolume5D.get(String(r.token)) || 0;
         const rvol = histAvg > 0 ? +(todayVol / histAvg).toFixed(1) : 0;
@@ -2432,10 +1998,7 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
           ltp: r.ltp,
           volume: todayVol,
           rvol: rvol,
-          dayOpen: r.dayOpen ?? null,
-          rank: existing.rank ?? null,
-          rsi,
-          rsiFirst: existing.rsiFirst ?? null
+          dayOpen: r.dayOpen ?? null
         });
 
         if (r.prevClose && r.prevClose > 0) {
@@ -2461,7 +2024,6 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
         bClose.push(r.ltp ?? null);
         bPivot.push(pivot);
         bPrevClose.push(r.prevClose ?? null);
-        bRsi.push(rsi);
       }
     }
 
@@ -2483,17 +2045,17 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
              date, sym, token, strategy_id,
              buy_qty, sell_qty, ltp, volume,
              day_open, day_high, day_low, day_close, pivot, prev_close,
-             rsi, fetched_at
+             fetched_at
            )
            SELECT $1, v.sym, v.token, 'momentum',
                   v.buy_qty, v.sell_qty, v.ltp, v.volume,
                   v.day_open, v.day_high, v.day_low, v.day_close, v.pivot, v.prev_close,
-                  v.rsi, $15
+                  $14
            FROM unnest(
              $2::text[], $3::text[], $4::numeric[], $5::numeric[],
              $6::numeric[], $7::numeric[], $8::numeric[], $9::numeric[],
-             $10::numeric[], $11::numeric[], $12::numeric[], $13::numeric[], $14::numeric[]
-           ) AS v(token, sym, buy_qty, sell_qty, ltp, volume, day_open, day_high, day_low, day_close, pivot, prev_close, rsi)
+             $10::numeric[], $11::numeric[], $12::numeric[], $13::numeric[]
+           ) AS v(token, sym, buy_qty, sell_qty, ltp, volume, day_open, day_high, day_low, day_close, pivot, prev_close)
            ON CONFLICT (date, token, strategy_id) DO UPDATE SET
              sym=EXCLUDED.sym,
              buy_qty=EXCLUDED.buy_qty,
@@ -2506,9 +2068,8 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
              day_close=COALESCE(EXCLUDED.day_close, s.day_close),
              pivot=COALESCE(EXCLUDED.pivot, s.pivot),
              prev_close=COALESCE(EXCLUDED.prev_close, s.prev_close),
-             rsi=COALESCE(EXCLUDED.rsi, s.rsi),
              fetched_at=EXCLUDED.fetched_at`,
-          [p.date, bTokens, bSyms, bBuy, bSell, bLtp, bVol, bOpen, bHigh, bLow, bClose, bPivot, bPrevClose, bRsi, fetchedAt]
+          [p.date, bTokens, bSyms, bBuy, bSell, bLtp, bVol, bOpen, bHigh, bLow, bClose, bPivot, bPrevClose, fetchedAt]
         );
         bsFreshDate = p.date;
       } catch (e) { dbErrors.push(`bulk-bs: ${e.message}`); }
@@ -2529,422 +2090,12 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
     broadcastBS(fetchedAt);
     if (!silent) console.log(`✅ Auto-BS: ${results.length}/${allTokens.length} in ${Math.round((Date.now() - t0) / 1000)}s`);
 
-    if (!volumeOnly) await assignDailyRank(p.date);
-    if (!volumeOnly) await buildChipList(p.date);
-
     if (!volumeOnly) {
       maybeRefreshMargins('angelone').catch(e => console.error('margin refresh:', e.message));
     }
   } catch (e) { console.error('Auto-BS failed:', e.message); }
   finally { bsRunning = false; }
 }
-
-async function assignDailyRank(date) {
-  try {
-    const { rows: chk } = await db.query(
-      `SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id=$2 AND rank_no IS NOT NULL`,
-      [date, 'momentum']
-    );
-    if (+chk[0].cnt > 0) { console.log(`#️⃣ Rank already assigned for ${date}`); return; }
-
-    const rows = STOCKS.map(s => {
-      const token = String(s.token);
-      const ltp = getCachedLTP(token);
-      const prevClose = prevCloseCache.get(token) || null;
-      const changePct = (ltp && prevClose && prevClose > 0) ? ((ltp - prevClose) / prevClose) * 100 : -Infinity;
-      return { token, changePct };
-    }).sort((a, b) => b.changePct - a.changePct);
-
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i];
-      const rank = i + 1;
-      db.query(
-        `UPDATE strategy_bs_snapshot SET rank_no=$1 WHERE date=$2 AND token=$3 AND strategy_id=$4`,
-        [rank, date, r.token, 'momentum']
-      ).catch(() => {});
-      const cached = bsCache.get(r.token) || {};
-      cached.rank = rank;
-      bsCache.set(r.token, cached);
-    }
-    console.log(`#️⃣ Assigned rank 1..${rows.length} for ${date}`);
-  } catch (e) { console.error('Rank assign failed:', e.message); }
-}
-
-async function buildChipList(date) {
-  try {
-    if (chipDate === date) return;
-
-    const { rows: chk } = await db.query(
-      `SELECT COUNT(*) AS cnt FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id='momentum' AND chip_rank IS NOT NULL`,
-      [date]
-    );
-    if (+chk[0].cnt > 0) { await loadChipListFromDB(date); return; }
-
-    const pool = STOCKS.map(s => String(s.token))
-      .map(t => ({ token: t, rank: bsCache.get(t)?.rank ?? null }))
-      .filter(x => x.rank != null && x.rank >= 1 && x.rank <= 10)
-      .sort((a, b) => a.rank - b.rank);
-    if (!pool.length) return;
-
-    const readyCount = pool.filter(x =>
-      (CHIP_TEST_MODE || (bsCache.get(x.token)?.rsi ?? null) != null) && getCachedLTP(x.token)
-    ).length;
-    const ist = getIST();
-    const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-    const forceLock = mins >= 9 * 60 + 20;
-    if (!forceLock && readyCount < Math.min(5, pool.length)) {
-      console.log(`🔒 Chip list: first ticks ka wait (ready ${readyCount}/${pool.length})`);
-      return;
-    }
-
-    const chips = [];
-    for (const x of pool) {
-      const dayOpen = bsCache.get(x.token)?.dayOpen ?? null;
-      const prevClose = prevCloseCache.get(x.token) || null;
-      if (!dayOpen || !prevClose || prevClose <= 0) continue;
-      const gapPct = ((dayOpen - prevClose) / prevClose) * 100;
-      const rsi = bsCache.get(x.token)?.rsi ?? null;
-      if (gapPct >= 3) continue;
-      if (!CHIP_TEST_MODE && (rsi == null || rsi < 70)) continue;
-      chips.push({
-        token: x.token,
-        sym: SYM_BY_TOKEN[x.token] || '?',
-        rank: x.rank,
-        gapPct: +gapPct.toFixed(2),
-        rsiAtLock: rsi
-      });
-    }
-
-    for (const c of chips) {
-      db.query(
-        `UPDATE strategy_bs_snapshot SET chip_rank=$1, chip_rsi=$2
-         WHERE date=$3 AND token=$4 AND strategy_id='momentum'`,
-        [c.rank, c.rsiAtLock, date, c.token]
-      ).catch(() => {});
-      chipList.set(c.token, c);
-    }
-    chipDate = date;
-    console.log(`🔒 Chip list LOCKED for ${date}: ${chips.length} stocks → ${chips.map(c => `${c.sym}(#${c.rank},gap+${c.gapPct}%,RSI${c.rsiAtLock})`).join(', ') || 'none'}`);
-    broadcastChip();
-  } catch (e) { console.error('Chip list build failed:', e.message); }
-}
-
-
-/* ============================================================
-   ORB-15 (first 15-min candle 9:15–9:30)
-   ============================================================ */
-async function computeOrbCandles(date) {
-  if (orbDoneDate === date) return;
-  if (orbCache.size >= 50) { console.log('🎯 ORB WS fallback skipped — official values already in cache'); return; }
-  const toks = [], hs = [], ls = [], szs = [], vols = [];
-  for (const s of STOCKS) {
-    const tk = String(s.token);
-    const H = wsTodayHighs.get(tk) || [];
-    const L = wsTodayLows.get(tk) || [];
-    const C = wsTodayCloses.get(tk) || [];
-    const V = wsTodayVols.get(tk) || [];
-    if (C.length < 15 || H.length < 15 || L.length < 15) continue;
-    if (H.length !== C.length || L.length !== C.length) {
-      console.warn(`🎯 ORB WS skip ${tk}: H/L misaligned (restart?) H=${H.length} L=${L.length} C=${C.length}`);
-      continue;
-    }
-    const h = Math.max(...H.slice(0, 15));
-    const l = Math.min(...L.slice(0, 15));
-    if (!(l > 0) || !(h > 0)) continue;
-    const sz = +(((h - l) / l) * 100).toFixed(2);
-    const v = V.slice(0, 15).reduce((a, b) => a + (+b || 0), 0);
-    orbCache.set(tk, { high: +h.toFixed(2), low: +l.toFixed(2), size: sz, volume: v });
-    toks.push(tk); hs.push(+h.toFixed(2)); ls.push(+l.toFixed(2)); szs.push(sz); vols.push(v);
-  }
-  if (toks.length) {
-    try {
-      await db.query(
-        `UPDATE strategy_bs_snapshot AS s
-         SET orb_high=v.h, orb_low=v.l, orb_size=v.sz, orb_volume=v.vol
-         FROM unnest($1::text[], $2::numeric[], $3::numeric[], $4::numeric[], $5::numeric[]) AS v(token, h, l, sz, vol)
-         WHERE s.date=$6 AND s.token=v.token AND s.strategy_id='momentum'`,
-        [toks, hs, ls, szs, vols, date]
-      );
-    } catch (e) { console.error('🎯 ORB save failed:', e.message); }
-  }
-  orbDoneDate = date;
-  orbForming.clear();
-  const tight = [...orbCache.values()].filter(x => x.size <= 1.5).length;
-  console.log(`🎯 ORB-15 candles computed: ${toks.length} stocks | size ≤1.5%: ${tight}`);
-}
-
-async function loadOrbFromDB(date) {
-  if (!date) return;
-  try {
-    const { rows } = await db.query(
-      `SELECT token, gq_high, gq_low, gq_volume
-       FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id='momentum' AND gq_high IS NOT NULL AND gq_low IS NOT NULL`,
-      [date]
-    );
-    if (rows.length) {
-      orbCache.clear();
-      for (const r of rows) {
-        const h = +r.gq_high, l = +r.gq_low;
-        if (!(h > 0) || !(l > 0)) continue;
-        orbCache.set(String(r.token), { high: h, low: l, size: +(((h - l) / l) * 100).toFixed(2), volume: +r.gq_volume || 0 });
-      }
-      orbDoneDate = date;
-      console.log(`🎯 ORB loaded from gq_* (GetQuote official): ${orbCache.size} stocks for ${date}`);
-      return;
-    }
-  } catch (e) { console.error('🎯 gq_* load failed (ALTER pending?):', e.message); }
-  try {
-    const { rows } = await db.query(
-      `SELECT token, orb_high, orb_low, orb_size, orb_volume
-       FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id='momentum' AND orb_size IS NOT NULL`,
-      [date]
-    );
-    orbCache.clear();
-    for (const r of rows) {
-      orbCache.set(String(r.token), { high: +r.orb_high, low: +r.orb_low, size: +r.orb_size, volume: +r.orb_volume });
-    }
-    if (rows.length) orbDoneDate = date;
-    if (rows.length) console.log(`🎯 ORB loaded from orb_* (fallback archive): ${rows.length} stocks for ${date}`);
-  } catch (e) { console.error('🎯 ORB load failed:', e.message); }
-}
-
-/* ============================================================
-   ORB-15 OFFICIAL SOURCE (GetQuote @9:30 + historical @9:35 / restart)
-   ============================================================ */
-const ANGEL_QUOTE_URL = 'https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/';
-let orbQuoteDoneDate = null;
-let orbHistDoneDate = null;
-let orbOfficialRunning = false;
-const orbSleep = ms => new Promise(r => setTimeout(r, ms));
-
-async function angelQuoteBatch(tokens) {
-  const out = new Map();
-  const chunks = [];
-  for (let i = 0; i < tokens.length; i += 200) chunks.push(tokens.slice(i, i + 200));
-  let jwt = await getAnyAngelJwt();
-  if (!jwt) throw new Error('No Angel JWT for quote');
-  for (const ch of chunks) {
-    const doReq = async j => {
-      const r = await fetch(ANGEL_QUOTE_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json', 'Accept': 'application/json',
-          'X-UserType': 'USER', 'X-SourceID': 'WEB', 'X-ClientLocalIP': '127.0.0.1',
-          'X-ClientPublicIP': '127.0.0.1', 'X-MACAddress': '00:00:00:00:00:00',
-          'X-PrivateKey': process.env.ANGEL_API_KEY, 'Authorization': 'Bearer ' + j
-        },
-        body: JSON.stringify({ mode: 'FULL', exchangeTokens: { NSE: ch } })
-      });
-      if (r.status === 401 || r.status === 403) return { authFail: true };
-      if (r.status === 429) return { rateFail: true };
-      if (!r.ok) throw new Error('quote HTTP ' + r.status);
-      const j2 = await r.json();
-      if (!j2.status || !Array.isArray(j2.data)) throw new Error(j2.message || 'quote no data');
-      return { data: j2.data };
-    };
-    let res = await doReq(jwt);
-    if (res.authFail) { jwt = await getAnyAngelJwt(); if (!jwt) throw new Error('quote re-login failed'); res = await doReq(jwt); }
-    if (!res.data) throw new Error('quote batch failed (auth/rate), stopping');
-    for (const q of res.data) {
-      const tk = String(q.exchangeToken ?? q.exchFeedCode ?? q.symbol ?? '');
-      if (!tk) continue;
-      const h = +q.high, l = +q.low;
-      if (Number.isFinite(h) && Number.isFinite(l) && h > 0 && l > 0)
-        out.set(tk, { high: h, low: l, volume: +q.volume || +q.lastTradedQuantity || 0, open: +q.open || 0, close: +q.ltp || 0 });
-    }
-    await orbSleep(800);
-  }
-  return out;
-}
-
-async function saveOrbToDB(toks, hs, ls, szs, vols, date) {
-  if (!toks.length) return;
-  try {
-    await db.query(
-      `UPDATE strategy_bs_snapshot AS s
-       SET orb_high=v.h, orb_low=v.l, orb_size=v.sz, orb_volume=v.vol
-       FROM unnest($1::text[], $2::numeric[], $3::numeric[], $4::numeric[], $5::numeric[]) AS v(token, h, l, sz, vol)
-       WHERE s.date=$6 AND s.token=v.token AND s.strategy_id='momentum'`,
-      [toks, hs, ls, szs, vols, date]);
-  } catch (e) { console.error('🎯 ORB save failed:', e.message); }
-}
-
-async function saveGQToDB(toks, os, hs, ls, cs, vs, date) {
-  if (!toks.length) return;
-  try {
-    await db.query(
-      `UPDATE strategy_bs_snapshot AS s
-       SET gq_open=v.o, gq_high=v.h, gq_low=v.l, gq_close=v.c, gq_volume=v.vol
-       FROM unnest($1::text[], $2::numeric[], $3::numeric[], $4::numeric[], $5::numeric[], $6::numeric[]) AS v(token, o, h, l, c, vol)
-       WHERE s.date=$7 AND s.token=v.token AND s.strategy_id='momentum'`,
-      [toks, os, hs, ls, cs, vs, date]);
-  } catch (e) { console.error('🎯 gq_* save failed (ALTER pending?):', e.message); }
-}
-
-function group15FromCandles(candles, date) {
-  const buckets = new Map();
-  for (const c of candles || []) {
-    let dstr, mins;
-    if (typeof c[0] === 'number') {
-      const d = new Date(c[0] + 5.5 * 3600 * 1000);
-      dstr = d.toISOString().slice(0, 10);
-      mins = d.getUTCHours() * 60 + d.getUTCMinutes();
-    } else {
-      dstr = String(c[0]).slice(0, 10);
-      mins = +String(c[0]).slice(11, 13) * 60 + +String(c[0]).slice(14, 16);
-    }
-    if (dstr !== date || mins < 555 || mins > 930) continue;
-    const bStart = 555 + Math.floor((mins - 555) / 15) * 15;
-    if (!buckets.has(bStart)) buckets.set(bStart, { o: +c[1], h: +c[2], l: +c[3], c: +c[4], v: +c[5] || 0 });
-    else {
-      const b = buckets.get(bStart);
-      if (+c[2] > b.h) b.h = +c[2];
-      if (+c[3] < b.l) b.l = +c[3];
-      b.c = +c[4]; b.v += +c[5] || 0;
-    }
-  }
-  return [...buckets.entries()].sort((a, b) => a[0] - b[0]).map(([m, b]) => ({
-    ...b, ts: `${date}T${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}:00.000+05:30`
-  }));
-}
-
-async function save15MinToDB(tk, sym, rows15, date) {
-  if (!rows15.length) return;
-  try {
-    await db.query(
-      `INSERT INTO strategy_bs_snapshot AS s
-         (date, sym, token, strategy_id,
-          ws_15min_open, ws_15min_high, ws_15min_low, ws_15min_close, ws_15min_volume, ws_15min_ts, fetched_at)
-       VALUES ($1,$2,$3,'momentum',$4::numeric[],$5::numeric[],$6::numeric[],$7::numeric[],$8::numeric[],$9::timestamptz[],NOW())
-       ON CONFLICT (date, token, strategy_id) DO UPDATE SET
-         ws_15min_open=EXCLUDED.ws_15min_open, ws_15min_high=EXCLUDED.ws_15min_high,
-         ws_15min_low=EXCLUDED.ws_15min_low, ws_15min_close=EXCLUDED.ws_15min_close,
-         ws_15min_volume=EXCLUDED.ws_15min_volume, ws_15min_ts=EXCLUDED.ws_15min_ts, fetched_at=NOW()`,
-      [date, sym, tk, rows15.map(x => x.o), rows15.map(x => x.h), rows15.map(x => x.l),
-       rows15.map(x => x.c), rows15.map(x => x.v), rows15.map(x => x.ts)]);
-  } catch (e) { console.error('🎯 ws_15min save failed:', e.message); }
-}
-
-function pushOrb(entries, date, source, mode) {
-  const toks = [], os = [], hs = [], ls = [], szs = [], cs = [], vols = [];
-  let changed = 0, cacheSet = 0;
-  for (const [tk, v] of entries) {
-    const sz = +(((v.high - v.low) / v.low) * 100).toFixed(2);
-    const prev = orbCache.get(tk);
-    if (!prev || Math.abs(prev.high - v.high) > 0.005 || Math.abs(prev.low - v.low) > 0.005) changed++;
-    toks.push(tk); hs.push(+v.high.toFixed(2)); ls.push(+v.low.toFixed(2)); szs.push(sz); vols.push(v.volume || 0);
-    os.push(v.open || 0); cs.push(v.close || 0);
-    if (mode === 'quote' || !prev) {
-      orbCache.set(tk, { high: +v.high.toFixed(2), low: +v.low.toFixed(2), size: sz, volume: v.volume || 0 });
-      cacheSet++;
-    }
-  }
-  if (mode === 'quote') saveGQToDB(toks, os, hs, ls, cs, vols, date);
-  else saveOrbToDB(toks, hs, ls, szs, vols, date);
-  console.log(`🎯 ORB official (${source}/${mode}): ${toks.length} stocks | cache set ${cacheSet} | changed vs prev ${changed} | size ≤1.5%: ${[...orbCache.values()].filter(x => x.size <= 1.5).length}`);
-  return toks.length;
-}
-
-async function orbFinalizeQuote(date) {
-  if (orbOfficialRunning) return false;
-  orbOfficialRunning = true;
-  try {
-    let q;
-    try { q = await angelQuoteBatch(STOCKS.map(s => String(s.token))); }
-    catch (e) { console.error('🎯 ORB quote attempt 1 failed:', e.message); q = await angelQuoteBatch(STOCKS.map(s => String(s.token))); }
-    if (!q || q.size < 50) throw new Error('quote too few: ' + (q ? q.size : 0));
-    pushOrb(q, date, 'quote@9:30', 'quote');
-    orbQuoteDoneDate = date; orbDoneDate = date;
-    return true;
-  } catch (e) { console.error('🎯 ORB quote finalize failed twice:', e.message); return false; }
-  finally { orbOfficialRunning = false; }
-}
-
-function orbWindowFromCandles(candles, date) {
-  let h = -1, l = Infinity, v = 0, n = 0;
-  for (const c of candles || []) {
-    let hm, dstr;
-    if (typeof c[0] === 'number') {
-      const d = new Date(c[0] + 5.5 * 3600 * 1000);
-      dstr = d.toISOString().slice(0, 10);
-      hm = String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
-    } else {
-      dstr = String(c[0]).slice(0, 10);
-      hm = String(c[0]).slice(11, 16);
-    }
-    if (dstr !== date) continue;
-    if (hm < '09:15' || hm > '09:29') continue;
-    const ch = +c[2], cl = +c[3], cv = +c[5] || 0;
-    if (!(ch > 0) || !(cl > 0)) continue;
-    if (ch > h) h = ch;
-    if (cl < l) l = cl;
-    v += cv; n++;
-  }
-  if (n < 15 || !(h > 0) || !Number.isFinite(l) || !(l > 0)) return null;
-  return { high: h, low: l, volume: v };
-}
-
-async function orbRepairHistorical(date, source) {
-  if (orbOfficialRunning) return 0;
-  orbOfficialRunning = true;
-  try {
-    const entries = new Map(); let fails = 0;
-    const fifteenByToken = new Map();
-    const symOf = new Map(STOCKS.map(s => [String(s.token), s.sym]));
-    for (const s of STOCKS) {
-      const tk = String(s.token);
-      try {
-        const candles = await fetchAngelInterval(tk, 'ONE_MINUTE', 0);
-        const w = orbWindowFromCandles(candles, date);
-        if (w) entries.set(tk, w); else fails++;
-        const r15 = group15FromCandles(candles, date);
-        if (r15.length) fifteenByToken.set(tk, r15);
-      } catch (e) { fails++; }
-      await orbSleep(340);
-    }
-    if (entries.size < 50) { console.error(`🎯 ORB historical (${source}): too few (${entries.size}, fails ${fails})`); return 0; }
-    pushOrb(entries, date, 'historical@' + source, 'hist');
-    for (const [tk, r15] of fifteenByToken) await save15MinToDB(tk, symOf.get(tk), r15, date);
-    console.log(`🎯 ws_15min_* updated from historical: ${fifteenByToken.size} stocks`);
-    orbHistDoneDate = date; orbDoneDate = date;
-    return entries.size;
-  } finally { orbOfficialRunning = false; }
-}
-
-setInterval(() => {
-  const ist = getIST();
-  if (!isTradingDay(ist)) return;
-  const hh = ist.getUTCHours(), mm = ist.getUTCMinutes(), ss = ist.getUTCSeconds();
-  const hhmm = String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
-  const today = ist.toISOString().split('T')[0];
-  const mins = hh * 60 + mm;
-
-  if (mins >= 555 && mins <= 569 && ss < 4 && !orbOfficialRunning) {
-    angelQuoteBatch(STOCKS.map(s => String(s.token)))
-      .then(q => { for (const [tk, v] of q) orbForming.set(tk, { h: v.high, l: v.low }); })
-      .catch(e => console.error('🎯 ORB forming poll failed:', e.message));
-  }
-  if (hhmm === '09:30' && ss >= 5 && ss <= 35 && orbQuoteDoneDate !== today && !orbOfficialRunning) {
-    orbFinalizeQuote(today).then(ok => {
-      if (!ok) orbRepairHistorical(today, 'fallback-931').catch(() => {});
-    }).catch(() => {});
-  }
-  if (hhmm === '09:35' && ss < 10 && orbHistDoneDate !== today && !orbOfficialRunning) {
-    orbRepairHistorical(today, '935').catch(e => console.error('🎯 ORB 9:35 repair failed:', e.message));
-  }
-}, 2000);
-
-app.get('/api/orb/repair', auth, (req, res) => {
-  const date = String(req.query.date || getIST().toISOString().split('T')[0]);
-  res.json({ ok: true, started: true, date });
-  orbRepairHistorical(date, 'manual')
-    .then(n => console.log(`🎯 ORB manual repair done: ${n} stocks for ${date}`))
-    .catch(e => console.error('🎯 ORB manual repair failed:', e.message));
-});
 
 async function buildAutoUsers() {
   const { rows: dbUsers } = await db.query(`SELECT id, username, side_mode FROM users`);
@@ -2954,32 +2105,6 @@ async function buildAutoUsers() {
   });
   if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000), sideMode: 'MIX' });
   return users;
-}
-
-async function loadChipListFromDB(date) {
-  try {
-    if (!date) return;
-    const { rows } = await db.query(
-      `SELECT token, sym, chip_rank, chip_rsi, day_open FROM strategy_bs_snapshot
-       WHERE date=$1 AND strategy_id='momentum' AND chip_rank IS NOT NULL
-       ORDER BY chip_rank`,
-      [date]
-    );
-    chipList.clear();
-    for (const r of rows) {
-      const prevClose = prevCloseCache.get(String(r.token)) || null;
-      const gapPct = (r.day_open && prevClose > 0) ? +(((+r.day_open - prevClose) / prevClose) * 100).toFixed(2) : null;
-      chipList.set(String(r.token), {
-        token: String(r.token),
-        sym: r.sym,
-        rank: +r.chip_rank,
-        gapPct,
-        rsiAtLock: r.chip_rsi != null ? +r.chip_rsi : null
-      });
-    }
-    chipDate = date;
-    if (rows.length) console.log(`🔒 Chip list DB se loaded: ${rows.length} stocks for ${date}`);
-  } catch (e) { console.error('Chip list load failed:', e.message); }
 }
 
 async function flushFinalMinuteBuffer() {
@@ -3116,7 +2241,6 @@ async function appendBSMinuteSnapshot(prevKey, prevTs, date) {
   );
   computeBuyersGroups();
   broadcastBuyers();
-  if (prevKey === '09:20') backfillRsiFirst(date).catch(() => {});
   console.log(`⚖️ BS minute snapshot: ${tokens.length} tokens @ ${prevKey} | strong buyers: ${buyersInfo.size}`);
 }
 
@@ -3164,27 +2288,6 @@ function scheduleFinalFlush() {
     scheduleFinalFlush();
   }, ms);
 }
-
-function getVCWatchDate() {
-  const ist = getIST();
-  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  const today = ist.toISOString().split('T')[0];
-  if (mins >= 15 * 60 + 35 && isTradingDay(ist)) return today;
-  return getPreviousTradingDay(ist);
-}
-
-function scheduleVCWatchReload() {
-  const ms = msUntil(15, 35);
-  console.log(`⏰ VC watchlist post-close refresh in ${Math.round(ms / 60000)} min`);
-  setTimeout(async () => {
-    await loadVCWatchlist(getIST().toISOString().split('T')[0], getVCWatchDate());
-    scheduleVCWatchReload();
-  }, ms);
-}
-
-// ⚠️ v5.48: scheduleDailyHistorical REMOVED — 4 PM auto-historical no longer fires.
-// Historical 5-min backfill runs ONLY when user clicks "📥 Fetch Historical" button
-// (POST /api/admin/fetch-historical). Saves rate limit.
 
 // ============================================================
 // AI POST-MARKET ANALYSIS (4:30 PM)
@@ -3278,21 +2381,12 @@ function scheduleMorningPreload() {
     bsCache.clear();
     chipList.clear();
     chipDate = null;
-    orbCache.clear();
-    orbDoneDate = null;
-    orbForming.clear();
     console.log('🧹 Morning purge: bsCache + chipList cleared, bsFreshDate reset');
 
     await loadPrevCloseFromDB();
-    await loadPrevClosesFromDB();
     await loadTodayClosesFromDB();
-    await loadPrevWSClosesFromDB();
     await loadTodayWSClosesFromDB();
-    seedRSIStateFromMemory();
     const today = getIST().toISOString().split('T')[0];
-    await recomputeAllRSI(today);
-    await loadVCWatchlist(today, getVCWatchDate());
-    await rebuildVCState(today);
     scheduleMorningPreload();
   }, ms);
 }
@@ -3322,7 +2416,7 @@ registerFifteenRoutes(app, {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`✅ Server on port ${PORT} — v5.50 (Clean Fix)`);
+  console.log(`✅ Server on port ${PORT} — v5.52 (Ultra Clean)`);
   initMarginService(db, getBrokerSession);
 
   try { 
@@ -3337,19 +2431,9 @@ app.listen(PORT, async () => {
   await loadAvgVolumeFromDB(); 
   await loadLastEodVolumeFromDB();
   await loadBSCacheFromDB();
-  await loadPrevClosesFromDB();
   await loadTodayClosesFromDB();
-  await loadChipListFromDB(getIST().toISOString().split('T')[0]);
   await loadBSMinuteArrays(getIST().toISOString().split('T')[0]);
-  await loadOrbFromDB(getScreenerPhase().date);
 
-  {
-    const i0 = getIST(); const m0 = i0.getUTCHours() * 60 + i0.getUTCMinutes();
-    if (isTradingDay(i0) && m0 >= 571) {
-      const d0 = i0.toISOString().split('T')[0];
-      setTimeout(() => orbRepairHistorical(d0, 'startup').catch(e => console.error('🎯 ORB startup repair failed:', e.message)), 45000);
-    }
-  }
   computeBuyersGroups();
   updateMarketBreadth();
 
@@ -3374,22 +2458,11 @@ app.listen(PORT, async () => {
     getLeverage: (broker, token) => getLeverage(broker, token),
     perTrade: Number(process.env.AUTO_PER_TRADE || 25000),
     getDayOpen: (t) => bsCache.get(String(t))?.dayOpen ?? null,
-    getTodayMinutes: (t) => ({
-      c: wsTodayCloses.get(String(t)) || [],
-      h: wsTodayHighs.get(String(t)) || [],
-      l: wsTodayLows.get(String(t)) || []
-    }),
     getUsers: buildAutoUsers,
-    onVCChange: () => broadcastVC(),
-    sectorByToken: SECTOR_BY_TOKEN,
-    getOrb: (t) => orbCache.get(String(t)) || null,
-    getRvol: (t) => bsCache.get(String(t))?.rvol ?? null
+    getRvol: (t) => firstMinuteRvol.get(String(t)) ?? null
   });
   await loadOpenPositions(getIST().toISOString().split('T')[0]);
-  await loadVCWatchlist(getIST().toISOString().split('T')[0], getVCWatchDate());
-  await rebuildVCState(getIST().toISOString().split('T')[0]);
   
-  await loadPrevWSClosesFromDB();
   await loadTodayWSClosesFromDB();
 
   const todayStrForVwap = getIST().toISOString().split('T')[0];
@@ -3410,11 +2483,7 @@ app.listen(PORT, async () => {
   }
   console.log(`🧮 VWAP seeded from stored minutes: ${vwapPV.size} tokens`);
 
-  seedRSIStateFromMemory();
   await loadCachedMargins('angelone');
-
-  const todayDate = getIST().toISOString().split('T')[0];
-  await recomputeAllRSI(todayDate);
 
   const nowIST = getIST();
   const mins = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
@@ -3451,7 +2520,6 @@ app.listen(PORT, async () => {
   scheduleDailyHLC();
   scheduleBSAutoFetch();
   scheduleFinalFlush();
-  scheduleVCWatchReload();
   scheduleMorningPreload();
   scheduleAIPostMarket();
   scheduleAIPreMarketCheck();
@@ -3461,6 +2529,6 @@ app.listen(PORT, async () => {
 
   setInterval(updateMarketBreadth, 5000);
 
-  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15 (every min) | ORB quote@9:30 | ORB hist@9:35 | VC@9:16-14:30 | HLC@15:31 | FinalFlush@15:31 | AI@16:30 | Preload@9:00 | Margins@5min');
+  console.log('ℹ️  Schedule: WS@9:14:55 | BS@9:15 (every min) | HLC@15:31 | FinalFlush@15:31 | AI@16:30 | Preload@9:00 | Margins@5min');
   console.log('⚠️  MANUAL-ONLY (button driven): 📥 Fetch Historical (5-min) | 📈 Fetch Volume History (ONE_DAY)');
 });

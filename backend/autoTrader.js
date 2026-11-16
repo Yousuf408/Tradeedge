@@ -1,5 +1,10 @@
 /* ============================================================
-   autoTrader.js — v5.1 (Bigplayer — Top 10 by Change % | RVOL>=0.05)
+   autoTrader.js — v5.2 (Bigplayer — Top 10 by Change % | RVOL>=0.05)
+   Fixes:
+     - Empty Top-10 no longer locks the engine (root cause of no trades)
+     - Retry every 15s until lock succeeds
+     - After N failed attempts, force-lock Top 10 by Change % (loud warning)
+     - bigPlayerEntered only set if at least one position was actually placed
    ============================================================ */
 
 const MAX_ENTRIES_PER_USER = Number(process.env.MAX_ENTRIES || 10);
@@ -7,13 +12,20 @@ const MAX_ENTRIES_PER_USER = Number(process.env.MAX_ENTRIES || 10);
 /* ---- BIGPLAYER ENGINE ---- */
 const BIGPLAYER_ENABLED = String(process.env.BIGPLAYER_ENGINE ?? 'true') === 'true';
 const BIGPLAYER_ENTRY_END_MIN = Number(process.env.BIGPLAYER_ENTRY_END_MIN ?? 14 * 60 + 30);
+const BIGPLAYER_RVOL_MIN = Number(process.env.BIGPLAYER_RVOL_MIN ?? 0.05);
+
+/* Lock retry tuning */
+const LOCK_RETRY_MS = Number(process.env.BIGPLAYER_LOCK_RETRY_MS || 15000);   // 15s
+const LOCK_FORCE_AFTER_ATTEMPTS = Number(process.env.BIGPLAYER_FORCE_AFTER || 4); // ~60s
 
 const bigPlayerEntered = new Set(); // token -> already entered today
 
-/* 🆕 Top 10 by Change % tracking (matches SQL) */
-let lockedTop10 = new Set();        // set of tokens
+/* Top 10 tracking */
+let lockedTop10 = new Set();
 let top10Locked = false;
 let top10BuiltAt = null;
+let lastLockAttempt = 0;
+let lockAttempts = 0;
 
 let db = null;
 let getJwt = null;
@@ -25,7 +37,7 @@ let getLev = null;
 let getDayOpen = () => null;
 let getUsers = async () => [];
 let getRvol = () => null;
-let getPrevClose = () => null;      // 🆕 injected from server.js
+let getPrevClose = () => null;
 let live = false;
 
 const positions = new Map();
@@ -48,15 +60,15 @@ export function initAutoTrader(deps) {
   getDayOpen = deps.getDayOpen || (() => null);
   getUsers = deps.getUsers || (async () => []);
   getRvol = deps.getRvol || (() => null);
-  getPrevClose = deps.getPrevClose || (() => null);   // 🆕
+  getPrevClose = deps.getPrevClose || (() => null);
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
 
-  console.log(`🤖 AutoTrader v5.1 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | BIGPLAYER: ${BIGPLAYER_ENABLED ? 'ON' : 'OFF'}`);
+  console.log(`🤖 AutoTrader v5.2 init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'} | BIGPLAYER: ${BIGPLAYER_ENABLED ? 'ON' : 'OFF'} | RVOL_MIN: ${BIGPLAYER_RVOL_MIN}`);
   startSquareOffWatch();
-  startTop10LockWatch();   // 🆕 independent of ticks
+  startTop10LockWatch();
 }
 
-/* ---------- Order placement (unchanged) ---------- */
+/* ---------- Order placement ---------- */
 async function placeOrder({ token, sym, side, qty }) {
   const jwt = getJwt ? getJwt() : null;
   if (!jwt) throw new Error('No Angel JWT');
@@ -81,32 +93,27 @@ async function placeOrder({ token, sym, side, qty }) {
 }
 
 /* ============================================================
-   BIGPLAYER ENGINE — Top 10 by Total Change % (RVOL >= 0.05)
+   BIGPLAYER ENGINE — Top 10 by Total Change % (RVOL >= BIGPLAYER_RVOL_MIN)
    ============================================================ */
-function lockTop10Stocks() {
-  if (top10Locked) return;
+function lockTop10Stocks({ force = false } = {}) {
+  if (top10Locked) return true;
 
-  // 🆕 FIX #1: iterate keys directly — token is the key
+  const now = Date.now();
+  if (!force && now - lastLockAttempt < LOCK_RETRY_MS) return false;
+  lastLockAttempt = now;
+  lockAttempts++;
+
   const tokens = Object.keys(symByToken);
   const candidates = [];
-  let scanned = 0, passedRvol = 0, passedPrev = 0;
-
-  // 🔍 FIX #6: one-time shape probe (log first raw RVOL array we see)
-  let probed = false;
+  let scanned = 0, passedRvol = 0, passedPrev = 0, rvolNull = 0;
 
   try {
     for (const tk of tokens) {
       scanned++;
       const rv = getRvol(tk);
-      if (!probed && rv != null) {
-        probed = true;
-        console.log(`🔍 RVOL probe ${symByToken[tk] || tk}: raw=${JSON.stringify(rv)} → using ${Number(rv)}`);
-      }
-
-      // 🆕 FIX #4: SQL parity — ROUND(rvol,2) >= 0.05
-      if (rv == null) continue;
+      if (rv == null) { rvolNull++; continue; }
       const rvRounded = Math.round(Number(rv) * 100) / 100;
-      if (!(rvRounded >= 0.05)) continue;
+      if (!(rvRounded >= BIGPLAYER_RVOL_MIN)) continue;
       passedRvol++;
 
       const ltp = getLtp(tk);
@@ -119,25 +126,50 @@ function lockTop10Stocks() {
       candidates.push({ tk, changePct });
     }
 
-    // Sort DESC by Total Change % (vs PDC) — matches SQL ORDER BY
+    /* ---------- Fallback: if still empty after N attempts, force by Change % ---------- */
+    let usedFallback = false;
+    if (!candidates.length && lockAttempts >= LOCK_FORCE_AFTER_ATTEMPTS) {
+      usedFallback = true;
+      console.warn(`🏆 BIGPLAYER fallback: ${lockAttempts} attempts with 0 rvol-qualified candidates (rvolNull=${rvolNull}/${scanned}). Forcing Top 10 by Change % only.`);
+      for (const tk of tokens) {
+        const ltp = getLtp(tk);
+        const prevClose = getPrevClose(tk);
+        if (!Number.isFinite(ltp) || ltp <= 0) continue;
+        if (!Number.isFinite(prevClose) || prevClose <= 0) continue;
+        const changePct = ((ltp - prevClose) / prevClose) * 100;
+        candidates.push({ tk, changePct });
+      }
+    }
+
+    if (!candidates.length) {
+      console.warn(
+        `🏆 BIGPLAYER: attempt #${lockAttempts} — no candidates yet ` +
+        `(scanned=${scanned} rvolNull=${rvolNull} rvolPass=${passedRvol} prevClosePass=${passedPrev}). ` +
+        `Will retry in ${LOCK_RETRY_MS / 1000}s.`
+      );
+      top10Locked = false;
+      return false;
+    }
+
     candidates.sort((a, b) => b.changePct - a.changePct);
     const top10 = candidates.slice(0, 10);
 
-    // 🆕 FIX #8: only mark locked AFTER successful build
     lockedTop10 = new Set(top10.map(x => x.tk));
     top10Locked = true;
     top10BuiltAt = new Date().toISOString();
 
     console.log(
-      `🏆 BIGPLAYER: Locked Top ${top10.length} | scanned=${scanned} rvolPass=${passedRvol} prevClosePass=${passedPrev}`
+      `🏆 BIGPLAYER: Locked Top ${top10.length} on attempt #${lockAttempts}` +
+      `${usedFallback ? ' (FALLBACK — rvol ignored)' : ''} | scanned=${scanned} rvolPass=${passedRvol} prevClosePass=${passedPrev}`
     );
     console.log(
-      `🏆 Top10: ${top10.map(x => `${symByToken[x.tk] || x.tk}(${x.changePct.toFixed(2)}%)`).join(', ') || '<empty>'}`
+      `🏆 Top10: ${top10.map(x => `${symByToken[x.tk] || x.tk}(${x.changePct.toFixed(2)}%)`).join(', ')}`
     );
+    return true;
   } catch (e) {
-    // 🆕 FIX #8: don't leave top10Locked=true on failure
     console.error('🏆 lockTop10Stocks failed:', e.message);
     top10Locked = false;
+    return false;
   }
 }
 
@@ -148,27 +180,34 @@ function bigPlayerOnTick(tk, ltp) {
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
   if (mins < 9 * 60 + 16 || mins >= BIGPLAYER_ENTRY_END_MIN) return;
 
-  // 🆕 FIX #3: lock also happens via timer; this is a safety net
   if (!top10Locked) lockTop10Stocks();
-  if (!top10Locked) return;
+  if (!top10Locked || lockedTop10.size === 0) return;
 
-  // 🆕 Only trade tokens in the locked Top 10
   if (!lockedTop10.has(tk)) return;
 
   if (!Number.isFinite(ltp) || ltp <= 0) return;
   const open = getDayOpen(tk);
   if (!open || open <= 0) return;
 
-  if (ltp <= open) return;                                   // LTP > Open
+  if (ltp <= open) return;
   const movePct = ((ltp - open) / open) * 100;
-  if (movePct < 0.5) return;                                 // Move >= 0.5%
+  if (movePct < 0.5) return;
 
-  bigPlayerEntered.add(tk);
-  const sl = ltp * 0.98;                                     // 2% SL
+  bigPlayerEntered.add(tk); // provisional lock — cleared if 0 positions placed
+  const sl = ltp * 0.98;
 
   console.log(`🚀 BIGPLAYER TRIGGER ${symByToken[tk] || tk} BUY @${ltp} | Move: ${movePct.toFixed(2)}%`);
   placeEntries(tk, { sym: symByToken[tk] || '?', side: 'BUY', sl, strat: 'bigplayer', tag: 'BIGPLAYER' }, ltp)
-    .catch(e => console.error('🤖 Bigplayer entry error:', e.message));
+    .then(placed => {
+      if (placed === 0) {
+        bigPlayerEntered.delete(tk);
+        console.warn(`🤖 Bigplayer ${symByToken[tk] || tk}: 0 positions placed — will retry on next tick`);
+      }
+    })
+    .catch(e => {
+      bigPlayerEntered.delete(tk);
+      console.error('🤖 Bigplayer entry error:', e.message);
+    });
 }
 
 async function placeEntries(tk, o, ltp) {
@@ -178,6 +217,8 @@ async function placeEntries(tk, o, ltp) {
     posDate = todayIST();
   }
   const users = await getUsers();
+  let placed = 0;
+
   for (const u of users) {
     const userMode = u.sideMode || 'MIX';
     if (userMode !== 'MIX' && userMode !== o.side) continue;
@@ -202,7 +243,6 @@ async function placeEntries(tk, o, ltp) {
       ? Math.floor((u.capital * lev) / entryLtp)
       : Math.floor(u.capital / (entryLtp * 0.01));
     if (qty < 1) {
-      // 🆕 FIX #10: visibility
       console.warn(`🤖 qty<1 skip ${symByToken[tk] || tk} user=${u.userId} capital=${u.capital} lev=${lev} ltp=${entryLtp}`);
       continue;
     }
@@ -219,6 +259,7 @@ async function placeEntries(tk, o, ltp) {
       strat: o.strat
     };
     positions.set(key, pos);
+    placed++;
 
     const orderKey = `${o.side}:${tk}`;
     if (live && !liveOrdered.has(orderKey)) {
@@ -234,6 +275,8 @@ async function placeEntries(tk, o, ltp) {
     }
     savePos(pos, posDate).catch(() => {});
   }
+
+  return placed;
 }
 
 /* ============================================================
@@ -243,7 +286,7 @@ export function onTickPos(token, ltp) {
   const tk = String(token);
   bigPlayerOnTick(tk, ltp);
 
-  for (const [key, pos] of positions) {
+  for (const [, pos] of positions) {
     if (pos.token !== tk || pos.status !== 'open') continue;
     let changed = false;
 
@@ -312,16 +355,15 @@ function startSquareOffWatch() {
   }, 15000);
 }
 
-/* 🆕 9:16 TOP-10 LOCK WATCH — fires without needing a tick */
+/* 9:16 TOP-10 LOCK WATCH — fires every 5s; actual retry throttle is inside lockTop10Stocks */
 function startTop10LockWatch() {
   setInterval(() => {
+    if (top10Locked) return;
     const ist = getIST();
     const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
     const secs = ist.getUTCSeconds();
-    // Fire at/after 9:16:05, once per day
-    if (!top10Locked && mins >= 9 * 60 + 16 && (mins > 9 * 60 + 16 || secs >= 5)) {
-      console.log('🏆 9:16 lock timer fired');
-      lockTop10Stocks();
+    if (mins >= 9 * 60 + 16 && (mins > 9 * 60 + 16 || secs >= 5)) {
+      lockTop10Stocks();   // internally throttled + forced after N attempts
     }
   }, 5000);
 }
@@ -372,7 +414,6 @@ export async function loadOpenPositions(date, userId) {
     posDate = date;
     for (const r of rows) {
       bigPlayerEntered.add(String(r.token));
-      // 🆕 FIX #5: restore locked set so engine doesn't re-lock / re-rank mid-day
       if (r.status === 'open' && (r.strat === 'bigplayer' || r.entry_at)) {
         lockedTop10.add(String(r.token));
       }

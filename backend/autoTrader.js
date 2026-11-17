@@ -77,8 +77,10 @@ async function loadSwingData() {
       JOIN prev_day pd ON pw.token = pd.token
     `);
     
-    swingData.clear();
+      swingData.clear();
+    bigPlayerEntered.clear(); // <--- Naya hafta, nayi entry allow karne ke liye
     for (const r of rows) {
+       
       swingData.set(String(r.token), {
         pwh: +r.pwh,
         pdl: +r.pdl,

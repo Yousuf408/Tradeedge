@@ -66,13 +66,13 @@ async function loadSwingData() {
           AND date <  date_trunc('week', CURRENT_DATE)::date
         GROUP BY token
       ),
-      prev_day AS (
-        SELECT token, day_low AS pdl, day_high AS yest_high
+           prev_day AS (
+        SELECT token, day_low AS pdl, day_close AS yest_close
         FROM strategy_bs_snapshot
         WHERE strategy_id = 'momentum'
           AND date = (SELECT MAX(date) FROM strategy_bs_snapshot WHERE date < CURRENT_DATE)
       )
-      SELECT pw.token, pw.pwh, pd.pdl, pd.yest_high
+      SELECT pw.token, pw.pwh, pd.pdl, pd.yest_close
       FROM prev_week pw
       JOIN prev_day pd ON pw.token = pd.token
     `);
@@ -141,11 +141,11 @@ function swingOnTick(tk, ltp) {
 
   const data = swingData.get(tk);
   if (!data) return;
-  const { pwh, pdl, yestHigh } = data;
+  const { pwh, pdl, yestClose } = data;
 
-  // 1. Fresh Breakout today (Yesterday High must be below PWH)
-  if (yestHigh >= pwh) return;
-
+  // 1. Fresh Breakout today (Yesterday Close must be below PWH)
+  if (yestClose >= pwh) return;
+   
   // 2. Price > PWH (with 1% buffer) & Price > Day Open
   const open = getDayOpen(tk);
   if (!open || open <= 0) return;

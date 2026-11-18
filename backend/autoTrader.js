@@ -58,36 +58,38 @@ async function loadSwingData() {
   if (!db) return;
   try {
     const { rows } = await db.query(`
-      WITH prev_week AS (
+      WITH ist_date AS (
+        SELECT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date AS today
+      ),
+      prev_week AS (
         SELECT token, MAX(day_high) AS pwh
-        FROM strategy_bs_snapshot
+        FROM strategy_bs_snapshot, ist_date
         WHERE strategy_id = 'momentum'
-          AND date >= date_trunc('week', CURRENT_DATE)::date - 7
-          AND date <  date_trunc('week', CURRENT_DATE)::date
+          AND date >= date_trunc('week', today)::date - 7
+          AND date <  date_trunc('week', today)::date
         GROUP BY token
       ),
-           prev_day AS (
+      prev_day AS (
         SELECT token, day_low AS pdl, day_close AS yest_close
-        FROM strategy_bs_snapshot
+        FROM strategy_bs_snapshot, ist_date
         WHERE strategy_id = 'momentum'
-          AND date = (SELECT MAX(date) FROM strategy_bs_snapshot WHERE date < CURRENT_DATE)
+          AND date = (SELECT MAX(date) FROM strategy_bs_snapshot WHERE date < today)
       )
       SELECT pw.token, pw.pwh, pd.pdl, pd.yest_close
       FROM prev_week pw
       JOIN prev_day pd ON pw.token = pd.token
     `);
     
-      swingData.clear();
-    bigPlayerEntered.clear(); // <--- Naya hafta, nayi entry allow karne ke liye
+    swingData.clear();
+    bigPlayerEntered.clear(); // Naya din/hafta start hone par fresh entry allow karega
     for (const r of rows) {
-       
       swingData.set(String(r.token), {
         pwh: +r.pwh,
         pdl: +r.pdl,
-        yestHigh: +r.yest_high
+        yestClose: +r.yest_close
       });
     }
-    console.log(`📊 Swing Data Loaded: ${swingData.size} tokens (PWH, PDL, YestHigh)`);
+    console.log(`📊 Swing Data Loaded: ${swingData.size} tokens (PWH, PDL, YestClose)`);
   } catch (e) {
     console.error('Swing data load failed:', e.message);
   }
@@ -154,9 +156,9 @@ function swingOnTick(tk, ltp) {
   if (ltp <= open) return;
   if (ltp < pwh * 1.01) return; 
 
-  // 3. RVOL >= 1
+   // 3. RVOL >= 0.95 (Rounding issues se bachne ke liye)
   const rvol = getRvol(tk);
-  if (rvol == null || Number(rvol) < 1) return;
+  if (rvol == null || Number(rvol) < 0.95) return;
 
   // All conditions met
   bigPlayerEntered.add(tk);

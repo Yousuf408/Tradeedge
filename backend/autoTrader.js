@@ -1,17 +1,16 @@
 /* ============================================================
-   autoTrader.js — v6.0 (Swing Trading Engine)
-   - Fresh Breakout Only (Yesterday High < PWH)
-   - Entry: LTP > PWH (1% buffer) + LTP > DayOpen + RVOL >= 1
+   autoTrader.js — v6.1 (Swing Trading Engine)
+   - Removed MAX_ENTRIES_PER_USER limit
+   - Open trades carry forward to next day (no clear)
+   - Date-wise DB tracking using entryDate
+   - Entry: LTP > PWH + LTP > DayOpen + RVOL >= 0.80
    - SL: PDL | Target: Entry * 1.04 (4%)
-   - Once Target Hit -> SL moves to Target
-   - No Auto Square-off (Swing Holding)
    ============================================================ */
 
-const MAX_ENTRIES_PER_USER = Number(process.env.MAX_ENTRIES || 10);
 const BIGPLAYER_ENTRY_END_MIN = Number(process.env.BIGPLAYER_ENTRY_END_MIN ?? 14 * 60 + 30);
 
-const bigPlayerEntered = new Set(); // token -> already entered today
-const swingData = new Map();        // token -> { pwh, pdl, yestHigh }
+const bigPlayerEntered = new Set(); 
+const swingData = new Map();        
 
 let db = null;
 let getJwt = null;
@@ -46,11 +45,10 @@ export function initAutoTrader(deps) {
   getRvol = deps.getRvol || (() => null);
   live = String(process.env.AUTO_TRADE).toLowerCase() === 'true';
 
-  console.log(`🤖 AutoTrader v6.0 (SWING) init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'}`);
+  console.log(`🤖 AutoTrader v6.1 (SWING) init — mode: ${live ? '🔴 LIVE' : '📝 PAPER'}`);
   
-  loadSwingData(); // Initial load
+  loadSwingData(); 
   scheduleSwingDataRefresh();
-  // startSquareOffWatch() removed for Swing Trading
 }
 
 /* ---------- DB: Load PWH, PDL, Yesterday High ---------- */
@@ -81,7 +79,7 @@ async function loadSwingData() {
     `);
     
     swingData.clear();
-    bigPlayerEntered.clear(); // Naya din/hafta start hone par fresh entry allow karega
+    bigPlayerEntered.clear(); 
     for (const r of rows) {
       swingData.set(String(r.token), {
         pwh: +r.pwh,
@@ -104,7 +102,7 @@ function scheduleSwingDataRefresh() {
   const ms = next9AM.getTime() - now.getTime();
   setTimeout(() => {
     loadSwingData().catch(() => {});
-    setInterval(() => loadSwingData().catch(() => {}), 24 * 60 * 60 * 1000); // every 24h
+    setInterval(() => loadSwingData().catch(() => {}), 24 * 60 * 60 * 1000); 
   }, ms);
 }
 
@@ -124,7 +122,7 @@ async function placeOrder({ token, sym, side, qty }) {
     body: JSON.stringify({
       variety: 'NORMAL', exchange: 'NSE', symboltoken: String(token),
       transactiontype: side, quantity: qty, ordertype: 'MARKET',
-      producttype: 'DELIVERY', // Changed to DELIVERY for Swing
+      producttype: 'DELIVERY', 
       duration: 'DAY', price: 0, squareoff: 0, stoploss: 0, tradingsymbol: sym
     })
   });
@@ -147,14 +145,14 @@ function swingOnTick(tk, ltp) {
   if (!data) return;
   const { pwh, pdl, yestClose } = data;
 
-  // 1. Fresh Breakout today (Yesterday Close must be below PWH)
+  // 1. Fresh Breakout today
   if (yestClose >= pwh) return;
    
   // 2. Price > PWH & Price > Day Open
   const open = getDayOpen(tk);
   if (!open || open <= 0) return;
   if (ltp <= open) return;
-  if (ltp <= pwh) return; // 1% buffer removed
+  if (ltp <= pwh) return; 
 
   // 3. RVOL >= 0.80
   const rvol = getRvol(tk);
@@ -168,8 +166,8 @@ function swingOnTick(tk, ltp) {
   placeEntries(tk, { 
     sym: symByToken[tk] || '?', 
     side: 'BUY', 
-    sl: pdl,              // SL = PDL
-    target: ltp * 1.04,   // Target = 4%
+    sl: pdl,              
+    target: ltp * 1.04,   
     strat: 'swing', 
     tag: 'SWING' 
   }, ltp).then(placed => {
@@ -181,11 +179,12 @@ function swingOnTick(tk, ltp) {
 }
 
 async function placeEntries(tk, o, ltp) {
+  // 🆕 Date change hui toh sirf liveOrdered clear hoga, positions nahi
   if (posDate !== todayIST()) {
-    positions.clear();
-    liveOrdered.clear();
+    liveOrdered.clear(); 
     posDate = todayIST();
   }
+  
   const users = await getUsers();
   let placed = 0;
 
@@ -193,16 +192,13 @@ async function placeEntries(tk, o, ltp) {
     const userMode = u.sideMode || 'MIX';
     if (userMode !== 'MIX' && userMode !== o.side) continue;
 
-    let userEntryCount = 0;
-    for (const p of positions.values()) if (p.userId === u.userId) userEntryCount++;
-    if (userEntryCount >= MAX_ENTRIES_PER_USER) continue;
+    // 🆕 MAX_ENTRIES_PER_USER logic removed
 
     const key = pkey(u.userId, tk, o.side);
     if (positions.has(key)) continue;
 
     const entryLtp = getLtp(tk) || ltp;
     const lev = getLev ? getLev('angelone', tk) : 1;
-    // Swing usually uses capital / LTP (no leverage), fallback to capital
     const qty = (lev && lev > 0) ? Math.floor((u.capital * lev) / entryLtp) : Math.floor(u.capital / entryLtp);
     if (qty < 1) continue;
 
@@ -215,6 +211,7 @@ async function placeEntries(tk, o, ltp) {
       stage: 0,
       status: 'open', reason: null, exitPrice: null,
       entryAt: new Date().toISOString(), exitAt: null,
+      entryDate: todayIST(), // 🆕 DB date tracking ke liye
       strat: o.strat
     };
     positions.set(key, pos);
@@ -232,7 +229,7 @@ async function placeEntries(tk, o, ltp) {
     } else if (!live) {
       console.log(`🤖 [PAPER] ${o.tag} ${pos.side} ${pos.sym} qty=${pos.qty} @${pos.entry} SL=${pos.sl} Tgt=${pos.target}`);
     }
-    savePos(pos, posDate).catch(() => {});
+    savePos(pos).catch(() => {});
   }
   return placed;
 }
@@ -263,7 +260,7 @@ export function onTickPos(token, ltp) {
         exitPosition(pos, ltp, pos.stage >= 1 ? 'TARGET_TRAIL' : 'SL');
         continue;
       }
-      if (changed) savePos(pos, posDate).catch(() => {});
+      if (changed) savePos(pos).catch(() => {});
       continue;
     }
   }
@@ -289,12 +286,15 @@ async function exitPosition(pos, price, reason) {
   } else if (!live) {
     console.log(`🤖 [PAPER] ${exitSide} (Exit) ${pos.sym} qty=${pos.qty} @${price} (${reason})`);
   }
-  savePos(pos, posDate).catch(() => {});
+  savePos(pos).catch(() => {});
 }
 
 /* ---------- DB PERSIST ---------- */
-async function savePos(p, date) {
+async function savePos(p) {
   if (!db) return;
+  // 🆕 Entry date use karega taaki purane open trade aaj ke date me duplicate na ho
+  const dateToSave = p.entryDate || posDate; 
+  
   await db.query(
     `INSERT INTO auto_positions
        (date, token, user_id, sym, qty, entry, sl, stage, peak, status, exit_price, exit_reason, entry_at, exit_at, updated_at, side)
@@ -303,7 +303,7 @@ async function savePos(p, date) {
        sl=EXCLUDED.sl, stage=EXCLUDED.stage, peak=EXCLUDED.peak,
        status=EXCLUDED.status, exit_price=EXCLUDED.exit_price,
        exit_reason=EXCLUDED.exit_reason, exit_at=EXCLUDED.exit_at, updated_at=NOW(), side=EXCLUDED.side`,
-    [date, p.token, p.userId, p.sym, p.qty, p.entry, p.sl, p.stage, p.entry,
+    [dateToSave, p.token, p.userId, p.sym, p.qty, p.entry, p.sl, p.stage, p.entry,
      p.status, p.exitPrice, p.reason, p.entryAt, p.exitAt, p.side || 'BUY']
   );
 }
@@ -311,25 +311,29 @@ async function savePos(p, date) {
 export async function loadOpenPositions(date, userId) {
   if (!db) return;
   try {
+    // 🆕 Date filter hataya taaki kal ke Open trades aaj bhi load hon
     const q = userId
-      ? { text: `SELECT * FROM auto_positions WHERE date=$1 AND user_id=$2 AND status='open'`, values: [date, userId] }
-      : { text: `SELECT * FROM auto_positions WHERE date=$1 AND status='open'`, values: [date] };
+      ? { text: `SELECT * FROM auto_positions WHERE user_id=$1 AND status='open'`, values: [userId] }
+      : { text: `SELECT * FROM auto_positions WHERE status='open'` };
     const { rows } = await db.query(q);
+    
     for (const r of rows) {
       positions.set(pkey(r.user_id || 'admin', String(r.token), r.side || 'BUY'), {
         userId: r.user_id || 'admin',
         token: String(r.token), sym: r.sym, qty: +r.qty,
         side: r.side || 'BUY',
         entry: +r.entry, sl: +r.sl,
-        stage: +r.stage, target: +r.entry * 1.04, // Recalculate target on load
+        stage: +r.stage, target: +r.entry * 1.04, 
         status: r.status, reason: r.exit_reason,
         exitPrice: r.exit_price != null ? +r.exit_price : null,
-        entryAt: r.entry_at, exitAt: r.exit_at, strat: 'swing'
+        entryAt: r.entry_at, exitAt: r.exit_at, 
+        entryDate: r.date ? r.date.toISOString().split('T')[0] : date, // 🆕 Purani date preserve karega
+        strat: 'swing'
       });
       bigPlayerEntered.add(String(r.token));
     }
     posDate = date;
-    console.log(`🤖 Positions loaded: ${rows.length} open`);
+    console.log(`🤖 Positions loaded: ${rows.length} open positions carried over.`);
   } catch (e) {
     console.error('🤖 Positions load failed:', e.message);
   }

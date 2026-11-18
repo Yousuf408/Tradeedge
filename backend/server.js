@@ -2274,7 +2274,13 @@ app.listen(PORT, async () => {
     perTrade: Number(process.env.AUTO_PER_TRADE || 25000),
     getDayOpen: (t) => bsCache.get(String(t))?.dayOpen ?? null,
     getUsers: buildAutoUsers,
-    getRvol: (t) => firstMinuteRvol.get(String(t)) ?? null,
+       getRvol: (t) => {
+      const tk = String(t);
+      const cum = lastWsVolume.get(tk) ?? bsCache.get(tk)?.volume ?? null;
+      const avg = avgVolume5D.get(tk) || 0;
+      return (cum != null && avg > 0) ? +(cum / avg).toFixed(2) : null;
+    },
+     
     getPrevClose: (t) => prevCloseCache.get(String(t)) ?? null   // ← ADDED: v5.1 requires this
   });
   await loadOpenPositions(getIST().toISOString().split('T')[0]);

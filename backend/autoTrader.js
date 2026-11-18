@@ -150,16 +150,16 @@ function swingOnTick(tk, ltp) {
   // 1. Fresh Breakout today (Yesterday Close must be below PWH)
   if (yestClose >= pwh) return;
    
-  // 2. Price > PWH (with 1% buffer) & Price > Day Open
+  // 2. Price > PWH & Price > Day Open
   const open = getDayOpen(tk);
   if (!open || open <= 0) return;
   if (ltp <= open) return;
-  if (ltp < pwh * 1.01) return; 
+  if (ltp <= pwh) return; // 1% buffer removed
 
-   // 3. RVOL >= 0.95 (Rounding issues se bachne ke liye)
+  // 3. RVOL >= 0.80
   const rvol = getRvol(tk);
-  if (rvol == null || Number(rvol) < 0.95) return;
-
+  if (rvol == null || Number(rvol) < 0.80) return;
+   
   // All conditions met
   bigPlayerEntered.add(tk);
   

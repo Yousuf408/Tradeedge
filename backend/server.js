@@ -998,12 +998,15 @@ app.get('/api/auto/positions', auth, async (req, res) => {
     const date = req.query.date || getIST().toISOString().split('T')[0];
     const uid = req.user?.id || req.user?.username || 'admin';
     
-    const { rows } = await db.query(
+     const { rows } = await db.query(
       `SELECT date::text AS date, token, sym, qty, entry, sl, stage, peak, side,
               status, exit_price, exit_reason, entry_at, exit_at
-       FROM auto_positions WHERE date=$1 AND user_id=$2 ORDER BY entry_at`,
+       FROM auto_positions 
+       WHERE (date=$1 AND user_id=$2) OR (status='open' AND user_id=$2) 
+       ORDER BY entry_at DESC`,
       [date, uid]
     );
+     
     const live = getPositions(uid);
     const out = rows.map(r => {
       const lp = live.find(p => p.token === String(r.token) && p.side === r.side);

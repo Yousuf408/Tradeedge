@@ -1010,7 +1010,7 @@ app.get('/api/auto/positions', auth, async (req, res) => {
     const live = getPositions(uid);
     const out = rows.map(r => {
       const lp = live.find(p => p.token === String(r.token) && p.side === r.side);
-      const ltp = getCachedLTP(String(r.token)) ?? null;
+      const ltp = getCachedLTP(String(r.token)) ?? bsCache.get(String(r.token))?.ltp ?? null;
       const ref = r.status === 'open' ? (ltp ?? +r.entry) : (r.exit_price != null ? +r.exit_price : +r.entry);
       const pnl = r.side === 'SELL' 
         ? +((+r.entry - ref) * r.qty).toFixed(2)

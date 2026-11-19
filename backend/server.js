@@ -1940,9 +1940,10 @@ async function autoFetchBS({ volumeOnly = false, silent = false } = {}) {
 
 async function buildAutoUsers() {
   const { rows: dbUsers } = await db.query(`SELECT id, username, side_mode FROM users`);
-  const users = [...userCapital.entries()].map(([userId, capital]) => {
-    const dbU = dbUsers.find(u => u.id === userId || u.username === userId);
-    return { userId, capital, sideMode: dbU?.side_mode || 'MIX' };
+  const users = dbUsers.map(dbU => {
+    const uid = String(dbU.id || dbU.username);
+    const capital = userCapital.get(uid) || userCapital.get(dbU.username) || Number(process.env.AUTO_PER_TRADE || 25000);
+    return { userId: uid, capital, sideMode: dbU.side_mode || 'MIX' };
   });
   if (!users.length) users.push({ userId: 'admin', capital: Number(process.env.AUTO_PER_TRADE || 25000), sideMode: 'MIX' });
   return users;

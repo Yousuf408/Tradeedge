@@ -327,7 +327,7 @@ export async function loadOpenPositions(date, userId) {
         status: r.status, reason: r.exit_reason,
         exitPrice: r.exit_price != null ? +r.exit_price : null,
         entryAt: r.entry_at, exitAt: r.exit_at, 
-        entryDate: r.date ? r.date.toISOString().split('T')[0] : date, // 🆕 Purani date preserve karega
+        entryDate: r.date ? new Date(r.date).toISOString().split('T')[0] : date, 
         strat: 'swing'
       });
       bigPlayerEntered.add(String(r.token));

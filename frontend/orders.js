@@ -1,5 +1,7 @@
 /* ============================================================
-   ORDERS.JS — v2.2 (Clean, Compact, Professional UI)
+   ORDERS.JS — v2.3 (Clean, Compact, Professional UI)
+   - Removed T1 / T2 columns completely
+   - Added Date + Time in the TIME column
    ============================================================ */
 
 let ORDERS_DATA = { date: null, total: 0, positions: [] };
@@ -56,7 +58,14 @@ function ordTime(d) {
   try {
     const dt = new Date(d);
     const ist = new Date(dt.getTime() + 5.5 * 3600 * 1000);
-    return ist.toISOString().slice(11, 16); // HH:MM
+    
+    // Format: DD-MMM HH:MM (e.g., 18-Nov 14:14)
+    const day = String(ist.getUTCDate()).padStart(2, '0');
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const month = months[ist.getUTCMonth()];
+    const time = ist.toISOString().slice(11, 16); // HH:MM
+    
+    return `${day}-${month} ${time}`;
   } catch { return '—'; }
 }
 
@@ -73,8 +82,7 @@ function ordShortINR(v) {
 // Clean State Column
 function ordState(p) {
   if (p.status === 'open') {
-    if (p.stage >= 3) return '<span style="color:#6C5CE7;font-weight:700">🟢 OPEN (T2 Trail)</span>';
-    if (p.stage === 2) return '<span style="color:#6C5CE7;font-weight:700">🟢 OPEN (T1 Trail)</span>';
+    if (p.stage >= 2) return '<span style="color:#6C5CE7;font-weight:700">🟢 OPEN (Trail)</span>';
     if (p.stage === 1) return '<span style="color:#F5A623;font-weight:700">🟢 OPEN (BE)</span>';
     return '<span style="color:var(--success);font-weight:700">🟢 OPEN</span>';
   }
@@ -124,8 +132,6 @@ function renderOrders() {
   /* ---- Positions Table ---- */
   const rows = ps.map(p => {
     const pnlCol = p.pnl > 0 ? 'var(--success)' : p.pnl < 0 ? 'var(--danger)' : 'var(--text-secondary)';
-    const t1hit = (p.stage >= 2 || (p.exitPrice != null && p.exitPrice >= p.t1));
-    const t2hit = (p.stage >= 3 || (p.exitPrice != null && p.exitPrice >= p.t2));
     
     const isShort = p.side === 'SELL';
     const typeText = isShort ? 'SHORT' : 'LONG';
@@ -145,8 +151,6 @@ function renderOrders() {
       <td style="padding:6px 8px; font-weight:700;">${ordINR(p.entry)}</td>
       <td style="padding:6px 8px;">${p.ltp ? ordINR(p.ltp) : '—'}</td>
       <td style="padding:6px 8px; color:#F5A623; font-weight:700;">${ordINR(p.slLive ?? p.sl)}</td>
-      <td style="padding:6px 8px; color:${t1hit ? 'var(--success)' : 'var(--text-muted)'}">${ordINR(p.t1)} ${t1hit ? '✓' : ''}</td>
-      <td style="padding:6px 8px; color:${t2hit ? 'var(--success)' : 'var(--text-muted)'}">${ordINR(p.t2)} ${t2hit ? '✓' : ''}</td>
       <td style="padding:6px 8px; color:var(--text-muted); font-size:11px;">${ordINR(capitalUsed)}</td>
       <td style="padding:6px 8px; color:${pnlCol}; font-weight:800;">
         ${p.pnl >= 0 ? '+' : ''}${ordINR(p.pnl)} <br>
@@ -159,22 +163,20 @@ function renderOrders() {
   wrap.innerHTML = `<table class="table-modern" style="width:100%; text-align:left; border-collapse:collapse;">
     <thead>
       <tr style="border-bottom:1px solid var(--border-soft); color:var(--text-muted); font-size:11px;">
-        <th style="padding:8px 8px;">TIME</th>
+        <th style="padding:8px 8px;">DATE / TIME</th>
         <th style="padding:8px 8px;">STOCK</th>
         <th style="padding:8px 8px;">TYPE</th>
         <th style="padding:8px 8px;">QTY</th>
         <th style="padding:8px 8px;">ENTRY</th>
         <th style="padding:8px 8px;">LTP</th>
         <th style="padding:8px 8px;">SL (live)</th>
-        <th style="padding:8px 8px;">T1</th>
-        <th style="padding:8px 8px;">T2</th>
         <th style="padding:8px 8px;">VALUE</th>
         <th style="padding:8px 8px;">NET P&L</th>
         <th style="padding:8px 8px;">STATE / EXIT</th>
       </tr>
     </thead>
     <tbody>
-      ${rows || `<tr><td colspan="12" style="text-align:center;padding:40px;color:var(--text-muted);font-size:12px;">
+      ${rows || `<tr><td colspan="10" style="text-align:center;padding:40px;color:var(--text-muted);font-size:12px;">
       No positions found.
     </td></tr>`}
     </tbody>

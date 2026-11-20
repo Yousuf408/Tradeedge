@@ -57,6 +57,7 @@ import {
 
 import { registerAdminRoutes } from './admin.js';
 import { registerFifteenRoutes } from './fifteen.js';
+import { registerBtstRoutes } from './btstRoutes.js'; 
 import { generateAIPlan } from './aiAnalyzer.js';
 
 import {
@@ -2234,6 +2235,7 @@ registerFifteenRoutes(app, {
   getHistoricalRunning: () => historicalRunning
 });
 
+registerBtstRoutes(app, db);  
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server on port ${PORT} — v5.53 (Ultra Clean)`);

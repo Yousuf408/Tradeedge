@@ -351,8 +351,9 @@ body.impersonating .main-col { padding-top:42px; }
   <ul class="nav-links">
     <li><a class="active" data-page="screener" title="Screener"><span class="ni">🔍</span><span class="nl">Screener</span></a></li>
     <li><a data-page="orders" title="Orders"><span class="ni">📋</span><span class="nl">Orders</span></a></li>
-    <li><a data-page="ai" title="AI Picks"><span class="ni">🧠</span><span class="nl">AI Picks</span></a></li>
+      <li><a data-page="ai" title="AI Picks"><span class="ni">🧠</span><span class="nl">AI Picks</span></a></li>
     <li><a data-page="sectors" title="Sectors"><span class="ni">🏢</span><span class="nl">Sectors</span></a></li>
+    <li><a data-page="btst" title="BTST Scanner"><span class="ni">🎯</span><span class="nl">BTST Scanner</span></a></li> <!-- ADD THIS LINE -->
     <li class="admin-only" style="display:none"><a data-page="users" title="Users"><span class="ni">👥</span><span class="nl">Users</span></a></li>
     <li><a data-page="settings" title="Settings"><span class="ni">⚙️</span><span class="nl">Settings</span></a></li>
   </ul>
@@ -402,6 +403,10 @@ body.impersonating .main-col { padding-top:42px; }
   <!-- 5.0 — SECTORS (standalone page in iframe) -->
   <div id="page-sectors" class="page">
     <iframe src="/sectors.html" style="width:100%;height:calc(100vh - 76px);border:0;border-radius:12px;display:block;margin-top:-6px"></iframe>
+  </div>
+  <!-- 5.0.1 — BTST SCANNER (standalone page in iframe) -->
+  <div id="page-btst" class="page">
+    <iframe src="/btst.html" style="width:100%;height:calc(100vh - 76px);border:0;border-radius:12px;display:block;margin-top:-6px"></iframe>
   </div>
   <!-- 5.1 — SCREENER -->
   <div id="page-screener" class="page active">

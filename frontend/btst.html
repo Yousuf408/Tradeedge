@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BTST Scanner — TradeAlgo Pro</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-main: #0f111a;
+      --bg-card: #181b26;
+      --border: #2a2e3d;
+      --text-main: #e2e8f0;
+      --text-muted: #94a3b8;
+      --brand: #6C5CE7;
+      --success: #10b981;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+    }
+    
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
+    
+    body {
+      background-color: var(--bg-main);
+      color: var(--text-main);
+      padding: 16px;
+      font-size: 13px;
+    }
+
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+
+    input[type="date"] {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-family: inherit;
+      outline: none;
+    }
+
+    .btn {
+      padding: 8px 16px;
+      border-radius: 8px;
+      border: none;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: 0.2s;
+    }
+
+    .btn-primary { background: var(--brand); color: white; }
+    .btn-primary:hover { background: #5a4bcf; }
+    
+    .btn-live { background: var(--success); color: white; }
+    .btn-live.active { background: var(--danger); }
+    
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    .summary {
+      display: flex;
+      gap: 16px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      padding: 12px 16px;
+      border-radius: 10px;
+      min-width: 120px;
+    }
+
+    .card-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .card-val {
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    .table-wrap {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+    }
+
+    th {
+      background: #141722;
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 12px;
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    tr:hover td { background: rgba(255,255,255,0.02); }
+
+    .sym { font-weight: 700; color: var(--text-main); }
+    
+    .badge {
+      padding: 3px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .b-yes { background: rgba(16, 185, 129, 0.15); color: var(--success); }
+    .b-no { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
+    .b-wait { background: rgba(245, 158, 11, 0.15); color: var(--warning); }
+    .b-warn { background: rgba(245, 158, 11, 0.15); color: var(--warning); }
+
+    .pos { color: var(--success); }
+    .neg { color: var(--danger); }
+  </style>
+</head>
+<body>
+
+  <div class="controls">
+    <input type="date" id="scanDate">
+    <button class="btn btn-primary" id="scanBtn">🔍 Scan</button>
+    <button class="btn btn-live" id="liveBtn">📡 Live Monitor: OFF</button>
+    <span id="liveStatus" style="color:var(--text-muted); font-size:12px; margin-left: 8px;"></span>
+  </div>
+
+  <div class="summary" id="summary"></div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Stock</th>
+          <th>Mother High</th>
+          <th>Mother Low</th>
+          <th>Inside Range</th>
+          <th>Days Inside</th>
+          <th>Change %</th>
+          <th>T+1 %</th>
+          <th>Breakout Time</th>
+          <th>RVOL</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="11" style="text-align:center; padding: 40px; color: var(--text-muted);">Select a date and click Scan.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <script src="btst.js"></script>
+</body>
+</html>

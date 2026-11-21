@@ -1,25 +1,37 @@
 /* ============================================================
-   BTST Frontend Logic (btst.js)
+   BTST Frontend Logic (btst.js) - Strict SQL Match
    ============================================================ */
 
 const API = ''; // Assuming same origin
-const getToken = () => localStorage.getItem('token') || '';
+// Robust token getter for iframe context
+const getToken = () => localStorage.getItem('ta_token') || localStorage.getItem('token') || '';
 
 const $ = id => document.getElementById(id);
 const today = () => new Date().toISOString().slice(0, 10);
 const fmt = (v, d = 2) => v === null || v === undefined ? '—' : Number(v).toFixed(d);
 const pctClass = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
 
+// Convert raw UTC timestamp to "YYYY-MM-DD HH:MM:SS" exactly like SQL
+const formatFullTime = (ts) => {
+  if (!ts) return '—';
+  try {
+    const d = new Date(ts);
+    // Convert to IST (+5.5 hours)
+    const ist = new Date(d.getTime() + 5.5 * 3600 * 1000);
+    return ist.toISOString().replace('T', ' ').slice(0, 19);
+  } catch { return '—'; }
+};
+
 let scanData = [];
 let liveSSE = null;
-let motherHighMap = {}; // token -> { mother_high, trEl }
+let motherHighMap = {}; // token -> { mother_high, trEl, badgeEl }
 
 $('scanDate').value = today();
 
 // ─── 1. RUN SCAN ──────────────────────────────────────────
 async function runScan() {
   const date = $('scanDate').value;
-  $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 20px; color: var(--text-muted);">Scanning ${date}... (this may take a few seconds)</td></tr>`;
+  $('tbody').innerHTML = `<tr><td colspan="10" style="text-align:center; padding: 20px; color: var(--text-muted);">Scanning ${date}... (this may take a few seconds)</td></tr>`;
   
   try {
     const res = await fetch(`${API}/api/btst/scan?date=${date}`, {
@@ -36,7 +48,7 @@ async function runScan() {
     $('liveStatus').textContent = json.isLive ? 'Ready for Live Monitor' : `Backtest mode (${date})`;
     
   } catch (e) {
-    $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 20px; color: var(--danger);">Error: ${e.message}</td></tr>`;
+    $('tbody').innerHTML = `<tr><td colspan="10" style="text-align:center; padding: 20px; color: var(--danger);">Error: ${e.message}</td></tr>`;
   }
 }
 
@@ -44,7 +56,7 @@ async function runScan() {
 function render({ data, date, isLive, scanMs }) {
   // Summary Cards
   const total = data.length;
-  const broke = data.filter(d => d.breakout_time_ist).length;
+  const broke = data.filter(d => d.breakout_ts).length;
   const confirmed = data.filter(d => d.is_breakout === 'Yes').length;
   
   let sumChg = 0, validChg = 0;
@@ -78,15 +90,16 @@ function render({ data, date, isLive, scanMs }) {
 
   // Table Rows
   if (!data.length) {
-    $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 40px; color: var(--text-muted);">No Inside Bar setups found for this date.</td></tr>`;
+    $('tbody').innerHTML = `<tr><td colspan="10" style="text-align:center; padding: 40px; color: var(--text-muted);">No Inside Bar setups found for this date.</td></tr>`;
     return;
   }
 
   $('tbody').innerHTML = data.map((d, i) => {
-    let badge = `<span class="badge b-no">❌ No Breakout</span>`;
+    // Generate Action Badge
+    let badge = `<span class="badge b-no">❌ No</span>`;
     if (d.is_breakout === 'Yes') {
-      badge = `<span class="badge b-yes">✅ BUY (Confirmed)</span>`;
-    } else if (d.breakout_time_ist) {
+      badge = `<span class="badge b-yes">✅ Yes (Confirmed)</span>`;
+    } else if (d.breakout_ts) {
       badge = `<span class="badge b-warn">⚠️ False Break</span>`;
     } else if (isLive) {
       badge = `<span class="badge b-wait">⏳ Waiting</span>`;
@@ -94,26 +107,22 @@ function render({ data, date, isLive, scanMs }) {
 
     // Store reference for live updating
     motherHighMap[d.token] = { 
-      mother_high: d.mother_high, 
+      mother_high: Number(d.mother_high), 
       trEl: null, 
       badgeEl: null 
     };
 
     return `<tr data-token="${d.token}">
       <td>${i + 1}</td>
-      <td>
-        <span class="sym">${d.sym}</span>
-        <div style="font-size: 10px; color: var(--text-muted);">${d.token}</div>
-      </td>
-      <td><strong>₹${fmt(d.mother_high)}</strong></td>
-      <td>₹${fmt(d.mother_low)}</td>
-      <td>${fmt(d.inside_low)} – ${fmt(d.inside_high)}</td>
-      <td>${d.days_inside}</td>
+      <td><span class="sym">${d.sym}</span></td>
+      <td>${d.mother_date || '—'}</td>
       <td class="${pctClass(d.change_pct)}">${d.change_pct != null ? d.change_pct + '%' : '—'}</td>
       <td class="${pctClass(d.t1_pct)}">${d.t1_pct != null ? d.t1_pct + '%' : '—'}</td>
-      <td>${d.breakout_time_ist || '—'}</td>
-      <td>${d.breakout_rvol != null ? fmt(d.breakout_rvol, 1) + 'x' : '—'}</td>
+      <td>${d.breakout_rvol != null ? fmt(d.breakout_rvol, 2) + 'x' : '—'}</td>
+      <td>${formatFullTime(d.breakout_ts)}</td>
       <td class="action-cell">${badge}</td>
+      <td>₹${fmt(d.mother_high)}</td>
+      <td>${d.days_inside}</td>
     </tr>`;
   }).join('');
 
@@ -152,6 +161,13 @@ function toggleLive() {
   $('liveStatus').textContent = 'Connecting to live feed...';
   
   const token = getToken();
+  if (!token) {
+    $('liveStatus').textContent = '🔴 Auth token missing. Cannot start stream.';
+    btn.textContent = '📡 Live Monitor: OFF';
+    btn.classList.remove('active');
+    return;
+  }
+
   const url = `${API}/api/screener/stream?token=${encodeURIComponent(token)}`;
   
   liveSSE = new EventSource(url);

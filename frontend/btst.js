@@ -1,9 +1,10 @@
 /* ============================================================
-   BTST Frontend Logic (btst.js) - Auto Live Feed + SQL Match
+   BTST Frontend Logic (btst.js) - Auto Live Feed + Auto Trade
    ============================================================ */
 
 const API = ''; // Assuming same origin
 const getToken = () => localStorage.getItem('ta_token') || localStorage.getItem('token') || '';
+const getUserId = () => localStorage.getItem('ta_user') || localStorage.getItem('username') || 'admin';
 
 const $ = id => document.getElementById(id);
 const today = () => new Date().toISOString().slice(0, 10);
@@ -22,18 +23,18 @@ const formatDateTimeNoSec = (ts) => {
   try {
     const d = new Date(ts);
     const ist = new Date(d.getTime() + 5.5 * 3600 * 1000);
-    return ist.toISOString().replace('T', ' ').slice(0, 16); // YYYY-MM-DD HH:MM
+    return ist.toISOString().replace('T', ' ').slice(0, 16);
   } catch { return '—'; }
 };
 
 let scanData = [];
 let liveSSE = null;
-let latestTicks = {}; // Keeps track of last known LTPs
-let motherHighMap = {}; // token -> { mother_high, trEl, badgeEl, ltpEl }
+let latestTicks = {}; 
+let motherHighMap = {}; 
 
 $('scanDate').value = today();
 
-// ─── 1. LIVE SSE CONNECTION (Auto-Connect) ────────────────
+// ─── 1. LIVE SSE CONNECTION ───────────────────────────────
 function startSSE() {
   if (liveSSE) return;
   const token = getToken();
@@ -55,9 +56,7 @@ function startSSE() {
     try {
       const msg = JSON.parse(e.data);
       if (msg.type === 'ltp' && msg.ticks) {
-        // Save latest ticks
         Object.assign(latestTicks, msg.ticks);
-        // Update DOM if we have data
         updateLiveUI(msg.ticks);
       }
     } catch (err) {}
@@ -77,24 +76,19 @@ function updateLiveUI(ticks) {
     const data = motherHighMap[token];
     if (!data || !data.trEl) continue;
 
-    // 1. Update LTP cell
     if (data.ltpEl) {
       data.ltpEl.textContent = '₹' + (+price).toFixed(2);
     }
 
-    // 2. Check for breakout (only if currently waiting/no breakout)
     if (price > data.mother_high && !data.trEl.classList.contains('live-broken')) {
       data.trEl.classList.add('live-broken');
       anyBreakout = true;
-
       data.badgeEl.innerHTML = `<span class="badge b-yes" style="background: var(--warning); color: #000; animation: pulse 1.5s infinite;">🚀 BREAKOUT!</span>`;
       data.trEl.style.backgroundColor = 'rgba(245, 158, 11, 0.1)';
     }
   }
 
-  if (anyBreakout) {
-    document.title = `🚀 BREAKOUT DETECTED!`;
-  }
+  if (anyBreakout) document.title = `🚀 BREAKOUT DETECTED!`;
 }
 
 // ─── 3. RUN SCAN ──────────────────────────────────────────
@@ -111,7 +105,7 @@ async function runScan() {
     if (!json.success) throw new Error(json.error);
     
     scanData = json.data;
-    motherHighMap = {}; // reset
+    motherHighMap = {}; 
     
     render(json);
     
@@ -155,7 +149,6 @@ function render({ data, isLive, scanMs }) {
       badge = `<span class="badge b-wait">⏳ Waiting</span>`;
     }
 
-    // Get current LTP from our live cache if available
     const currentLtp = latestTicks[d.token] ? '₹' + (+latestTicks[d.token]).toFixed(2) : '—';
 
     motherHighMap[d.token] = { mother_high: Number(d.mother_high), trEl: null, badgeEl: null, ltpEl: null };
@@ -175,7 +168,6 @@ function render({ data, isLive, scanMs }) {
     </tr>`;
   }).join('');
 
-  // Cache elements for real-time updates
   document.querySelectorAll('#tbody tr').forEach(tr => {
     const token = tr.dataset.token;
     if (motherHighMap[token]) {
@@ -186,10 +178,86 @@ function render({ data, isLive, scanMs }) {
   });
 }
 
-// ─── 5. EVENTS & INIT ─────────────────────────────────────
+// ─── 5. AUTO-TRADE CONTROLS ───────────────────────────────
+$('startAutoBtn').addEventListener('click', async () => {
+  if (!scanData || scanData.length === 0) {
+    alert('Please scan a date first to load the watchlist.');
+    return;
+  }
+
+  const mode = $('tradeMode').value;
+  const product = $('productType').value;
+  const qty = parseInt($('tradeQty').value) || 1;
+
+  if (mode === 'REAL') {
+    const confirmReal = confirm(`⚠️ WARNING: You are about to place REAL money orders via Kotak Neo.\n\nQty: ${qty}\nProduct: ${product}\n\nAre you sure?`);
+    if (!confirmReal) return;
+  }
+
+  // Only send stocks that haven't broken out yet
+  const stocksToTrade = scanData.filter(d => d.is_breakout !== 'Yes').map(d => ({
+    sym: d.sym,
+    token: d.token,
+    mother_high: d.mother_high
+  }));
+
+  if (stocksToTrade.length === 0) {
+    alert('All stocks in this scan have already broken out. Scan a new date/watchlist.');
+    return;
+  }
+
+  try {
+    const res = await fetch(`${API}/api/btst/start`, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + getToken()
+      },
+      body: JSON.stringify({
+        userId: getUserId(),
+        stocks: stocksToTrade,
+        config: { tradeMode: mode, productType: product, qty: qty }
+      })
+    });
+    
+    const json = await res.json();
+    if (json.success) {
+      $('startAutoBtn').style.display = 'none';
+      $('stopAutoBtn').style.display = 'inline-flex';
+      $('liveStatus').innerHTML = `<span style="color: var(--warning); font-weight: 700;">🚀 Auto-Trading ACTIVE (${mode} - ${product})</span>`;
+    } else {
+      alert('Error: ' + json.error);
+    }
+  } catch (err) {
+    alert('Failed to start Auto-Trade: ' + err.message);
+  }
+});
+
+$('stopAutoBtn').addEventListener('click', async () => {
+  try {
+    const res = await fetch(`${API}/api/btst/stop`, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + getToken()
+      },
+      body: JSON.stringify({ userId: getUserId() })
+    });
+    
+    if (res.ok) {
+      $('startAutoBtn').style.display = 'inline-flex';
+      $('stopAutoBtn').style.display = 'none';
+      $('liveStatus').innerHTML = `<span style="color: var(--success);">🟢 Live Feed Connected (Auto-Trade Stopped)</span>`;
+    }
+  } catch (err) {
+    alert('Failed to stop Auto-Trade: ' + err.message);
+  }
+});
+
+// ─── 6. INIT ──────────────────────────────────────────────
 $('scanBtn').addEventListener('click', runScan);
 
 window.addEventListener('load', () => {
-  startSSE(); // Start WebSocket/SSE immediately on page load
-  runScan();  // Load today's data
+  startSSE(); 
+  runScan();  
 });

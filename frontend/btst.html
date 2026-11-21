@@ -5,28 +5,46 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>BTST Scanner — TradeAlgo Pro</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <!-- ADDED: Load main app styles so it inherits the theme colors -->
-  <link rel="stylesheet" href="styles.css" />
   
   <script>
-    // ADDED: Sync theme with main app
+    // 1. Set theme on load
     (function() {
       const saved = localStorage.getItem('ta_theme') || 'light';
       document.documentElement.setAttribute('data-theme', saved);
     })();
+
+    // 2. Listen for real-time theme changes from the main app
+    window.addEventListener('storage', (e) => {
+      if (e.key === 'ta_theme') {
+        document.documentElement.setAttribute('data-theme', e.newValue);
+      }
+    });
   </script>
 
   <style>
-    /* MAPPED TO MAIN APP VARIABLES (so light/dark mode works automatically) */
+    /* LIGHT & DARK MODE VARIABLES */
+    [data-theme="light"] {
+      --bg-main: #f8fafc;
+      --bg-card: #ffffff;
+      --border: #e2e8f0;
+      --text-main: #0f172a;
+      --text-muted: #64748b;
+      --hover-bg: rgba(0, 0, 0, 0.03);
+    }
+
+    [data-theme="dark"] {
+      --bg-main: #0f111a;
+      --bg-card: #181b26;
+      --border: #2a2e3d;
+      --text-main: #e2e8f0;
+      --text-muted: #94a3b8;
+      --hover-bg: rgba(255, 255, 255, 0.02);
+    }
+
     :root {
-      --bg-main: var(--bg-primary, #0f111a);
-      --bg-card: var(--bg-secondary, #181b26);
-      --border: var(--border-soft, #2a2e3d);
-      --text-main: var(--text-primary, #e2e8f0);
-      --text-muted: var(--text-muted, #94a3b8);
-      --brand: var(--brand, #6C5CE7);
-      --success: var(--success, #10b981);
-      --danger: var(--danger, #ef4444);
+      --brand: #6C5CE7;
+      --success: #10b981;
+      --danger: #ef4444;
       --warning: #f59e0b;
     }
     
@@ -135,7 +153,7 @@
       white-space: nowrap;
     }
 
-    tr:hover td { background: rgba(128, 128, 128, 0.05); }
+    tr:hover td { background: var(--hover-bg); }
 
     .sym { font-weight: 700; color: var(--text-main); }
     

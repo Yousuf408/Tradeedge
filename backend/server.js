@@ -1039,9 +1039,32 @@ app.get('/api/screener/margins', auth, (req, res) => {
   res.json({ ok: true, status: getMarginStatus() });
 });
 
+app.post('/api/user/broker-credentials', auth, async (req, res) => {
+  const { broker, client_id, user_api_key, totp_secret, mpin } = req.body;
+  const username = req.user.username || req.user.name; // From your JWT token
+
+  try {
+    await db.query(`
+      INSERT INTO broker_credentials (username, broker, client_id, user_api_key, totp_secret, mpin)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (username, broker) DO UPDATE SET
+        client_id = EXCLUDED.client_id,
+        user_api_key = EXCLUDED.user_api_key,
+        totp_secret = EXCLUDED.totp_secret,
+        mpin = EXCLUDED.mpin
+    `, [username, broker, client_id, user_api_key, totp_secret, mpin]);
+    
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Save Credentials Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/screener/stream', (req, res) => {
   const token = req.query.token;
-  if (!token) return res.status(401).end();
+     
+   if (!token) return res.status(401).end();
   try { jwt.verify(token, SECRET); } catch { return res.status(401).end(); }
 
   res.setHeader('Content-Type', 'text/event-stream');

@@ -656,24 +656,43 @@ Rahul Verma,9876543212,5d"></textarea>
 
     <div class="panel-glass">
       <div class="panel-head"><h3>🔌 Broker Connection</h3></div>
-      <div class="panel-body">
+            <div class="panel-body">
         <div class="settings-group">
           <label>Select Broker</label>
           <select id="brokerSelect" onchange="toggleBrokerFields()">
             <option value="">— Choose —</option>
             <option value="dhan" selected>Dhan</option>
+            <option value="kotak">Kotak Neo</option> <!-- ADDED KOTAK -->
             <option value="zerodha">Zerodha</option>
             <option value="fyers">Fyers</option>
             <option value="upstox">Upstox</option>
           </select>
         </div>
+
+        <!-- DHAN FIELDS -->
         <div id="dhanFields" class="broker-fields">
-          <div class="field-group field-full"><label>Client ID</label><input type="text" placeholder="Your Dhan Client ID" /></div>
-          <div class="field-group"><label>TOTP</label><input type="text" placeholder="Your Dhan TOTP secret" /></div>
-          <div class="field-group"><label>PIN</label><input type="password" placeholder="Your Dhan PIN" /></div>
-          <div class="field-group field-full"><label>Secret Key</label><input type="password" placeholder="Your Dhan Secret Key" /></div>
+          <div class="field-group field-full"><label>Client ID</label><input type="text" id="dhanClientId" placeholder="Your Dhan Client ID" /></div>
+          <div class="field-group"><label>TOTP</label><input type="text" id="dhanTotp" placeholder="Your Dhan TOTP secret" /></div>
+          <div class="field-group"><label>PIN</label><input type="password" id="dhanPin" placeholder="Your Dhan PIN" /></div>
+          <div class="field-group field-full"><label>Secret Key</label><input type="password" id="dhanSecret" placeholder="Your Dhan Secret Key" /></div>
         </div>
-        <div id="otherBrokerFields"><p>🔑 Enter credentials for your selected broker.</p></div>
+
+        <!-- KOTAK FIELDS (NEW) -->
+        <div id="kotakFields" class="broker-fields" style="display:none;">
+          <div class="field-group"><label>Mobile Number</label><input type="text" id="kotakMobile" placeholder="+919876543210" /></div>
+          <div class="field-group"><label>UCC (Client Code)</label><input type="text" id="kotakUcc" placeholder="e.g. AB123" /></div>
+          <div class="field-group field-full"><label>API Access Token</label><input type="text" id="kotakApiKey" placeholder="Paste the UUID from Kotak API Dashboard" /></div>
+          <div class="field-group"><label>TOTP Secret</label><input type="password" id="kotakTotpSecret" placeholder="Setup key from Authenticator" /></div>
+          <div class="field-group"><label>MPIN</label><input type="password" id="kotakMpin" placeholder="6-digit trading PIN" /></div>
+        </div>
+
+        <!-- OTHER BROKERS -->
+        <div id="otherBrokerFields" style="display:none;"><p>🔑 Enter credentials for your selected broker.</p></div>
+
+        <!-- SAVE BUTTON -->
+        <div style="margin-top: 20px;">
+          <button class="btn btn-primary" onclick="saveBrokerDetails()">💾 Save Broker Details</button>
+        </div>
       </div>
     </div>
 

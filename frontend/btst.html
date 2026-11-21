@@ -132,6 +132,7 @@
       border-radius: 12px;
       font-size: 11px;
       font-weight: 700;
+      display: inline-block;
     }
     .b-yes { background: rgba(16, 185, 129, 0.15); color: var(--success); }
     .b-no { background: rgba(239, 68, 68, 0.15); color: var(--danger); }
@@ -140,6 +141,8 @@
 
     .pos { color: var(--success); }
     .neg { color: var(--danger); }
+    
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
   </style>
 </head>
 <body>
@@ -158,20 +161,19 @@
       <thead>
         <tr>
           <th>#</th>
-          <th>Stock</th>
-          <th>Mother High</th>
-          <th>Mother Low</th>
-          <th>Inside Range</th>
-          <th>Days Inside</th>
-          <th>Change %</th>
+          <th>sym</th>
+          <th>mother_date</th>
+          <th>change_pct</th>
           <th>T+1 %</th>
-          <th>Breakout Time</th>
-          <th>RVOL</th>
-          <th>Action</th>
+          <th>breakout_rvol</th>
+          <th>breakout_time</th>
+          <th>is_breakout</th>
+          <th>mother_high</th>
+          <th>days_inside</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td colspan="11" style="text-align:center; padding: 40px; color: var(--text-muted);">Select a date and click Scan.</td></tr>
+        <tr><td colspan="10" style="text-align:center; padding: 40px; color: var(--text-muted);">Select a date and click Scan.</td></tr>
       </tbody>
     </table>
   </div>

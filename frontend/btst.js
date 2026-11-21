@@ -1,9 +1,8 @@
 /* ============================================================
-   BTST Frontend Logic (btst.js) - Strict SQL Match
+   BTST Frontend Logic (btst.js) - Auto Live Feed + SQL Match
    ============================================================ */
 
 const API = ''; // Assuming same origin
-// Robust token getter for iframe context
 const getToken = () => localStorage.getItem('ta_token') || localStorage.getItem('token') || '';
 
 const $ = id => document.getElementById(id);
@@ -11,27 +10,97 @@ const today = () => new Date().toISOString().slice(0, 10);
 const fmt = (v, d = 2) => v === null || v === undefined ? '—' : Number(v).toFixed(d);
 const pctClass = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
 
-// Convert raw UTC timestamp to "YYYY-MM-DD HH:MM:SS" exactly like SQL
-const formatFullTime = (ts) => {
+// Format "YYYY-MM-DD" (removes the T00:00:00Z)
+const formatDateOnly = (dateStr) => {
+  if (!dateStr) return '—';
+  return String(dateStr).split('T')[0]; 
+};
+
+// Format "YYYY-MM-DD HH:MM" (removes seconds)
+const formatDateTimeNoSec = (ts) => {
   if (!ts) return '—';
   try {
     const d = new Date(ts);
-    // Convert to IST (+5.5 hours)
     const ist = new Date(d.getTime() + 5.5 * 3600 * 1000);
-    return ist.toISOString().replace('T', ' ').slice(0, 19);
+    return ist.toISOString().replace('T', ' ').slice(0, 16); // YYYY-MM-DD HH:MM
   } catch { return '—'; }
 };
 
 let scanData = [];
 let liveSSE = null;
-let motherHighMap = {}; // token -> { mother_high, trEl, badgeEl }
+let latestTicks = {}; // Keeps track of last known LTPs
+let motherHighMap = {}; // token -> { mother_high, trEl, badgeEl, ltpEl }
 
 $('scanDate').value = today();
 
-// ─── 1. RUN SCAN ──────────────────────────────────────────
+// ─── 1. LIVE SSE CONNECTION (Auto-Connect) ────────────────
+function startSSE() {
+  if (liveSSE) return;
+  const token = getToken();
+  if (!token) {
+    $('liveStatus').textContent = '🔴 Auth token missing';
+    $('liveStatus').style.color = 'var(--danger)';
+    return;
+  }
+
+  const url = `${API}/api/screener/stream?token=${encodeURIComponent(token)}`;
+  liveSSE = new EventSource(url);
+  
+  liveSSE.onopen = () => {
+    $('liveStatus').textContent = '🟢 Live Feed Connected';
+    $('liveStatus').style.color = 'var(--success)';
+  };
+
+  liveSSE.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'ltp' && msg.ticks) {
+        // Save latest ticks
+        Object.assign(latestTicks, msg.ticks);
+        // Update DOM if we have data
+        updateLiveUI(msg.ticks);
+      }
+    } catch (err) {}
+  };
+
+  liveSSE.onerror = () => {
+    $('liveStatus').textContent = '🔴 Reconnecting...';
+    $('liveStatus').style.color = 'var(--warning)';
+  };
+}
+
+// ─── 2. UPDATE DOM IN REAL-TIME ───────────────────────────
+function updateLiveUI(ticks) {
+  let anyBreakout = false;
+  
+  for (const [token, price] of Object.entries(ticks)) {
+    const data = motherHighMap[token];
+    if (!data || !data.trEl) continue;
+
+    // 1. Update LTP cell
+    if (data.ltpEl) {
+      data.ltpEl.textContent = '₹' + (+price).toFixed(2);
+    }
+
+    // 2. Check for breakout (only if currently waiting/no breakout)
+    if (price > data.mother_high && !data.trEl.classList.contains('live-broken')) {
+      data.trEl.classList.add('live-broken');
+      anyBreakout = true;
+
+      data.badgeEl.innerHTML = `<span class="badge b-yes" style="background: var(--warning); color: #000; animation: pulse 1.5s infinite;">🚀 BREAKOUT!</span>`;
+      data.trEl.style.backgroundColor = 'rgba(245, 158, 11, 0.1)';
+    }
+  }
+
+  if (anyBreakout) {
+    document.title = `🚀 BREAKOUT DETECTED!`;
+  }
+}
+
+// ─── 3. RUN SCAN ──────────────────────────────────────────
 async function runScan() {
   const date = $('scanDate').value;
-  $('tbody').innerHTML = `<tr><td colspan="10" style="text-align:center; padding: 20px; color: var(--text-muted);">Scanning ${date}... (this may take a few seconds)</td></tr>`;
+  $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 20px; color: var(--text-muted);">Scanning ${date}... (this may take a few seconds)</td></tr>`;
   
   try {
     const res = await fetch(`${API}/api/btst/scan?date=${date}`, {
@@ -45,16 +114,14 @@ async function runScan() {
     motherHighMap = {}; // reset
     
     render(json);
-    $('liveStatus').textContent = json.isLive ? 'Ready for Live Monitor' : `Backtest mode (${date})`;
     
   } catch (e) {
-    $('tbody').innerHTML = `<tr><td colspan="10" style="text-align:center; padding: 20px; color: var(--danger);">Error: ${e.message}</td></tr>`;
+    $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 20px; color: var(--danger);">Error: ${e.message}</td></tr>`;
   }
 }
 
-// ─── 2. RENDER UI ─────────────────────────────────────────
-function render({ data, date, isLive, scanMs }) {
-  // Summary Cards
+// ─── 4. RENDER UI ─────────────────────────────────────────
+function render({ data, isLive, scanMs }) {
   const total = data.length;
   const broke = data.filter(d => d.breakout_ts).length;
   const confirmed = data.filter(d => d.is_breakout === 'Yes').length;
@@ -66,36 +133,19 @@ function render({ data, date, isLive, scanMs }) {
   const avgChg = validChg ? (sumChg / validChg) : 0;
 
   $('summary').innerHTML = `
-    <div class="card">
-      <div class="card-label">Setups Found</div>
-      <div class="card-val">${total}</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Intraday Breakouts</div>
-      <div class="card-val" style="color: var(--warning)">${broke}</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Confirmed (Close)</div>
-      <div class="card-val" style="color: var(--success)">${confirmed}</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Avg Change %</div>
-      <div class="card-val ${pctClass(avgChg)}">${validChg ? avgChg.toFixed(2) : '0.00'}%</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Scan Time</div>
-      <div class="card-val" style="font-size: 14px; margin-top: 6px;">${scanMs}ms</div>
-    </div>
+    <div class="card"><div class="card-label">Setups Found</div><div class="card-val">${total}</div></div>
+    <div class="card"><div class="card-label">Intraday Breakouts</div><div class="card-val" style="color: var(--warning)">${broke}</div></div>
+    <div class="card"><div class="card-label">Confirmed (Close)</div><div class="card-val" style="color: var(--success)">${confirmed}</div></div>
+    <div class="card"><div class="card-label">Avg Change %</div><div class="card-val ${pctClass(avgChg)}">${validChg ? avgChg.toFixed(2) : '0.00'}%</div></div>
+    <div class="card"><div class="card-label">Scan Time</div><div class="card-val" style="font-size: 14px; margin-top: 6px;">${scanMs}ms</div></div>
   `;
 
-  // Table Rows
   if (!data.length) {
-    $('tbody').innerHTML = `<tr><td colspan="10" style="text-align:center; padding: 40px; color: var(--text-muted);">No Inside Bar setups found for this date.</td></tr>`;
+    $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 40px; color: var(--text-muted);">No Inside Bar setups found for this date.</td></tr>`;
     return;
   }
 
   $('tbody').innerHTML = data.map((d, i) => {
-    // Generate Action Badge
     let badge = `<span class="badge b-no">❌ No</span>`;
     if (d.is_breakout === 'Yes') {
       badge = `<span class="badge b-yes">✅ Yes (Confirmed)</span>`;
@@ -105,126 +155,41 @@ function render({ data, date, isLive, scanMs }) {
       badge = `<span class="badge b-wait">⏳ Waiting</span>`;
     }
 
-    // Store reference for live updating
-    motherHighMap[d.token] = { 
-      mother_high: Number(d.mother_high), 
-      trEl: null, 
-      badgeEl: null 
-    };
+    // Get current LTP from our live cache if available
+    const currentLtp = latestTicks[d.token] ? '₹' + (+latestTicks[d.token]).toFixed(2) : '—';
+
+    motherHighMap[d.token] = { mother_high: Number(d.mother_high), trEl: null, badgeEl: null, ltpEl: null };
 
     return `<tr data-token="${d.token}">
       <td>${i + 1}</td>
       <td><span class="sym">${d.sym}</span></td>
-      <td>${d.mother_date || '—'}</td>
+      <td class="ltp-cell" style="font-weight:700;">${currentLtp}</td>
+      <td>${formatDateOnly(d.mother_date)}</td>
       <td class="${pctClass(d.change_pct)}">${d.change_pct != null ? d.change_pct + '%' : '—'}</td>
       <td class="${pctClass(d.t1_pct)}">${d.t1_pct != null ? d.t1_pct + '%' : '—'}</td>
       <td>${d.breakout_rvol != null ? fmt(d.breakout_rvol, 2) + 'x' : '—'}</td>
-      <td>${formatFullTime(d.breakout_ts)}</td>
+      <td>${formatDateTimeNoSec(d.breakout_ts)}</td>
       <td class="action-cell">${badge}</td>
       <td>₹${fmt(d.mother_high)}</td>
       <td>${d.days_inside}</td>
     </tr>`;
   }).join('');
 
-  // Cache DOM elements for live updating
+  // Cache elements for real-time updates
   document.querySelectorAll('#tbody tr').forEach(tr => {
     const token = tr.dataset.token;
     if (motherHighMap[token]) {
       motherHighMap[token].trEl = tr;
       motherHighMap[token].badgeEl = tr.querySelector('.action-cell');
+      motherHighMap[token].ltpEl = tr.querySelector('.ltp-cell');
     }
   });
 }
 
-// ─── 3. LIVE MONITOR (SSE) ────────────────────────────────
-function toggleLive() {
-  const btn = $('liveBtn');
-  
-  if (liveSSE) {
-    // STOP
-    liveSSE.close();
-    liveSSE = null;
-    btn.textContent = '📡 Live Monitor: OFF';
-    btn.classList.remove('active');
-    $('liveStatus').textContent = 'Monitor stopped.';
-    return;
-  }
+// ─── 5. EVENTS & INIT ─────────────────────────────────────
+$('scanBtn').addEventListener('click', runScan);
 
-  if (!scanData.length) {
-    alert('Please run a scan first to load the watchlist.');
-    return;
-  }
-
-  // START
-  btn.textContent = '⏹ Stop Live Monitor';
-  btn.classList.add('active');
-  $('liveStatus').textContent = 'Connecting to live feed...';
-  
-  const token = getToken();
-  if (!token) {
-    $('liveStatus').textContent = '🔴 Auth token missing. Cannot start stream.';
-    btn.textContent = '📡 Live Monitor: OFF';
-    btn.classList.remove('active');
-    return;
-  }
-
-  const url = `${API}/api/screener/stream?token=${encodeURIComponent(token)}`;
-  
-  liveSSE = new EventSource(url);
-  
-  liveSSE.onopen = () => {
-    $('liveStatus').textContent = '🟢 Live monitoring active. Waiting for breakout...';
-  };
-
-  liveSSE.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'ltp' && msg.ticks) {
-        checkLiveBreakouts(msg.ticks);
-      }
-    } catch (err) {}
-  };
-
-  liveSSE.onerror = () => {
-    $('liveStatus').textContent = '🔴 SSE Connection lost. Reconnecting...';
-  };
-}
-
-function checkLiveBreakouts(ticks) {
-  let anyBreakout = false;
-  
-  for (const [token, price] of Object.entries(ticks)) {
-    const data = motherHighMap[token];
-    if (!data || !data.trEl) continue;
-
-    // Only trigger if we haven't already marked it as broken live
-    if (price > data.mother_high && !data.trEl.classList.contains('live-broken')) {
-      data.trEl.classList.add('live-broken');
-      anyBreakout = true;
-
-      // Update badge
-      data.badgeEl.innerHTML = `<span class="badge b-yes" style="background: var(--warning); color: #000; animation: pulse 1.5s infinite;">🚀 BREAKOUT!</span>`;
-      
-      // Update row highlight
-      data.trEl.style.backgroundColor = 'rgba(245, 158, 11, 0.1)';
-      
-      // Flash title
-      document.title = `🚀 BREAKOUT: ${data.trEl.querySelector('.sym').textContent}`;
-    }
-  }
-
-  if (anyBreakout) {
-    $('liveStatus').innerHTML = `<span style="color: var(--warning); font-weight: 700;">🚀 Breakout detected! Check highlighted rows.</span>`;
-  }
-}
-
-// ─── 4. EVENTS ────────────────────────────────────────────
-$('scanBtn').addEventListener('click', () => {
-  if (liveSSE) toggleLive(); // stop live if running
-  runScan();
+window.addEventListener('load', () => {
+  startSSE(); // Start WebSocket/SSE immediately on page load
+  runScan();  // Load today's data
 });
-
-$('liveBtn').addEventListener('click', toggleLive);
-
-// Auto-run on load
-window.addEventListener('load', runScan);

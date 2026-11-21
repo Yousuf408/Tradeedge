@@ -1,11 +1,56 @@
 /* ============================================================
+   APP.JS
+   Settings + Theme toggle
+   ============================================================ */
+
+/* ============================================================
+   SECTION 1 — THEME (light / dark)
+   ============================================================ */
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  document.body.setAttribute('data-theme', theme);
+  localStorage.setItem('ta_theme', theme);
+  updateThemeIcon(theme);
+}
+
+function toggleTheme() {
+  const current = localStorage.getItem('ta_theme') || 'light';
+  const next = current === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  if (typeof showToast === 'function') {
+    showToast(
+      next === 'dark' ? '🌙 Dark Mode' : '☀️ Light Mode',
+      `Theme switched to ${next}`
+    );
+  }
+}
+
+function updateThemeIcon(theme) {
+  const icon = document.getElementById('themeIcon');
+  if (!icon) return;
+  icon.textContent = theme === 'dark' ? '☀️' : '🌙';
+}
+
+// Apply saved theme on load
+(function initTheme() {
+  const saved = localStorage.getItem('ta_theme') || 'light';
+  applyTheme(saved);
+})();
+
+/* ============================================================
+   SECTION 2 — PORTFOLIO (REMOVED)
+   ============================================================ */
+function loadPortfolio() { /* removed — no-op */ }
+
+/* ============================================================
    SECTION 3 — SETTINGS: BROKER FIELDS TOGGLE
    ============================================================ */
 function toggleBrokerFields() {
   const b = document.getElementById('brokerSelect').value;
   
   // Show/Hide Dhan fields
-  document.getElementById('dhanFields').style.display = (b === 'dhan') ? 'grid' : 'none';
+  const dhanDiv = document.getElementById('dhanFields');
+  if (dhanDiv) dhanDiv.style.display = (b === 'dhan') ? 'grid' : 'none';
   
   // Show/Hide Kotak fields
   const kotakDiv = document.getElementById('kotakFields');
@@ -16,7 +61,6 @@ function toggleBrokerFields() {
   if (otherDiv) otherDiv.style.display = (b && b !== 'dhan' && b !== 'kotak') ? 'block' : 'none';
 }
 
-// ADD THIS NEW FUNCTION at the bottom of app.js
 async function saveBrokerDetails() {
   const broker = document.getElementById('brokerSelect').value;
   if (!broker) return showToast('⚠️ Error', 'Please select a broker first');
@@ -29,8 +73,6 @@ async function saveBrokerDetails() {
     payload.totp_secret = document.getElementById('kotakTotpSecret').value;
     payload.mpin = document.getElementById('kotakMpin').value;
     
-    // We also need the mobile number, but we can store it in a generic field if needed.
-    // For now, let's assume client_id is UCC.
     if (!payload.client_id || !payload.user_api_key || !payload.totp_secret || !payload.mpin) {
       return showToast('⚠️ Missing Fields', 'Please fill all Kotak details');
     }
@@ -39,11 +81,12 @@ async function saveBrokerDetails() {
   }
 
   try {
+    // API and getToken() are defined in screener.js, which loads before app.js
     const res = await fetch(API + '/api/user/broker-credentials', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: 'Bearer ' + getToken() // Uses your existing getToken()
+        Authorization: 'Bearer ' + getToken()
       },
       body: JSON.stringify(payload)
     });

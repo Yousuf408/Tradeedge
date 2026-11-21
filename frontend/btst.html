@@ -59,10 +59,6 @@
 
     .btn-primary { background: var(--brand); color: white; }
     .btn-primary:hover { background: #5a4bcf; }
-    
-    .btn-live { background: var(--success); color: white; }
-    .btn-live.active { background: var(--danger); }
-    
     .btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
     .summary {
@@ -150,8 +146,7 @@
   <div class="controls">
     <input type="date" id="scanDate">
     <button class="btn btn-primary" id="scanBtn">🔍 Scan</button>
-    <button class="btn btn-live" id="liveBtn">📡 Live Monitor: OFF</button>
-    <span id="liveStatus" style="color:var(--text-muted); font-size:12px; margin-left: 8px;"></span>
+    <span id="liveStatus" style="color:var(--success); font-size:12px; margin-left: 8px;">🟢 Live Feed Connected</span>
   </div>
 
   <div class="summary" id="summary"></div>
@@ -162,6 +157,7 @@
         <tr>
           <th>#</th>
           <th>sym</th>
+          <th>LTP</th>
           <th>mother_date</th>
           <th>change_pct</th>
           <th>T+1 %</th>
@@ -173,7 +169,7 @@
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td colspan="10" style="text-align:center; padding: 40px; color: var(--text-muted);">Select a date and click Scan.</td></tr>
+        <tr><td colspan="11" style="text-align:center; padding: 40px; color: var(--text-muted);">Select a date and click Scan.</td></tr>
       </tbody>
     </table>
   </div>

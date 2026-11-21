@@ -684,6 +684,8 @@ function handleTick(token, ltp, tickMs, extra) {
   broadcastLTP(token, ltp);
   lastLtpAt.set(String(token), Date.now());
   onTickPos(token, ltp);
+   // Send tick to BTST Engine
+  if (app.processBtstTick) app.processBtstTick(token, ltp); 
 }
 
 function startWebSocketForReadyPhase() {

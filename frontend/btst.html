@@ -5,16 +5,28 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>BTST Scanner — TradeAlgo Pro</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <!-- ADDED: Load main app styles so it inherits the theme colors -->
+  <link rel="stylesheet" href="styles.css" />
+  
+  <script>
+    // ADDED: Sync theme with main app
+    (function() {
+      const saved = localStorage.getItem('ta_theme') || 'light';
+      document.documentElement.setAttribute('data-theme', saved);
+    })();
+  </script>
+
   <style>
+    /* MAPPED TO MAIN APP VARIABLES (so light/dark mode works automatically) */
     :root {
-      --bg-main: #0f111a;
-      --bg-card: #181b26;
-      --border: #2a2e3d;
-      --text-main: #e2e8f0;
-      --text-muted: #94a3b8;
-      --brand: #6C5CE7;
-      --success: #10b981;
-      --danger: #ef4444;
+      --bg-main: var(--bg-primary, #0f111a);
+      --bg-card: var(--bg-secondary, #181b26);
+      --border: var(--border-soft, #2a2e3d);
+      --text-main: var(--text-primary, #e2e8f0);
+      --text-muted: var(--text-muted, #94a3b8);
+      --brand: var(--brand, #6C5CE7);
+      --success: var(--success, #10b981);
+      --danger: var(--danger, #ef4444);
       --warning: #f59e0b;
     }
     
@@ -25,6 +37,7 @@
       color: var(--text-main);
       padding: 16px;
       font-size: 13px;
+      transition: background-color 0.3s, color 0.3s;
     }
 
     .controls {
@@ -106,7 +119,7 @@
     table { width: 100%; border-collapse: collapse; text-align: left; }
 
     th {
-      background: #141722;
+      background: var(--bg-main);
       color: var(--text-muted);
       font-size: 11px;
       font-weight: 600;
@@ -122,7 +135,7 @@
       white-space: nowrap;
     }
 
-    tr:hover td { background: rgba(255,255,255,0.02); }
+    tr:hover td { background: rgba(128, 128, 128, 0.05); }
 
     .sym { font-weight: 700; color: var(--text-main); }
     

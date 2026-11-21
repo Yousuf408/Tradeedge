@@ -30,19 +30,24 @@
     .controls {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
       margin-bottom: 16px;
       flex-wrap: wrap;
+      background: var(--bg-card);
+      padding: 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
     }
 
-    input[type="date"] {
-      background: var(--bg-card);
+    input[type="date"], input[type="number"], select {
+      background: var(--bg-main);
       border: 1px solid var(--border);
       color: var(--text-main);
       padding: 8px 12px;
       border-radius: 8px;
       font-family: inherit;
       outline: none;
+      font-size: 13px;
     }
 
     .btn {
@@ -55,10 +60,15 @@
       align-items: center;
       gap: 6px;
       transition: 0.2s;
+      font-size: 13px;
     }
 
     .btn-primary { background: var(--brand); color: white; }
     .btn-primary:hover { background: #5a4bcf; }
+    .btn-success { background: var(--success); color: white; }
+    .btn-success:hover { background: #059669; }
+    .btn-danger { background: var(--danger); color: white; }
+    .btn-danger:hover { background: #dc2626; }
     .btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
     .summary {
@@ -84,10 +94,7 @@
       margin-bottom: 4px;
     }
 
-    .card-val {
-      font-size: 20px;
-      font-weight: 700;
-    }
+    .card-val { font-size: 20px; font-weight: 700; }
 
     .table-wrap {
       background: var(--bg-card);
@@ -96,11 +103,7 @@
       overflow-x: auto;
     }
 
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      text-align: left;
-    }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
 
     th {
       background: #141722;
@@ -146,7 +149,26 @@
   <div class="controls">
     <input type="date" id="scanDate">
     <button class="btn btn-primary" id="scanBtn">🔍 Scan</button>
-    <span id="liveStatus" style="color:var(--success); font-size:12px; margin-left: 8px;">🟢 Live Feed Connected</span>
+    
+    <div style="width: 1px; height: 24px; background: var(--border); margin: 0 8px;"></div>
+
+    <select id="tradeMode">
+      <option value="PAPER">📝 Paper Trade</option>
+      <option value="REAL">💸 Real Trade (Kotak)</option>
+    </select>
+    
+    <select id="productType">
+      <option value="MIS">Intraday (MIS)</option>
+      <option value="CNC">Delivery (CNC)</option>
+      <option value="MTF">MTF</option>
+    </select>
+
+    <input type="number" id="tradeQty" value="1" min="1" placeholder="Qty" style="width: 80px;" title="Quantity per trade">
+
+    <button class="btn btn-success" id="startAutoBtn">🚀 Start Auto-Trade</button>
+    <button class="btn btn-danger" id="stopAutoBtn" style="display: none;">🛑 Stop Auto-Trade</button>
+
+    <span id="liveStatus" style="color:var(--success); font-size:12px; margin-left: auto; font-weight: 600;">🟢 Live Feed Connected</span>
   </div>
 
   <div class="summary" id="summary"></div>

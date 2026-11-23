@@ -287,6 +287,10 @@ const wsTodayLows = new Map();
 
 const currentMinHighs = new Map();
 const currentMinLows = new Map();
+// NEW: Track 5-min Open, High, Low
+const temp5MinOpen = new Map();
+const temp5MinHigh = new Map();
+const temp5MinLow = new Map();
 
 const chipList = new Map();
 let chipDate = null;
@@ -412,12 +416,32 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
     if (ring.length > 5) ring.shift();
     minVolRing.set(token, ring);
   }
-  if (!tokens.length) return;
+   if (!tokens.length) return;
+
+  // --- NEW: Track 5-min OHLC ---
+  for (const tk of tokens) {
+    const close = closes[tokens.indexOf(tk)];
+    const minHigh = currentMinHighs.get(tk) || close;
+    const minLow = currentMinLows.get(tk) || close;
+
+    if (!temp5MinOpen.has(tk)) temp5MinOpen.set(tk, close);
+    const prevHigh = temp5MinHigh.get(tk) || minHigh;
+    const prevLow = temp5MinLow.get(tk) || minLow;
+    
+    temp5MinHigh.set(tk, Math.max(prevHigh, minHigh));
+    temp5MinLow.set(tk, Math.min(prevLow, minLow));
+  }
+  // -----------------------------
 
   const isFive = Number(prevKey.slice(3)) % 5 === 4;
   const tss = tokens.map(() => prevTs);
   const vols5 = isFive ? tokens.map(t => (minVolRing.get(t) || []).reduce((a, b) => a + b, 0)) : [];
   const vwaps = tokens.map(t => lastWsAvg.get(t) ?? 0);
+  
+  const opens5 = isFive ? tokens.map(t => temp5MinOpen.get(t)) : [];
+  const highs5 = isFive ? tokens.map(t => temp5MinHigh.get(t)) : [];
+  const lows5 = isFive ? tokens.map(t => temp5MinLow.get(t)) : [];
+   
   try {
     await db.query(
       `UPDATE strategy_bs_snapshot AS s
@@ -430,18 +454,29 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
        WHERE s.date = $7 AND s.token = v.token AND s.strategy_id = 'momentum'`,
       [tokens, closes, tss, minVols, vwaps, minRvols, date]
     );
-    if (isFive) {
+       if (isFive) {
       await db.query(
         `UPDATE strategy_bs_snapshot AS s
-         SET ws_5min_close  = COALESCE(s.ws_5min_close,  ARRAY[]::numeric[]) || v.c,
+         SET ws_5min_open   = COALESCE(s.ws_5min_open,   ARRAY[]::numeric[]) || v.o,
+             ws_5min_high   = COALESCE(s.ws_5min_high,   ARRAY[]::numeric[]) || v.h,
+             ws_5min_low    = COALESCE(s.ws_5min_low,    ARRAY[]::numeric[]) || v.l,
+             ws_5min_close  = COALESCE(s.ws_5min_close,  ARRAY[]::numeric[]) || v.c,
              ws_5min_ts     = COALESCE(s.ws_5min_ts,     ARRAY[]::timestamptz[]) || v.t,
              ws_5min_volume = COALESCE(s.ws_5min_volume, ARRAY[]::numeric[]) || v.vol
-         FROM unnest($1::text[], $2::numeric[], $3::timestamptz[], $4::numeric[]) AS v(token, c, t, vol)
-         WHERE s.date = $5 AND s.token = v.token AND s.strategy_id = 'momentum'`,
-        [tokens, closes, tss, vols5, date]
+         FROM unnest($1::text[], $2::numeric[], $3::numeric[], $4::numeric[], $5::numeric[], $6::timestamptz[], $7::numeric[]) 
+         AS v(token, o, h, l, c, t, vol)
+         WHERE s.date = $8 AND s.token = v.token AND s.strategy_id = 'momentum'`,
+        [tokens, opens5, highs5, lows5, closes, tss, vols5, date]
       );
+      
+      // Clear the 5-min temp maps after saving
+      for (const tk of tokens) {
+        temp5MinOpen.delete(tk);
+        temp5MinHigh.delete(tk);
+        temp5MinLow.delete(tk);
+      }
     }
-    for (let i = 0; i < tokens.length; i++) {
+     for (let i = 0; i < tokens.length; i++) {
       const tk = tokens[i];
       const arr = wsTodayCloses.get(tk) || [];
       arr.push(closes[i]);

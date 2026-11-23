@@ -56,7 +56,6 @@ import {
 } from './autoTrader.js';
 
 import { registerAdminRoutes } from './admin.js';
-import { registerFifteenRoutes } from './fifteen.js';
 import { registerBtstRoutes } from './btstRoutes.js'; 
 import { generateAIPlan } from './aiAnalyzer.js';
 
@@ -2288,12 +2287,6 @@ registerAdminRoutes(app, {
   loadHolidaysFromDB
 });
 
-registerFifteenRoutes(app, {
-  db, auth, adminOnly, STOCKS,
-  fetchAngelInterval, isRateError, isSessionError,
-  forceRelogin: forceReloginREST, loginREST, getSessionStatusREST,
-  getHistoricalRunning: () => historicalRunning
-});
 
 registerBtstRoutes(app, db);  
 const PORT = process.env.PORT || 3000;

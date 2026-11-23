@@ -2,8 +2,29 @@
    BTST Frontend Logic (btst.js) - Auto Live Feed + Auto Trade
    ============================================================ */
 
-const API = ''; // Assuming same origin
-const getToken = () => localStorage.getItem('ta_token') || localStorage.getItem('token') || '';
+const API = ''; 
+
+// --- BULLETPROOF TOKEN FETCHER FOR IFRAME ---
+const getToken = () => {
+  // 1. Try getting the function directly from the main window (Parent)
+  try {
+    if (window.parent && typeof window.parent.getToken === 'function') {
+      const pToken = window.parent.getToken();
+      if (pToken) return pToken;
+    }
+  } catch (e) {
+    // Ignore cross-origin errors if any
+  }
+  
+  // 2. Fallback to LocalStorage (trying all common keys)
+  const keys = ['ta_token', 'token', 'jwt', 'auth_token', 'access_token'];
+  for (let k of keys) {
+    const val = localStorage.getItem(k);
+    if (val) return val;
+  }
+  return '';
+};
+
 const getUserId = () => localStorage.getItem('ta_user') || localStorage.getItem('username') || 'admin';
 
 const $ = id => document.getElementById(id);
@@ -11,13 +32,11 @@ const today = () => new Date().toISOString().slice(0, 10);
 const fmt = (v, d = 2) => v === null || v === undefined ? '—' : Number(v).toFixed(d);
 const pctClass = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
 
-// Format "YYYY-MM-DD" (removes the T00:00:00Z)
 const formatDateOnly = (dateStr) => {
   if (!dateStr) return '—';
   return String(dateStr).split('T')[0]; 
 };
 
-// Format "YYYY-MM-DD HH:MM" (removes seconds)
 const formatDateTimeNoSec = (ts) => {
   if (!ts) return '—';
   try {
@@ -38,8 +57,9 @@ $('scanDate').value = today();
 function startSSE() {
   if (liveSSE) return;
   const token = getToken();
+  
   if (!token) {
-    $('liveStatus').textContent = '🔴 Auth token missing';
+    $('liveStatus').textContent = '🔴 Auth token missing (Check login)';
     $('liveStatus').style.color = 'var(--danger)';
     return;
   }
@@ -194,7 +214,6 @@ $('startAutoBtn').addEventListener('click', async () => {
     if (!confirmReal) return;
   }
 
-  // Only send stocks that haven't broken out yet
   const stocksToTrade = scanData.filter(d => d.is_breakout !== 'Yes').map(d => ({
     sym: d.sym,
     token: d.token,

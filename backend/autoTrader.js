@@ -295,16 +295,16 @@ async function savePos(p) {
   // 🆕 Entry date use karega taaki purane open trade aaj ke date me duplicate na ho
   const dateToSave = p.entryDate || posDate; 
   
-  await db.query(
+   await db.query(
     `INSERT INTO auto_positions
-       (date, token, user_id, sym, qty, entry, sl, stage, peak, status, exit_price, exit_reason, entry_at, exit_at, updated_at, side)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),$15)
-     ON CONFLICT (date, token, user_id) DO UPDATE SET
+       (date, token, user_id, sym, qty, entry, sl, stage, peak, status, exit_price, exit_reason, entry_at, exit_at, updated_at, side, strategy)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),$15,$16)
+     ON CONFLICT (date, token, user_id, strategy) DO UPDATE SET
        sl=EXCLUDED.sl, stage=EXCLUDED.stage, peak=EXCLUDED.peak,
        status=EXCLUDED.status, exit_price=EXCLUDED.exit_price,
        exit_reason=EXCLUDED.exit_reason, exit_at=EXCLUDED.exit_at, updated_at=NOW(), side=EXCLUDED.side`,
     [dateToSave, p.token, p.userId, p.sym, p.qty, p.entry, p.sl, p.stage, p.entry,
-     p.status, p.exitPrice, p.reason, p.entryAt, p.exitAt, p.side || 'BUY']
+     p.status, p.exitPrice, p.reason, p.entryAt, p.exitAt, p.side || 'BUY', p.strat || 'swing']
   );
 }
 

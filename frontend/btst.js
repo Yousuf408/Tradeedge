@@ -124,9 +124,31 @@ async function runScan() {
     
     if (!json.success) throw new Error(json.error);
     
-    scanData = json.data;
+      scanData = json.data;
     motherHighMap = {}; 
     
+    // --- ADD THIS BLOCK ---
+    if (scanData.length > 0) {
+      const tokens = scanData.map(d => d.token);
+      try {
+        const ltpRes = await fetch(`${API}/api/screener/ltp`, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json', 
+            Authorization: 'Bearer ' + getToken() 
+          },
+          body: JSON.stringify({ tokens })
+        });
+        const ltpJson = await ltpRes.json();
+        if (ltpJson.results) {
+          ltpJson.results.forEach(r => {
+            if (r.ltp) latestTicks[r.token] = r.ltp; // Save to our cache
+          });
+        }
+      } catch (err) { console.error('Failed to fetch initial LTPs', err); }
+    }
+    // ---------------------
+
     render(json);
     
   } catch (e) {

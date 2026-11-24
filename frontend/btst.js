@@ -4,28 +4,26 @@
 
 const API = ''; 
 
-// --- BULLETPROOF TOKEN FETCHER FOR IFRAME ---
+// --- BULLETPROOF TOKEN FETCHER ---
 const getToken = () => {
-  // 1. Try getting the function directly from the main window (Parent)
   try {
     if (window.parent && typeof window.parent.getToken === 'function') {
       const pToken = window.parent.getToken();
       if (pToken) return pToken;
     }
-  } catch (e) {
-    // Ignore cross-origin errors if any
-  }
+  } catch (e) {}
   
-  // 2. Fallback to LocalStorage (trying all common keys)
-  const keys = ['ta_token', 'token', 'jwt', 'auth_token', 'access_token'];
+  // Check all possible keys the main app might use
+  const keys = ['ta_token', 'token', 'jwt', 'auth_token', 'access_token', 'ta_auth', 'ta_auth_token'];
   for (let k of keys) {
     const val = localStorage.getItem(k);
-    if (val) return val;
+    if (val && val !== 'undefined' && val !== 'null') return val;
   }
   return '';
 };
 
 const getUserId = () => localStorage.getItem('ta_user') || localStorage.getItem('username') || 'admin';
+
 
 const $ = id => document.getElementById(id);
 const today = () => new Date().toISOString().slice(0, 10);

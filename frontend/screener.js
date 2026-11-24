@@ -21,7 +21,6 @@ let QUOTE_FETCHING = false;
 let DAYHLC_FETCHING = false;
 let EOD_FETCHING = false;
 let HISTORICAL_FETCHING = false;
-let FIFTEEN_FETCHING = false;       
 let VOLUME_HIST_FETCHING = false;   
 let ANGEL_3D_FETCHING = false;      
 
@@ -104,7 +103,6 @@ function renderStrategyControls() {
     <button id="fetchHistoricalBtn" class="btn btn-outline" ${btnStyle} onclick="startHistoricalFetch()">📥 Fetch Historical</button>
     <button id="fetchVolumeHistBtn" class="btn btn-outline" ${btnStyle} onclick="startVolumeHistoryFetch()">📈 Fetch Volume History</button>
     <button id="fetchAngel3dBtn" class="btn btn-outline" ${btnStyle} onclick="startAngel3dFetch()">📥 Fetch Angel 3D</button>
-    <button id="fetch15Btn" class="btn btn-outline" ${btnStyle} onclick="startFifteenFetch()">📊 Fetch 15-Min</button>
     <button id="fetchEODBtn" class="btn btn-outline" ${btnStyle} onclick="startEODClosesFetch()">⚙️ Fetch EOD Closes</button>`;
 
   controls.innerHTML = `
@@ -640,74 +638,6 @@ async function startHistoricalFetch() {
   }
 }
 
-/* ============================================================
-   SECTION 5.7 — FETCH 15-MIN CANDLES
-   ============================================================ */
-async function startFifteenFetch() {
-  const btn = document.getElementById('fetch15Btn');
-  if (!btn) return;
-  if (FIFTEEN_FETCHING) return;
-
-  const ok = confirm('📊 Fetch 15-Min Candles (OHLCV)\n\nDownloads last ~2 months of 15-minute open/high/low/close/volume for all stocks from Angel REST.\nRuns in background with its own progress bar. Continue?');
-  if (!ok) return;
-
-  FIFTEEN_FETCHING = true;
-  btn.disabled = true;
-  btn.textContent = '⏳ Fetching 15-min...';
-
-  const pb = document.getElementById('progressBar');
-  if (pb) pb.style.display = 'block';
-
-  try {
-    const r = await fetch(API + '/api/admin/fetch-15min', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
-      body: JSON.stringify({ days: 44 })
-    });
-
-    let d = {};
-    try { d = await r.json(); } catch (e) { d = { error: 'Server timeout or invalid response' }; }
-
-    if (!r.ok) {
-      showToast('⚠️ Failed', d.error || `HTTP ${r.status}`);
-      FIFTEEN_FETCHING = false;
-      btn.disabled = false;
-      btn.textContent = '📊 Fetch 15-Min';
-      if (pb) pb.style.display = 'none';
-      return;
-    }
-
-    showToast('✅ 15-Min Fetch Started', 'Background process running. Watch progress bar.');
-
-    const poll = setInterval(async () => {
-      try {
-        const pr = await fetch(API + '/api/admin/fetch-15min-progress', {
-          headers: { Authorization: 'Bearer ' + getToken() }
-        }).then(res => res.json());
-
-        if (pr.running) {
-          updateProgress(pr.done, pr.total);
-          btn.textContent = `⏳ 15-min ${pr.current || ''} (${pr.done}/${pr.total})`;
-        } else {
-          clearInterval(poll);
-          FIFTEEN_FETCHING = false;
-          btn.disabled = false;
-          btn.textContent = '📊 Fetch 15-Min';
-          updateProgress(pr.total || 1, pr.total || 1);
-          showToast('🎉 15-Min Complete', 'OHLCV 15-min candles saved for ~2 months.');
-          setTimeout(() => { if (pb) pb.style.display = 'none'; }, 3000);
-        }
-      } catch (e) { console.error('15-min progress poll failed:', e); }
-    }, 2000);
-
-  } catch (e) {
-    showToast('⚠️ Network Error', 'Server is not reachable.');
-    FIFTEEN_FETCHING = false;
-    btn.disabled = false;
-    btn.textContent = '📊 Fetch 15-Min';
-    if (pb) pb.style.display = 'none';
-  }
-}
 
 /* ============================================================
    SECTION 5.8 — FETCH VOLUME HISTORY

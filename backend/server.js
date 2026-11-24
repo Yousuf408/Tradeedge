@@ -453,7 +453,7 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
        WHERE s.date = $7 AND s.token = v.token AND s.strategy_id = 'momentum'`,
       [tokens, closes, tss, minVols, vwaps, minRvols, date]
     );
-       if (isFive) {
+         if (isFive) {
       await db.query(
         `UPDATE strategy_bs_snapshot AS s
          SET ws_5min_open   = COALESCE(s.ws_5min_open,   ARRAY[]::numeric[]) || v.o,
@@ -468,6 +468,14 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
         [tokens, opens5, highs5, lows5, closes, tss, vols5, date]
       );
       
+      // --- ADD THIS BLOCK ---
+      if (app.processBtst5mClose) {
+        for (let i = 0; i < tokens.length; i++) {
+          app.processBtst5mClose(tokens[i], closes[i], highs5[i]);
+        }
+      }
+      // ----------------------
+
       // Clear the 5-min temp maps after saving
       for (const tk of tokens) {
         temp5MinOpen.delete(tk);

@@ -1,19 +1,17 @@
 /* ============================================================
-   btstRoutes.js — BTST (Inside Bar / Mother Candle Breakout)
-   Mounted at /api/btst in server.js
+   btstRoutes.js — BTST Engine with 5-Min Confirmation
    ============================================================ */
 
 import express from 'express';
 import { placeOrder } from './brokers/kotak/Kotak_Orders.js';
 
 const activeTraders = new Map();
-const btstPositions = new Map(); // Tracks active BTST trades for SL/Target
+const btstPositions = new Map(); 
 
 const getIST = () => new Date(Date.now() + 5.5 * 60 * 60 * 1000);
 const todayIST = () => getIST().toISOString().split('T')[0];
 const pkey = (userId, token) => `${userId}|${token}`;
 
-// Helper to save to DB (Matches autoTrader.js exactly)
 async function savePos(db, p) {
   try {
     await db.query(
@@ -27,25 +25,20 @@ async function savePos(db, p) {
       [p.entryDate, p.token, p.userId, p.sym, p.qty, p.entry, p.sl, p.stage, p.entry,
        p.status, p.exitPrice, p.reason, p.entryAt, p.exitAt, p.side || 'BUY', 'BTST']
     );
-  } catch (e) {
-    console.error('BTST DB Save Error:', e.message);
-  }
+  } catch (e) { console.error('BTST DB Save Error:', e.message); }
 }
 
 export function registerBtstRoutes(app, db) {
   const router = express.Router();
 
-  // ─── 1. SCAN ENDPOINT ──────────────────────────────────
   router.get('/scan', async (req, res) => {
     try {
       const date = req.query.date;
       const strategyId = req.query.strategy || 'momentum';
-
       if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ success: false, error: 'date required' });
 
       const istNow = new Date(Date.now() + 5.5 * 3600 * 1000);
-      const todayIst = istNow.toISOString().slice(0, 10);
-      const isLive = date === todayIst;
+      const isLive = date === istNow.toISOString().slice(0, 10);
 
       const sql = `
         WITH daily_data AS (
@@ -83,41 +76,70 @@ export function registerBtstRoutes(app, db) {
         WHERE t.date = $1::date ORDER BY change_pct DESC NULLS LAST;
       `;
 
+      const t0 = Date.now();
       const { rows } = await db.query(sql, [date, strategyId]);
-      res.json({ success: true, date, isLive, count: rows.length, data: rows });
+      const scanMs = Date.now() - t0; // Fixed Scan Time
+
+      res.json({ success: true, date, isLive, scanMs, count: rows.length, data: rows });
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
     }
   });
 
-  // ─── 2. START AUTO-TRADE ────────────────────────────────
   router.post('/start', (req, res) => {
     const { userId, stocks, config } = req.body;
     if (!userId || !stocks) return res.status(400).json({ success: false, error: 'Invalid payload' });
 
     const list = stocks.map(s => ({
-      sym: s.sym, token: String(s.token), mother_high: Number(s.mother_high), triggered: false
+      sym: s.sym, token: String(s.token), mother_high: Number(s.mother_high), 
+      state: 'WAITING', // NEW: State machine
+      armed_high: null, // NEW: Tracks the 5m high
+      triggered: false
     }));
 
     activeTraders.set(String(userId), { watchlist: list, config });
     res.json({ success: true, count: list.length });
   });
 
-  // ─── 3. STOP AUTO-TRADE ─────────────────────────────────
   router.post('/stop', (req, res) => {
     activeTraders.delete(String(req.body.userId));
     res.json({ success: true });
   });
 
-  // ─── 4. TICK PROCESSOR (Called from server.js) ──────────
+  // ─── NEW: Triggered on 5-Minute Close ───
+  app.processBtst5mClose = (token, close, high) => {
+    const tk = String(token);
+    for (const [userId, data] of activeTraders.entries()) {
+      const stock = data.watchlist.find(s => s.token === tk && !s.triggered);
+      if (!stock) continue;
+
+      if (close > stock.mother_high) {
+        // 5m closed above mother high -> ARM the setup
+        if (stock.state !== 'ARMED') {
+           console.log(`⏳ [BTST] ${stock.sym} 5m closed above Mother High (₹${close} > ₹${stock.mother_high}). Armed at ₹${high}`);
+        }
+        stock.state = 'ARMED';
+        stock.armed_high = high;
+      } else {
+        // 5m closed below mother high -> Reset
+        if (stock.state === 'ARMED') {
+          console.log(`❌ [BTST] ${stock.sym} 5m closed below Mother High. Disarmed.`);
+        }
+        stock.state = 'WAITING';
+        stock.armed_high = null;
+      }
+    }
+  };
+
+  // ─── Triggered on Every Tick ───
   app.processBtstTick = async (token, price) => {
     const tk = String(token);
 
-    // A) Check for NEW Entries
+    // A) Check for NEW Entries (Only if ARMED)
     for (const [userId, data] of activeTraders.entries()) {
       const stock = data.watchlist.find(s => s.token === tk && !s.triggered);
       
-      if (stock && Number(price) > stock.mother_high) {
+      if (stock && stock.state === 'ARMED' && Number(price) > stock.armed_high) {
         stock.triggered = true;
         const config = data.config || {};
         
@@ -125,15 +147,15 @@ export function registerBtstRoutes(app, db) {
           userId, token: tk, sym: stock.sym, qty: config.qty || 1,
           side: 'BUY',
           entry: +price.toFixed(2),
-          sl: +(price * 0.98).toFixed(2),     // 2% SL
-          target: +(price * 1.04).toFixed(2), // 4% Target
+          sl: +(price * 0.98).toFixed(2),
+          target: +(price * 1.04).toFixed(2),
           stage: 0, status: 'open', reason: null, exitPrice: null,
           entryAt: new Date().toISOString(), exitAt: null,
           entryDate: todayIST()
         };
 
         btstPositions.set(pkey(userId, tk), pos);
-        savePos(db, pos); // <-- Save to DB immediately
+        savePos(db, pos);
 
         if (config.tradeMode === 'REAL') {
           console.log(`💸 [BTST] REAL TRADE: Ordering ${stock.sym} @ ₹${price}`);
@@ -144,19 +166,17 @@ export function registerBtstRoutes(app, db) {
       }
     }
 
-    // B) Check for EXITS (Target/SL)
+    // B) Check for EXITS
     for (const [key, pos] of btstPositions.entries()) {
       if (pos.token !== tk || pos.status !== 'open') continue;
 
-      // Check Target
       if (pos.stage === 0 && price >= pos.target) {
         pos.stage = 1;
-        pos.sl = pos.target; // Trail SL to Target (Lock profit)
+        pos.sl = pos.target;
         savePos(db, pos);
         console.log(`🤖 BTST ${pos.sym}: Target 4% hit → SL trailed to @${pos.sl}`);
       }
 
-      // Check SL
       if (price <= pos.sl) {
         pos.status = 'closed';
         pos.reason = pos.stage >= 1 ? 'TARGET_TRAIL' : 'SL';
@@ -165,10 +185,8 @@ export function registerBtstRoutes(app, db) {
         
         savePos(db, pos);
         btstPositions.delete(key);
-
         console.log(`🤖 BTST ${pos.sym}: Exited at ₹${price} (${pos.reason})`);
         
-        // If REAL mode, fire sell order
         const mode = activeTraders.get(pos.userId)?.config?.tradeMode;
         if (mode === 'REAL') {
            placeOrder(pos.userId, { sym: pos.sym, qty: pos.qty, side: 'SELL', price: 0, type: 'MKT', product: activeTraders.get(pos.userId).config.productType }).catch(e => console.error(e));
@@ -177,8 +195,6 @@ export function registerBtstRoutes(app, db) {
     }
   };
 
-  router.get('/health', (_req, res) => res.json({ ok: true }));
-
   app.use('/api/btst', router);
-  console.log('🎯 BTST routes mounted: /api/btst');
+  console.log('🎯 BTST routes mounted with 5-Min Confirmation');
 }

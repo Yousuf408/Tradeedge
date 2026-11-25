@@ -101,7 +101,7 @@ function updateLiveUI(ticks) {
     if (price > data.mother_high && !data.trEl.classList.contains('live-broken')) {
       data.trEl.classList.add('live-broken');
       anyBreakout = true;
-      data.badgeEl.innerHTML = `<span class="badge b-yes" style="background: var(--warning); color: #000; animation: pulse 1.5s infinite;">🚀 BREAKOUT!</span>`;
+      data.badgeEl.innerHTML = `<span class="badge b-wait" style="animation: pulse 1.5s infinite;">⏳ Touched (Wait 5m)</span>`;
       data.trEl.style.backgroundColor = 'rgba(245, 158, 11, 0.1)';
     }
   }

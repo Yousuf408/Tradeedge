@@ -41,14 +41,14 @@ export function registerBtstRoutes(app, db) {
       const isLive = date === istNow.toISOString().slice(0, 10);
 
       const sql = `
-              WITH daily_data AS (
+        WITH daily_data AS (
           SELECT sym, date, MAX(token) AS token, MAX(day_high) AS high, MIN(day_low) AS low, MAX(day_close) AS close,
             LEAD(date) OVER (PARTITION BY sym ORDER BY date) AS next_date,
             LEAD(MAX(day_close)) OVER (PARTITION BY sym ORDER BY date) AS next_close,
             LEAD(MAX(day_high), 2) OVER (PARTITION BY sym ORDER BY date) AS next2_high
           FROM strategy_bs_snapshot
           WHERE day_high IS NOT NULL AND day_low IS NOT NULL AND strategy_id = $2
-            AND date BETWEEN ($1::date - 15) AND ($1::date + 3)
+            AND date BETWEEN ($1::date - 60) AND ($1::date + 3)
           GROUP BY sym, date
         )
         SELECT t.sym, t.token, m.date AS mother_date, m.high AS mother_high, m.low AS mother_low,
@@ -61,9 +61,8 @@ export function registerBtstRoutes(app, db) {
         CROSS JOIN LATERAL (
           SELECT d.date, d.high, d.low FROM daily_data d
           WHERE d.sym = t.sym AND d.date < t.date
-            -- CHANGED TO CLOSE HERE
-            AND d.high >= (SELECT MAX(close) FROM daily_data c WHERE c.sym = t.sym AND c.date > d.date AND c.date <= t.date)
-            AND d.low  <= (SELECT MIN(close) FROM daily_data c WHERE c.sym = t.sym AND c.date > d.date AND c.date <= t.date)
+            AND d.high >= (SELECT MAX(high) FROM daily_data c WHERE c.sym = t.sym AND c.date > d.date AND c.date <= t.date)
+            AND d.low  <= (SELECT MIN(low)  FROM daily_data c WHERE c.sym = t.sym AND c.date > d.date AND c.date <= t.date)
           ORDER BY d.date DESC LIMIT 1
         ) m
         LEFT JOIN LATERAL (

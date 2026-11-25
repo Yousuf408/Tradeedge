@@ -1,9 +1,10 @@
 /* ============================================================
-   BTST Frontend Logic (btst.js) - Auto-Scan & Live Change %
+   BTST Frontend Logic (btst.js) - Auto-Scan, Live Feed & UI Filter
    ============================================================ */
 
 const API = ''; 
 
+// Bulletproof token fetcher for iframe context
 const getToken = () => {
   try {
     if (window.parent && typeof window.parent.getToken === 'function') {
@@ -11,6 +12,7 @@ const getToken = () => {
       if (pToken && pToken !== 'undefined') return pToken;
     }
   } catch (e) {}
+  
   const keys = ['ta_token', 'token', 'jwt', 'auth_token', 'access_token', 'ta_auth', 'ta_auth_token'];
   for (let k of keys) {
     const val = localStorage.getItem(k);
@@ -53,10 +55,10 @@ let liveSSE = null;
 let latestTicks = {}; 
 let motherHighMap = {}; 
 
-// 1. Set default date on load
+// Set default date on load
 $('scanDate').value = getLastWorkingDay();
 
-// 2. Start SSE
+// ─── 1. LIVE SSE CONNECTION ───────────────────────────────
 function startSSE() {
   if (liveSSE) return;
   const token = getToken();
@@ -90,7 +92,7 @@ function startSSE() {
   };
 }
 
-// 3. Update DOM (LTP + Dynamic Change %)
+// ─── 2. UPDATE DOM (LTP + Dynamic Change %) ───────────────
 function updateLiveUI(ticks) {
   for (const [token, price] of Object.entries(ticks)) {
     const data = motherHighMap[token];
@@ -108,7 +110,7 @@ function updateLiveUI(ticks) {
       data.changePctEl.textContent = (pct > 0 ? '+' : '') + pct.toFixed(2) + '%';
     }
 
-    // Update Breakout Badge
+    // Update Breakout Badge (if not already flagged)
     if (price > data.mother_high && !data.trEl.classList.contains('live-broken')) {
       data.trEl.classList.add('live-broken');
       data.badgeEl.innerHTML = `<span class="badge b-wait" style="animation: pulse 1.5s infinite;">⏳ Touched (Wait 5m)</span>`;
@@ -117,7 +119,7 @@ function updateLiveUI(ticks) {
   }
 }
 
-// 4. Run Scan (Auto-triggered on load and date change)
+// ─── 3. RUN SCAN ──────────────────────────────────────────
 async function runScan() {
   const date = $('scanDate').value;
   $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 20px; color: var(--text-muted);">Scanning ${date}... (this may take a few seconds)</td></tr>`;
@@ -135,7 +137,8 @@ async function runScan() {
     
     if (!json.success) throw new Error(json.error);
     
-    scanData = json.data;
+    // Keep ALL data for the Auto-Trader (including ❌ No)
+    scanData = json.data; 
     motherHighMap = {}; 
     
     // Fetch initial LTPs to populate the table immediately
@@ -156,11 +159,20 @@ async function runScan() {
       } catch (err) {}
     }
 
-    render(json);
+    // FILTER DATA FOR UI (Only show Yes or False Break)
+    const uiData = scanData.filter(d => d.is_breakout === 'Yes' || d.breakout_ts != null);
+    
+    // RENDER UI WITH FILTERED DATA
+    render({ 
+      data: uiData, 
+      totalScanned: scanData.length, 
+      isLive: json.isLive, 
+      scanMs: json.scanMs 
+    });
 
-    // 5. Auto-Start Paper Trade if there are setups
-    if (json.data.length > 0 && $('tradeMode').value === 'PAPER') {
-      const stocksToTrade = json.data.filter(d => d.is_breakout !== 'Yes').map(d => ({
+    // Auto-Start Paper Trade if there are setups (Uses the full scanData)
+    if (scanData.length > 0 && $('tradeMode').value === 'PAPER') {
+      const stocksToTrade = scanData.filter(d => d.is_breakout !== 'Yes').map(d => ({
         sym: d.sym, token: d.token, mother_high: d.mother_high
       }));
       
@@ -174,9 +186,8 @@ async function runScan() {
   }
 }
 
-// 6. Render UI
-function render({ data, isLive, scanMs }) {
-  const total = data.length;
+// ─── 4. RENDER UI ─────────────────────────────────────────
+function render({ data, totalScanned, isLive, scanMs }) {
   const broke = data.filter(d => d.breakout_ts).length;
   const confirmed = data.filter(d => d.is_breakout === 'Yes').length;
   
@@ -186,8 +197,9 @@ function render({ data, isLive, scanMs }) {
   });
   const avgChg = validChg ? (sumChg / validChg) : 0;
 
+  // UPDATE SUMMARY: Show Total Scanned (background) + UI Filtered counts
   $('summary').innerHTML = `
-    <div class="card"><div class="card-label">Setups Found</div><div class="card-val">${total}</div></div>
+    <div class="card"><div class="card-label">Total Setups</div><div class="card-val">${totalScanned || data.length}</div></div>
     <div class="card"><div class="card-label">Intraday Breakouts</div><div class="card-val" style="color: var(--warning)">${broke}</div></div>
     <div class="card"><div class="card-label">Confirmed (Close)</div><div class="card-val" style="color: var(--success)">${confirmed}</div></div>
     <div class="card"><div class="card-label">Avg Change %</div><div class="card-val ${pctClass(avgChg)}">${validChg ? avgChg.toFixed(2) : '0.00'}%</div></div>
@@ -195,7 +207,7 @@ function render({ data, isLive, scanMs }) {
   `;
 
   if (!data.length) {
-    $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 40px; color: var(--text-muted);">No Inside Bar setups found for this date.</td></tr>`;
+    $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 40px; color: var(--text-muted);">No breakouts found for this date.</td></tr>`;
     return;
   }
 
@@ -234,6 +246,7 @@ function render({ data, isLive, scanMs }) {
     </tr>`;
   }).join('');
 
+  // Cache elements for real-time SSE updates
   document.querySelectorAll('#tbody tr').forEach(tr => {
     const token = tr.dataset.token;
     if (motherHighMap[token]) {
@@ -245,7 +258,7 @@ function render({ data, isLive, scanMs }) {
   });
 }
 
-// 7. Auto-Trade Controls
+// ─── 5. AUTO-TRADE CONTROLS ───────────────────────────────
 $('startAutoBtn').addEventListener('click', async () => {
   if (!scanData || scanData.length === 0) {
     alert('Please scan a date first to load the watchlist.');
@@ -261,6 +274,7 @@ $('startAutoBtn').addEventListener('click', async () => {
     if (!confirmReal) return;
   }
 
+  // Uses the FULL scanData (including ❌ No) so it can monitor them
   const stocksToTrade = scanData.filter(d => d.is_breakout !== 'Yes').map(d => ({
     sym: d.sym,
     token: d.token,
@@ -320,7 +334,7 @@ $('stopAutoBtn').addEventListener('click', async () => {
   }
 });
 
-// 8. Auto-scan events
+// ─── 6. INIT & EVENTS ─────────────────────────────────────
 $('scanDate').addEventListener('change', runScan); // Auto scan when date changes
 
 window.addEventListener('load', () => {

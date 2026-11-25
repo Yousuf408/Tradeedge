@@ -171,9 +171,10 @@ function swingOnTick(tk, ltp) {
     strat: 'swing', 
     tag: 'SWING' 
   }, ltp).then(placed => {
-    if (placed === 0) bigPlayerEntered.delete(tk);
+    // Don't delete if it failed due to existing position or low capital
   }).catch(e => {
-    bigPlayerEntered.delete(tk);
+    // Only delete on actual network errors
+    setTimeout(() => bigPlayerEntered.delete(tk), 60000);
     console.error('🤖 Swing entry error:', e.message);
   });
 }

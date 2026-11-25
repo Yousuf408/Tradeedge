@@ -1,34 +1,38 @@
 /* ============================================================
-   BTST Frontend Logic (btst.js) - Auto Live Feed + Auto Trade
+   BTST Frontend Logic (btst.js) - Auto-Scan & Live Change %
    ============================================================ */
 
 const API = ''; 
 
-// --- BULLETPROOF TOKEN FETCHER ---
 const getToken = () => {
   try {
     if (window.parent && typeof window.parent.getToken === 'function') {
       const pToken = window.parent.getToken();
-      if (pToken) return pToken;
+      if (pToken && pToken !== 'undefined') return pToken;
     }
   } catch (e) {}
-  
-  // Check all possible keys the main app might use
   const keys = ['ta_token', 'token', 'jwt', 'auth_token', 'access_token', 'ta_auth', 'ta_auth_token'];
   for (let k of keys) {
     const val = localStorage.getItem(k);
-    if (val && val !== 'undefined' && val !== 'null') return val;
+    if (val && val.length > 20 && val !== 'undefined' && val !== 'null') return val;
   }
   return '';
 };
 
 const getUserId = () => localStorage.getItem('ta_user') || localStorage.getItem('username') || 'admin';
-
-
 const $ = id => document.getElementById(id);
-const today = () => new Date().toISOString().slice(0, 10);
 const fmt = (v, d = 2) => v === null || v === undefined ? '—' : Number(v).toFixed(d);
 const pctClass = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
+
+// Helper: Get Last Working Day (Yesterday)
+function getLastWorkingDay() {
+  let d = new Date();
+  d.setDate(d.getDate() - 1); // Start with yesterday
+  while (d.getDay() === 0 || d.getDay() === 6) { // Skip Sat/Sun
+    d.setDate(d.getDate() - 1);
+  }
+  return d.toISOString().slice(0, 10);
+}
 
 const formatDateOnly = (dateStr) => {
   if (!dateStr) return '—';
@@ -49,15 +53,15 @@ let liveSSE = null;
 let latestTicks = {}; 
 let motherHighMap = {}; 
 
-$('scanDate').value = today();
+// 1. Set default date on load
+$('scanDate').value = getLastWorkingDay();
 
-// ─── 1. LIVE SSE CONNECTION ───────────────────────────────
+// 2. Start SSE
 function startSSE() {
   if (liveSSE) return;
   const token = getToken();
-  
   if (!token) {
-    $('liveStatus').textContent = '🔴 Auth token missing (Check login)';
+    $('liveStatus').textContent = '🔴 Auth token missing';
     $('liveStatus').style.color = 'var(--danger)';
     return;
   }
@@ -86,34 +90,43 @@ function startSSE() {
   };
 }
 
-// ─── 2. UPDATE DOM IN REAL-TIME ───────────────────────────
+// 3. Update DOM (LTP + Dynamic Change %)
 function updateLiveUI(ticks) {
-  let anyBreakout = false;
-  
   for (const [token, price] of Object.entries(ticks)) {
     const data = motherHighMap[token];
     if (!data || !data.trEl) continue;
 
+    // Update LTP
     if (data.ltpEl) {
       data.ltpEl.textContent = '₹' + (+price).toFixed(2);
     }
 
+    // Update Change % dynamically based on LTP vs Mother High
+    if (data.changePctEl && data.mother_high) {
+      const pct = ((price - data.mother_high) / data.mother_high) * 100;
+      data.changePctEl.className = `change-pct-cell ${pctClass(pct)}`;
+      data.changePctEl.textContent = (pct > 0 ? '+' : '') + pct.toFixed(2) + '%';
+    }
+
+    // Update Breakout Badge
     if (price > data.mother_high && !data.trEl.classList.contains('live-broken')) {
       data.trEl.classList.add('live-broken');
-      anyBreakout = true;
       data.badgeEl.innerHTML = `<span class="badge b-wait" style="animation: pulse 1.5s infinite;">⏳ Touched (Wait 5m)</span>`;
       data.trEl.style.backgroundColor = 'rgba(245, 158, 11, 0.1)';
     }
   }
-
-  if (anyBreakout) document.title = `🚀 BREAKOUT DETECTED!`;
 }
 
-// ─── 3. RUN SCAN ──────────────────────────────────────────
+// 4. Run Scan (Auto-triggered on load and date change)
 async function runScan() {
   const date = $('scanDate').value;
   $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 20px; color: var(--text-muted);">Scanning ${date}... (this may take a few seconds)</td></tr>`;
   
+  // Stop live monitor if running
+  if ($('stopAutoBtn').style.display === 'inline-flex') {
+      $('stopAutoBtn').click();
+  }
+
   try {
     const res = await fetch(`${API}/api/btst/scan?date=${date}`, {
       headers: { Authorization: 'Bearer ' + getToken() }
@@ -122,39 +135,46 @@ async function runScan() {
     
     if (!json.success) throw new Error(json.error);
     
-      scanData = json.data;
+    scanData = json.data;
     motherHighMap = {}; 
     
-    // --- ADD THIS BLOCK ---
+    // Fetch initial LTPs to populate the table immediately
     if (scanData.length > 0) {
       const tokens = scanData.map(d => d.token);
       try {
         const ltpRes = await fetch(`${API}/api/screener/ltp`, {
           method: 'POST',
-          headers: { 
-            'Content-Type': 'application/json', 
-            Authorization: 'Bearer ' + getToken() 
-          },
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + getToken() },
           body: JSON.stringify({ tokens })
         });
         const ltpJson = await ltpRes.json();
         if (ltpJson.results) {
           ltpJson.results.forEach(r => {
-            if (r.ltp) latestTicks[r.token] = r.ltp; // Save to our cache
+            if (r.ltp) latestTicks[r.token] = r.ltp;
           });
         }
-      } catch (err) { console.error('Failed to fetch initial LTPs', err); }
+      } catch (err) {}
     }
-    // ---------------------
 
     render(json);
+
+    // 5. Auto-Start Paper Trade if there are setups
+    if (json.data.length > 0 && $('tradeMode').value === 'PAPER') {
+      const stocksToTrade = json.data.filter(d => d.is_breakout !== 'Yes').map(d => ({
+        sym: d.sym, token: d.token, mother_high: d.mother_high
+      }));
+      
+      if (stocksToTrade.length > 0 && $('startAutoBtn').style.display !== 'none') {
+        $('startAutoBtn').click();
+      }
+    }
     
   } catch (e) {
     $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 20px; color: var(--danger);">Error: ${e.message}</td></tr>`;
   }
 }
 
-// ─── 4. RENDER UI ─────────────────────────────────────────
+// 6. Render UI
 function render({ data, isLive, scanMs }) {
   const total = data.length;
   const broke = data.filter(d => d.breakout_ts).length;
@@ -190,15 +210,21 @@ function render({ data, isLive, scanMs }) {
     }
 
     const currentLtp = latestTicks[d.token] ? '₹' + (+latestTicks[d.token]).toFixed(2) : '—';
+    
+    // Calculate dynamic change % for initial render
+    let currentPct = d.change_pct;
+    if (latestTicks[d.token] && d.mother_high) {
+       currentPct = ((latestTicks[d.token] - d.mother_high) / d.mother_high) * 100;
+    }
 
-    motherHighMap[d.token] = { mother_high: Number(d.mother_high), trEl: null, badgeEl: null, ltpEl: null };
+    motherHighMap[d.token] = { mother_high: Number(d.mother_high), trEl: null, badgeEl: null, ltpEl: null, changePctEl: null };
 
     return `<tr data-token="${d.token}">
       <td>${i + 1}</td>
       <td><span class="sym">${d.sym}</span></td>
       <td class="ltp-cell" style="font-weight:700;">${currentLtp}</td>
       <td>${formatDateOnly(d.mother_date)}</td>
-      <td class="${pctClass(d.change_pct)}">${d.change_pct != null ? d.change_pct + '%' : '—'}</td>
+      <td class="change-pct-cell ${pctClass(currentPct)}">${currentPct != null ? currentPct.toFixed(2) + '%' : '—'}</td>
       <td class="${pctClass(d.t1_pct)}">${d.t1_pct != null ? d.t1_pct + '%' : '—'}</td>
       <td>${d.breakout_rvol != null ? fmt(d.breakout_rvol, 2) + 'x' : '—'}</td>
       <td>${formatDateTimeNoSec(d.breakout_ts)}</td>
@@ -214,11 +240,12 @@ function render({ data, isLive, scanMs }) {
       motherHighMap[token].trEl = tr;
       motherHighMap[token].badgeEl = tr.querySelector('.action-cell');
       motherHighMap[token].ltpEl = tr.querySelector('.ltp-cell');
+      motherHighMap[token].changePctEl = tr.querySelector('.change-pct-cell');
     }
   });
 }
 
-// ─── 5. AUTO-TRADE CONTROLS ───────────────────────────────
+// 7. Auto-Trade Controls
 $('startAutoBtn').addEventListener('click', async () => {
   if (!scanData || scanData.length === 0) {
     alert('Please scan a date first to load the watchlist.');
@@ -241,7 +268,7 @@ $('startAutoBtn').addEventListener('click', async () => {
   }));
 
   if (stocksToTrade.length === 0) {
-    alert('All stocks in this scan have already broken out. Scan a new date/watchlist.');
+    if (mode === 'REAL') alert('All stocks in this scan have already broken out.');
     return;
   }
 
@@ -293,10 +320,10 @@ $('stopAutoBtn').addEventListener('click', async () => {
   }
 });
 
-// ─── 6. INIT ──────────────────────────────────────────────
-$('scanBtn').addEventListener('click', runScan);
+// 8. Auto-scan events
+$('scanDate').addEventListener('change', runScan); // Auto scan when date changes
 
 window.addEventListener('load', () => {
   startSSE(); 
-  runScan();  
+  runScan();  // Auto scan immediately on page load
 });

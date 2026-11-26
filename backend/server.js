@@ -372,7 +372,7 @@ const vwapPV = new Map();
 const vwapV = new Map();
 let vwapDate = null;
 const prevCumVol = new Map();
-const minVolRing = new Map();
+const prev5mCumVol = new Map(); // NEW: Tracks cumulative volume at the end of last 5m block
 let wsMinuteKey = null;
 
 async function flushWSMinuteClose(prevKey, prevTs, date) {
@@ -410,12 +410,9 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
       firstMinuteRvol.set(token, rvol);
     }
 
-    const ring = minVolRing.get(token) || [];
-    ring.push(mv);
-    if (ring.length > 5) ring.shift();
-    minVolRing.set(token, ring);
+    // REMOVED minVolRing logic entirely
   }
-   if (!tokens.length) return;
+  if (!tokens.length) return;
 
   // --- NEW: Track 5-min OHLC ---
   for (const tk of tokens) {
@@ -434,7 +431,28 @@ async function flushWSMinuteClose(prevKey, prevTs, date) {
 
   const isFive = Number(prevKey.slice(3)) % 5 === 4;
   const tss = tokens.map(() => prevTs);
-  const vols5 = isFive ? tokens.map(t => (minVolRing.get(t) || []).reduce((a, b) => a + b, 0)) : [];
+  
+  // NEW: Calculate exact 5-min volume using Cumulative Volume Difference
+  let vols5 = [];
+  if (isFive) {
+    vols5 = tokens.map((t, index) => {
+      const cum = lastWsVolume.get(t) ?? bsCache.get(t)?.volume ?? null;
+      const prev = prev5mCumVol.get(t) || 0;
+      
+      let vol = 0;
+      if (cum !== null && cum > 0) {
+        vol = cum - prev;
+        prev5mCumVol.set(t, cum); // Save current cum for the next 5m block
+      } else {
+        // Fallback: If cumulative volume is missing, sum up the 1-min volumes!
+        vol = minVols[index];
+      }
+      
+      // Never return 0 if we have 1-min volume data
+      return vol > 0 ? vol : (minVols[index] || 0);
+    });
+  }
+  
   const vwaps = tokens.map(t => lastWsAvg.get(t) ?? 0);
   
   const opens5 = isFive ? tokens.map(t => temp5MinOpen.get(t)) : [];

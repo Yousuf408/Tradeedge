@@ -15,9 +15,9 @@ const pkey = (userId, token) => `${userId}|${token}`;
 async function savePos(db, p) {
   try {
     await db.query(
-      `INSERT INTO auto_positions
-         (date, token, user_id, sym, qty, entry, sl, stage, peak, status, exit_price, exit_reason, entry_at, exit_at, updated_at, side, strategy)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),$15,$16)
+           `INSERT INTO auto_positions
+         (date, token, user_id, sym, qty, entry, sl, stage, peak, status, exit_price, exit_reason, entry_at, exit_at, updated_at, side, strategy, sector_name, sector_rank)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),$15,$16,$17,$18)`
        ON CONFLICT (date, token, user_id, strategy) DO UPDATE SET
          sl=EXCLUDED.sl, stage=EXCLUDED.stage, peak=EXCLUDED.peak,
          status=EXCLUDED.status, exit_price=EXCLUDED.exit_price,
@@ -28,7 +28,7 @@ async function savePos(db, p) {
   } catch (e) { console.error('BTST DB Save Error:', e.message); }
 }
 
-export function registerBtstRoutes(app, db) {
+export function registerBtstRoutes(app, db, getSectorRanks) {
   const router = express.Router();
 
   router.get('/scan', async (req, res) => {
@@ -141,7 +141,31 @@ export function registerBtstRoutes(app, db) {
       
       if (stock && stock.state === 'ARMED' && Number(price) > stock.armed_high) {
         stock.triggered = true;
-        const config = data.config || {};
+               const config = data.config || {};
+        
+        // NEW: Get sector rank at the exact moment of breakout
+        let sectorName = 'UNKNOWN';
+        let sectorRank = null;
+        try {
+          const ranks = getSectorRanks();
+          // Find which sector this stock belongs to (using your global STOCKS list logic, but simplified here)
+          // Assuming you pass the stock's sector in the watchlist, or look it up:
+          sectorName = stock.sector || 'MISC'; 
+          sectorRank = ranks[sectorName] || null;
+        } catch (e) {}
+
+        const pos = {
+          userId, token: tk, sym: stock.sym, qty: config.qty || 1,
+          side: 'BUY',
+          entry: +price.toFixed(2),
+          sl: +(price * 0.98).toFixed(2),
+          target: +(price * 1.04).toFixed(2),
+          stage: 0, status: 'open', reason: null, exitPrice: null,
+          entryAt: new Date().toISOString(), exitAt: null,
+          entryDate: todayIST(),
+          sectorName, // <-- SAVED
+          sectorRank  // <-- SAVED
+        };
         
         const pos = {
           userId, token: tk, sym: stock.sym, qty: config.qty || 1,

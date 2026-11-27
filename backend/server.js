@@ -2313,8 +2313,14 @@ registerAdminRoutes(app, {
   loadHolidaysFromDB
 });
 
+// NEW: Helper function for btstRoutes.js to map token to sector
+app.getSectorByToken = () => {
+  return SECTOR_BY_TOKEN;
+};
+
 // Pass a function to get live sector rankings
 registerBtstRoutes(app, db, () => {
+   
   const by = {};
   for (const s of STOCKS) {
     const t = String(s.token);

@@ -14,9 +14,12 @@ const pkey = (userId, token) => `${userId}|${token}`;
 
 async function savePos(db, p) {
   try {
+    // Only save sector info if it actually broke out
+    const finalSectorName = p.status === 'open' || p.reason ? p.sectorName : null;
+    const finalSectorRank = p.status === 'open' || p.reason ? p.sectorRank : null;
     await db.query(
       `INSERT INTO auto_positions
-         (date, token, user_id, sym, qty, entry, sl, stage, peak, status, exit_price, exit_reason, entry_at, exit_at, updated_at, side, strategy, sector_name, sector_rank)
+      (date, token, user_id, sym, qty, entry, sl, stage, peak, status, exit_price, exit_reason, entry_at, exit_at, updated_at, side, strategy, sector_name, sector_rank)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),$15,$16,$17,$18)
        ON CONFLICT (date, token, user_id, strategy) DO UPDATE SET
          sl=EXCLUDED.sl, stage=EXCLUDED.stage, peak=EXCLUDED.peak,

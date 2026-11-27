@@ -1,5 +1,5 @@
 /* ============================================================
-   btstRoutes.js — BTST Engine with 5-Min Confirmation & Sector Rank
+   btstRoutes.js — BTST Engine (No Fake Historical Sectors)
    ============================================================ */
 
 import express from 'express';
@@ -17,16 +17,17 @@ async function savePos(db, p) {
     // Only save sector info if it actually broke out
     const finalSectorName = p.status === 'open' || p.reason ? p.sectorName : null;
     const finalSectorRank = p.status === 'open' || p.reason ? p.sectorRank : null;
+
     await db.query(
       `INSERT INTO auto_positions
-      (date, token, user_id, sym, qty, entry, sl, stage, peak, status, exit_price, exit_reason, entry_at, exit_at, updated_at, side, strategy, sector_name, sector_rank)
+         (date, token, user_id, sym, qty, entry, sl, stage, peak, status, exit_price, exit_reason, entry_at, exit_at, updated_at, side, strategy, sector_name, sector_rank)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),$15,$16,$17,$18)
        ON CONFLICT (date, token, user_id, strategy) DO UPDATE SET
          sl=EXCLUDED.sl, stage=EXCLUDED.stage, peak=EXCLUDED.peak,
          status=EXCLUDED.status, exit_price=EXCLUDED.exit_price,
          exit_reason=EXCLUDED.exit_reason, exit_at=EXCLUDED.exit_at, updated_at=NOW(), side=EXCLUDED.side`,
       [p.entryDate, p.token, p.userId, p.sym, p.qty, p.entry, p.sl, p.stage, p.entry,
-       p.status, p.exitPrice, p.reason, p.entryAt, p.exitAt, p.side || 'BUY', 'BTST', p.sectorName || null, p.sectorRank || null]
+       p.status, p.exitPrice, p.reason, p.entryAt, p.exitAt, p.side || 'BUY', 'BTST', finalSectorName, finalSectorRank]
     );
   } catch (e) { console.error('BTST DB Save Error:', e.message); }
 }
@@ -41,7 +42,8 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
       if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ success: false, error: 'date required' });
 
       const istNow = new Date(Date.now() + 5.5 * 3600 * 1000);
-      const isLive = date === istNow.toISOString().slice(0, 10);
+      const todayStr = istNow.toISOString().slice(0, 10);
+      const isLive = date === todayStr;
 
       // 1. CHECK IF ALREADY SCANNED (CACHE FROM DB)
       const { rows: cachedRows } = await db.query(
@@ -101,16 +103,27 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
       const t0 = Date.now();
       const { rows } = await db.query(sql, [date, strategyId]);
       
-      const ranks = getSectorRanks();
       const sectorMap = app.getSectorByToken ? app.getSectorByToken() : {};
+      
+      // ONLY fetch live ranks if we are scanning TODAY.
+      let ranks = {};
+      if (isLive) {
+        ranks = getSectorRanks();
+      }
 
       const data = rows.map(r => {
         const sector = sectorMap[r.token] || 'MISC';
-        const rank = ranks[sector] || null;
+        
+        // ONLY assign rank if it's live AND a breakout happened
+        let rank = null;
+        if (isLive && r.breakout_ts != null) {
+           rank = ranks[sector] || null;
+        }
+        
         return { ...r, sector, sector_rank: rank };
       });
 
-      // 3. SAVE RESULTS TO DB (Using explicit type casts for arrays)
+      // 3. SAVE RESULTS TO DB
       if (data.length > 0) {
         const values = [];
         const placeholders = data.map((d, i) => {
@@ -121,7 +134,6 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
              d.breakout_ts, d.breakout_time_ist, d.breakout_rvol, d.is_breakout, 
              d.sector, d.sector_rank
            );
-           // Added explicit ::date, ::numeric, etc to prevent column mismatch error
            return `($${idx+1}::date, $${idx+2}, $${idx+3}, $${idx+4}::date, $${idx+5}::numeric, $${idx+6}::numeric, $${idx+7}::numeric, $${idx+8}::numeric, $${idx+9}::integer, $${idx+10}::numeric, $${idx+11}::numeric, $${idx+12}::timestamptz, $${idx+13}, $${idx+14}::numeric, $${idx+15}, $${idx+16}, $${idx+17}::integer)`;
         }).join(',');
         

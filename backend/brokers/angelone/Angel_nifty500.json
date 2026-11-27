@@ -138,6 +138,8 @@
   {"sym":"TEJASNET","token":"21131"},
   {"sym":"TTML","token":"8954","disabled":true},
   {"sym":"ZENSARTECH","token":"1076"}
+  {"sym":"WIPRO","token":"3787"}
+  {"sym":"FSL","token":"14304"},
 ],
 
 "PHARMA": [
@@ -188,6 +190,7 @@
   {"sym":"WOCKPHARMA","token":"7506"},
   {"sym":"ZYDUSLIFE","token":"7929"},
   {"sym":"ZYDUSWELL","token":"17635"}
+  
 ],
 
 "AUTO": [
@@ -530,7 +533,7 @@
   {"sym":"CANHLIFE","token":"759477","disabled":true},
   {"sym":"CPPLUS","token":"758858","disabled":true},
   {"sym":"ENRIN","token":"756871"},
-  {"sym":"FSL","token":"14304"},
+  
   {"sym":"GICRE","token":"277"},
   {"sym":"GODIGIT","token":"23799"},
   {"sym":"GRASIM","token":"1232"},
@@ -545,6 +548,6 @@
   {"sym":"SWANCORP","token":"27095"},
   {"sym":"TBOTEK","token":"23740"},
   {"sym":"VMM","token":"27969","disabled":true},
-  {"sym":"WIPRO","token":"3787"}
+  
 ]
 }

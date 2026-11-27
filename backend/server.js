@@ -2313,10 +2313,8 @@ registerAdminRoutes(app, {
   loadHolidaysFromDB
 });
 
-
 // Pass a function to get live sector rankings
 registerBtstRoutes(app, db, () => {
-  // Re-using the sector logic from your /api/sectors endpoint
   const by = {};
   for (const s of STOCKS) {
     const t = String(s.token);
@@ -2324,17 +2322,14 @@ registerBtstRoutes(app, db, () => {
     const ltp = getCachedLTP(t) ?? bsCache.get(t)?.ltp ?? null;
     const open = bsCache.get(t)?.dayOpen ?? null;
     
-    const e = by[sec] || (by[sec] = { sector: sec, up: 0, down: 0, sumOpen: 0, nOpen: 0 });
+    const e = by[sec] || (by[sec] = { sector: sec, sumOpen: 0, nOpen: 0 });
     if (!ltp || !open || open <= 0) continue;
     
     const openPct = ((ltp - open) / open) * 100;
-    if (ltp > open) e.up++;
-    else if (ltp < open) e.down++;
     e.sumOpen += openPct;
     e.nOpen++;
   }
   
-  // Return a map of { sectorName: rank }
   const sectors = Object.values(by)
     .map(e => ({ sector: e.sector, avg: e.nOpen ? e.sumOpen / e.nOpen : -999 }))
     .sort((a, b) => b.avg - a.avg);
@@ -2347,6 +2342,7 @@ registerBtstRoutes(app, db, () => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Server on port ${PORT} — v5.53 (Ultra Clean)`);
+  
   initMarginService(db, getBrokerSession);
 
   try { 

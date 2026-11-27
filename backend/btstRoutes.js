@@ -49,12 +49,10 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
           FROM strategy_bs_snapshot
           WHERE day_high IS NOT NULL AND day_low IS NOT NULL AND strategy_id = $2
             AND date BETWEEN ($1::date - 15) AND ($1::date + 3)
-                GROUP BY sym, date
+          GROUP BY sym, date
         )
         SELECT t.sym, t.token, 
-          COALESCE((SELECT sector FROM ... WHERE token = t.token LIMIT 1), 'MISC') AS sector,
           m.date AS mother_date, m.high AS mother_high, m.low AS mother_low,
-          
           t.high AS inside_high, t.low AS inside_low, (t.date - m.date) AS days_inside,
           CASE WHEN t.next_close > m.high THEN ROUND(((t.next_close - m.high) / NULLIF(m.high, 0)) * 100, 2) ELSE NULL END AS change_pct,
           CASE WHEN t.next_close > m.high THEN ROUND(((t.next2_high - m.high) / NULLIF(m.high, 0)) * 100, 2) ELSE NULL END AS t1_pct,
@@ -81,9 +79,20 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
 
       const t0 = Date.now();
       const { rows } = await db.query(sql, [date, strategyId]);
-      const scanMs = Date.now() - t0;
+      
+      // --- NEW: Calculate Sector & Rank for each row ---
+      const ranks = getSectorRanks();
+      // Use the global STOCKS mapping from server.js if available, otherwise fallback
+      const sectorMap = app.getSectorByToken ? app.getSectorByToken() : {};
 
-      res.json({ success: true, date, isLive, scanMs, count: rows.length, data: rows });
+      const data = rows.map(r => {
+        const sector = sectorMap[r.token] || 'MISC';
+        const rank = ranks[sector] || null;
+        return { ...r, sector, sector_rank: rank };
+      });
+      // -------------------------------------------------
+
+      res.json({ success: true, date, isLive, scanMs: Date.now() - t0, count: data.length, data });
     } catch (err) {
       res.status(500).json({ success: false, error: err.message });
     }
@@ -95,7 +104,7 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
 
     const list = stocks.map(s => ({
       sym: s.sym, token: String(s.token), mother_high: Number(s.mother_high), 
-      sector: s.sector, // <-- ADD THIS
+      sector: s.sector || 'MISC', // Passed from UI
       state: 'WAITING',
       armed_high: null,
       triggered: false
@@ -146,7 +155,6 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
         let sectorRank = null;
         try {
           const ranks = getSectorRanks();
-          // Use the real sector name passed from the frontend watchlist
           sectorName = stock.sector || 'MISC'; 
           sectorRank = ranks[sectorName] || null;
         } catch (e) {

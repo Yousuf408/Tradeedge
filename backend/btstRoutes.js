@@ -151,6 +151,14 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
         stock.triggered = true;
         const config = data.config || {};
         
+        // FIX: Ensure userId is strictly a string (extract 'admin' from JSON if needed)
+        let safeUserId = userId;
+        try {
+          if (typeof userId === 'string' && userId.startsWith('{')) {
+             safeUserId = JSON.parse(userId).username || JSON.parse(userId).id || 'admin';
+          }
+        } catch(e) {}
+                 
         let sectorName = 'MISC';
         let sectorRank = null;
         try {

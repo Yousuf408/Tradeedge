@@ -42,12 +42,11 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
 
       // 1. CHECK IF ALREADY SCANNED (CACHE FROM DB)
       const { rows: cachedRows } = await db.query(
-        `SELECT * FROM btst_setups WHERE scan_date = $1 ORDER BY change_pct DESC NULLS LAST`, 
+        `SELECT * FROM btst_setups WHERE scan_date = $1::date ORDER BY change_pct DESC NULLS LAST`, 
         [date]
       );
 
       if (cachedRows.length > 0) {
-        // Map DB columns back to frontend expected names
         const data = cachedRows.map(r => ({
           sym: r.sym, token: r.token, mother_date: r.mother_date, mother_high: r.mother_high,
           mother_low: r.mother_low, inside_high: r.inside_high, inside_low: r.inside_low,
@@ -108,13 +107,19 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
         return { ...r, sector, sector_rank: rank };
       });
 
-      // 3. SAVE RESULTS TO DB
+      // 3. SAVE RESULTS TO DB (Using explicit type casts for arrays)
       if (data.length > 0) {
         const values = [];
         const placeholders = data.map((d, i) => {
-           const idx = i * 16;
-           values.push(date, d.token, d.sym, d.mother_date, d.mother_high, d.mother_low, d.inside_high, d.inside_low, d.days_inside, d.change_pct, d.t1_pct, d.breakout_ts, d.breakout_time_ist, d.breakout_rvol, d.is_breakout, d.sector, d.sector_rank);
-           return `($${idx+1}, $${idx+2}, $${idx+3}, $${idx+4}, $${idx+5}, $${idx+6}, $${idx+7}, $${idx+8}, $${idx+9}, $${idx+10}, $${idx+11}, $${idx+12}, $${idx+13}, $${idx+14}, $${idx+15}, $${idx+16}, $${idx+17})`;
+           const idx = i * 17;
+           values.push(
+             date, d.token, d.sym, d.mother_date, d.mother_high, d.mother_low, 
+             d.inside_high, d.inside_low, d.days_inside, d.change_pct, d.t1_pct, 
+             d.breakout_ts, d.breakout_time_ist, d.breakout_rvol, d.is_breakout, 
+             d.sector, d.sector_rank
+           );
+           // Added explicit ::date, ::numeric, etc to prevent column mismatch error
+           return `($${idx+1}::date, $${idx+2}, $${idx+3}, $${idx+4}::date, $${idx+5}::numeric, $${idx+6}::numeric, $${idx+7}::numeric, $${idx+8}::numeric, $${idx+9}::integer, $${idx+10}::numeric, $${idx+11}::numeric, $${idx+12}::timestamptz, $${idx+13}, $${idx+14}::numeric, $${idx+15}, $${idx+16}, $${idx+17}::integer)`;
         }).join(',');
         
         await db.query(`

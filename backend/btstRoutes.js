@@ -1,5 +1,5 @@
 /* ============================================================
-   btstRoutes.js — BTST Engine with 5-Min Confirmation
+   btstRoutes.js — BTST Engine with 5-Min Confirmation & Sector Rank
    ============================================================ */
 
 import express from 'express';
@@ -15,15 +15,15 @@ const pkey = (userId, token) => `${userId}|${token}`;
 async function savePos(db, p) {
   try {
     await db.query(
-           `INSERT INTO auto_positions
+      `INSERT INTO auto_positions
          (date, token, user_id, sym, qty, entry, sl, stage, peak, status, exit_price, exit_reason, entry_at, exit_at, updated_at, side, strategy, sector_name, sector_rank)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),$15,$16,$17,$18)`
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW(),$15,$16,$17,$18)
        ON CONFLICT (date, token, user_id, strategy) DO UPDATE SET
          sl=EXCLUDED.sl, stage=EXCLUDED.stage, peak=EXCLUDED.peak,
          status=EXCLUDED.status, exit_price=EXCLUDED.exit_price,
          exit_reason=EXCLUDED.exit_reason, exit_at=EXCLUDED.exit_at, updated_at=NOW(), side=EXCLUDED.side`,
       [p.entryDate, p.token, p.userId, p.sym, p.qty, p.entry, p.sl, p.stage, p.entry,
-       p.status, p.exitPrice, p.reason, p.entryAt, p.exitAt, p.side || 'BUY', 'BTST']
+       p.status, p.exitPrice, p.reason, p.entryAt, p.exitAt, p.side || 'BUY', 'BTST', p.sectorName || null, p.sectorRank || null]
     );
   } catch (e) { console.error('BTST DB Save Error:', e.message); }
 }
@@ -48,7 +48,7 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
             LEAD(MAX(day_high), 2) OVER (PARTITION BY sym ORDER BY date) AS next2_high
           FROM strategy_bs_snapshot
           WHERE day_high IS NOT NULL AND day_low IS NOT NULL AND strategy_id = $2
-            AND date BETWEEN ($1::date - 60) AND ($1::date + 3)
+            AND date BETWEEN ($1::date - 15) AND ($1::date + 3)
           GROUP BY sym, date
         )
         SELECT t.sym, t.token, m.date AS mother_date, m.high AS mother_high, m.low AS mother_low,
@@ -78,7 +78,7 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
 
       const t0 = Date.now();
       const { rows } = await db.query(sql, [date, strategyId]);
-      const scanMs = Date.now() - t0; // Fixed Scan Time
+      const scanMs = Date.now() - t0;
 
       res.json({ success: true, date, isLive, scanMs, count: rows.length, data: rows });
     } catch (err) {
@@ -92,8 +92,8 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
 
     const list = stocks.map(s => ({
       sym: s.sym, token: String(s.token), mother_high: Number(s.mother_high), 
-      state: 'WAITING', // NEW: State machine
-      armed_high: null, // NEW: Tracks the 5m high
+      state: 'WAITING',
+      armed_high: null,
       triggered: false
     }));
 
@@ -106,7 +106,6 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
     res.json({ success: true });
   });
 
-  // ─── NEW: Triggered on 5-Minute Close ───
   app.processBtst5mClose = (token, close, high) => {
     const tk = String(token);
     for (const [userId, data] of activeTraders.entries()) {
@@ -114,14 +113,12 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
       if (!stock) continue;
 
       if (close > stock.mother_high) {
-        // 5m closed above mother high -> ARM the setup
         if (stock.state !== 'ARMED') {
            console.log(`⏳ [BTST] ${stock.sym} 5m closed above Mother High (₹${close} > ₹${stock.mother_high}). Armed at ₹${high}`);
         }
         stock.state = 'ARMED';
         stock.armed_high = high;
       } else {
-        // 5m closed below mother high -> Reset
         if (stock.state === 'ARMED') {
           console.log(`❌ [BTST] ${stock.sym} 5m closed below Mother High. Disarmed.`);
         }
@@ -131,25 +128,20 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
     }
   };
 
-  // ─── Triggered on Every Tick ───
   app.processBtstTick = async (token, price) => {
     const tk = String(token);
 
-    // A) Check for NEW Entries (Only if ARMED)
     for (const [userId, data] of activeTraders.entries()) {
       const stock = data.watchlist.find(s => s.token === tk && !s.triggered);
       
       if (stock && stock.state === 'ARMED' && Number(price) > stock.armed_high) {
         stock.triggered = true;
-               const config = data.config || {};
+        const config = data.config || {};
         
-        // NEW: Get sector rank at the exact moment of breakout
         let sectorName = 'UNKNOWN';
         let sectorRank = null;
         try {
           const ranks = getSectorRanks();
-          // Find which sector this stock belongs to (using your global STOCKS list logic, but simplified here)
-          // Assuming you pass the stock's sector in the watchlist, or look it up:
           sectorName = stock.sector || 'MISC'; 
           sectorRank = ranks[sectorName] || null;
         } catch (e) {}
@@ -163,19 +155,8 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
           stage: 0, status: 'open', reason: null, exitPrice: null,
           entryAt: new Date().toISOString(), exitAt: null,
           entryDate: todayIST(),
-          sectorName, // <-- SAVED
-          sectorRank  // <-- SAVED
-        };
-        
-        const pos = {
-          userId, token: tk, sym: stock.sym, qty: config.qty || 1,
-          side: 'BUY',
-          entry: +price.toFixed(2),
-          sl: +(price * 0.98).toFixed(2),
-          target: +(price * 1.04).toFixed(2),
-          stage: 0, status: 'open', reason: null, exitPrice: null,
-          entryAt: new Date().toISOString(), exitAt: null,
-          entryDate: todayIST()
+          sectorName,
+          sectorRank
         };
 
         btstPositions.set(pkey(userId, tk), pos);
@@ -190,7 +171,6 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
       }
     }
 
-    // B) Check for EXITS
     for (const [key, pos] of btstPositions.entries()) {
       if (pos.token !== tk || pos.status !== 'open') continue;
 

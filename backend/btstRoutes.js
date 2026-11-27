@@ -40,6 +40,25 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
       const istNow = new Date(Date.now() + 5.5 * 3600 * 1000);
       const isLive = date === istNow.toISOString().slice(0, 10);
 
+      // 1. CHECK IF ALREADY SCANNED (CACHE FROM DB)
+      const { rows: cachedRows } = await db.query(
+        `SELECT * FROM btst_setups WHERE scan_date = $1 ORDER BY change_pct DESC NULLS LAST`, 
+        [date]
+      );
+
+      if (cachedRows.length > 0) {
+        // Map DB columns back to frontend expected names
+        const data = cachedRows.map(r => ({
+          sym: r.sym, token: r.token, mother_date: r.mother_date, mother_high: r.mother_high,
+          mother_low: r.mother_low, inside_high: r.inside_high, inside_low: r.inside_low,
+          days_inside: r.days_inside, change_pct: r.change_pct, t1_pct: r.t1_pct,
+          breakout_ts: r.breakout_ts, breakout_time_ist: r.breakout_time_ist, breakout_rvol: r.breakout_rvol,
+          is_breakout: r.is_breakout, sector: r.sector_name, sector_rank: r.sector_rank
+        }));
+        return res.json({ success: true, date, isLive, scanMs: 5, count: data.length, data });
+      }
+
+      // 2. IF NOT SCANNED, RUN THE SQL
       const sql = `
         WITH daily_data AS (
           SELECT sym, date, MAX(token) AS token, MAX(day_high) AS high, MIN(day_low) AS low, MAX(day_close) AS close,
@@ -80,9 +99,7 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
       const t0 = Date.now();
       const { rows } = await db.query(sql, [date, strategyId]);
       
-      // --- NEW: Calculate Sector & Rank for each row ---
       const ranks = getSectorRanks();
-      // Use the global STOCKS mapping from server.js if available, otherwise fallback
       const sectorMap = app.getSectorByToken ? app.getSectorByToken() : {};
 
       const data = rows.map(r => {
@@ -90,7 +107,23 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
         const rank = ranks[sector] || null;
         return { ...r, sector, sector_rank: rank };
       });
-      // -------------------------------------------------
+
+      // 3. SAVE RESULTS TO DB
+      if (data.length > 0) {
+        const values = [];
+        const placeholders = data.map((d, i) => {
+           const idx = i * 16;
+           values.push(date, d.token, d.sym, d.mother_date, d.mother_high, d.mother_low, d.inside_high, d.inside_low, d.days_inside, d.change_pct, d.t1_pct, d.breakout_ts, d.breakout_time_ist, d.breakout_rvol, d.is_breakout, d.sector, d.sector_rank);
+           return `($${idx+1}, $${idx+2}, $${idx+3}, $${idx+4}, $${idx+5}, $${idx+6}, $${idx+7}, $${idx+8}, $${idx+9}, $${idx+10}, $${idx+11}, $${idx+12}, $${idx+13}, $${idx+14}, $${idx+15}, $${idx+16}, $${idx+17})`;
+        }).join(',');
+        
+        await db.query(`
+          INSERT INTO btst_setups 
+            (scan_date, token, sym, mother_date, mother_high, mother_low, inside_high, inside_low, days_inside, change_pct, t1_pct, breakout_ts, breakout_time_ist, breakout_rvol, is_breakout, sector_name, sector_rank)
+          VALUES ${placeholders}
+          ON CONFLICT (scan_date, token) DO NOTHING
+        `, values);
+      }
 
       res.json({ success: true, date, isLive, scanMs: Date.now() - t0, count: data.length, data });
     } catch (err) {
@@ -104,7 +137,7 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
 
     const list = stocks.map(s => ({
       sym: s.sym, token: String(s.token), mother_high: Number(s.mother_high), 
-      sector: s.sector || 'MISC', // Passed from UI
+      sector: s.sector || 'MISC',
       state: 'WAITING',
       armed_high: null,
       triggered: false
@@ -151,14 +184,6 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
         stock.triggered = true;
         const config = data.config || {};
         
-        // FIX: Ensure userId is strictly a string (extract 'admin' from JSON if needed)
-        let safeUserId = userId;
-        try {
-          if (typeof userId === 'string' && userId.startsWith('{')) {
-             safeUserId = JSON.parse(userId).username || JSON.parse(userId).id || 'admin';
-          }
-        } catch(e) {}
-                 
         let sectorName = 'MISC';
         let sectorRank = null;
         try {

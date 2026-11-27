@@ -243,6 +243,8 @@ function render({ data, totalScanned, isLive, scanMs }) {
       <td class="action-cell">${badge}</td>
       <td>₹${fmt(d.mother_high)}</td>
       <td>${d.days_inside}</td>
+      <td>${d.sector_rank || '—'}</td> <!-- NEW COLUMN -->
+
     </tr>`;
   }).join('');
 

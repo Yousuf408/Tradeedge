@@ -275,10 +275,11 @@ $('startAutoBtn').addEventListener('click', async () => {
   }
 
   // Uses the FULL scanData (including ❌ No) so it can monitor them
-  const stocksToTrade = scanData.filter(d => d.is_breakout !== 'Yes').map(d => ({
+   const stocksToTrade = scanData.filter(d => d.is_breakout !== 'Yes').map(d => ({
     sym: d.sym,
     token: d.token,
-    mother_high: d.mother_high
+    mother_high: d.mother_high,
+    sector: d.sector // <-- ADD THIS
   }));
 
   if (stocksToTrade.length === 0) {

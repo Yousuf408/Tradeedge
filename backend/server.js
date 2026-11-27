@@ -2322,6 +2322,7 @@ registerBtstRoutes(app, db, () => {
     const ltp = getCachedLTP(t) ?? bsCache.get(t)?.ltp ?? null;
     const open = bsCache.get(t)?.dayOpen ?? null;
     
+    // Only calculate sectors that actually have stocks with data
     const e = by[sec] || (by[sec] = { sector: sec, sumOpen: 0, nOpen: 0 });
     if (!ltp || !open || open <= 0) continue;
     
@@ -2330,6 +2331,7 @@ registerBtstRoutes(app, db, () => {
     e.nOpen++;
   }
   
+  // Sort sectors by their average open gain %
   const sectors = Object.values(by)
     .map(e => ({ sector: e.sector, avg: e.nOpen ? e.sumOpen / e.nOpen : -999 }))
     .sort((a, b) => b.avg - a.avg);

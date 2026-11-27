@@ -49,9 +49,12 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
           FROM strategy_bs_snapshot
           WHERE day_high IS NOT NULL AND day_low IS NOT NULL AND strategy_id = $2
             AND date BETWEEN ($1::date - 15) AND ($1::date + 3)
-          GROUP BY sym, date
+                GROUP BY sym, date
         )
-        SELECT t.sym, t.token, m.date AS mother_date, m.high AS mother_high, m.low AS mother_low,
+        SELECT t.sym, t.token, 
+          COALESCE((SELECT sector FROM ... WHERE token = t.token LIMIT 1), 'MISC') AS sector,
+          m.date AS mother_date, m.high AS mother_high, m.low AS mother_low,
+          
           t.high AS inside_high, t.low AS inside_low, (t.date - m.date) AS days_inside,
           CASE WHEN t.next_close > m.high THEN ROUND(((t.next_close - m.high) / NULLIF(m.high, 0)) * 100, 2) ELSE NULL END AS change_pct,
           CASE WHEN t.next_close > m.high THEN ROUND(((t.next2_high - m.high) / NULLIF(m.high, 0)) * 100, 2) ELSE NULL END AS t1_pct,

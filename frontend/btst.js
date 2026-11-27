@@ -21,7 +21,18 @@ const getToken = () => {
   return '';
 };
 
-const getUserId = () => localStorage.getItem('ta_user') || localStorage.getItem('username') || 'admin';
+// FIXED: Extracts just the username string, preventing duplicate orders
+const getUserId = () => {
+  let uid = localStorage.getItem('ta_user') || localStorage.getItem('username') || 'admin';
+  try {
+    if (uid.startsWith('{')) {
+      const parsed = JSON.parse(uid);
+      uid = parsed.username || parsed.id || 'admin';
+    }
+  } catch (e) {}
+  return uid;
+};
+
 const $ = id => document.getElementById(id);
 const fmt = (v, d = 2) => v === null || v === undefined ? '—' : Number(v).toFixed(d);
 const pctClass = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';

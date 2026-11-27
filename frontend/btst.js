@@ -122,7 +122,7 @@ function updateLiveUI(ticks) {
 // ─── 3. RUN SCAN ──────────────────────────────────────────
 async function runScan() {
   const date = $('scanDate').value;
-  $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 20px; color: var(--text-muted);">Scanning ${date}... (this may take a few seconds)</td></tr>`;
+  $('tbody').innerHTML = `<tr><td colspan="12" style="text-align:center; padding: 20px; color: var(--text-muted);">Scanning ${date}... (this may take a few seconds)</td></tr>`;
   
   // Stop live monitor if running
   if ($('stopAutoBtn').style.display === 'inline-flex') {
@@ -173,7 +173,7 @@ async function runScan() {
     // Auto-Start Paper Trade if there are setups (Uses the full scanData)
     if (scanData.length > 0 && $('tradeMode').value === 'PAPER') {
       const stocksToTrade = scanData.filter(d => d.is_breakout !== 'Yes').map(d => ({
-        sym: d.sym, token: d.token, mother_high: d.mother_high
+        sym: d.sym, token: d.token, mother_high: d.mother_high, sector: d.sector
       }));
       
       if (stocksToTrade.length > 0 && $('startAutoBtn').style.display !== 'none') {
@@ -182,7 +182,7 @@ async function runScan() {
     }
     
   } catch (e) {
-    $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 20px; color: var(--danger);">Error: ${e.message}</td></tr>`;
+    $('tbody').innerHTML = `<tr><td colspan="12" style="text-align:center; padding: 20px; color: var(--danger);">Error: ${e.message}</td></tr>`;
   }
 }
 
@@ -207,7 +207,7 @@ function render({ data, totalScanned, isLive, scanMs }) {
   `;
 
   if (!data.length) {
-    $('tbody').innerHTML = `<tr><td colspan="11" style="text-align:center; padding: 40px; color: var(--text-muted);">No breakouts found for this date.</td></tr>`;
+    $('tbody').innerHTML = `<tr><td colspan="12" style="text-align:center; padding: 40px; color: var(--text-muted);">No breakouts found for this date.</td></tr>`;
     return;
   }
 
@@ -243,8 +243,7 @@ function render({ data, totalScanned, isLive, scanMs }) {
       <td class="action-cell">${badge}</td>
       <td>₹${fmt(d.mother_high)}</td>
       <td>${d.days_inside}</td>
-      <td>${d.sector_rank || '—'}</td> <!-- NEW COLUMN -->
-
+      <td><strong>${d.sector || '—'}</strong> (${d.sector_rank || '—'})</td>
     </tr>`;
   }).join('');
 
@@ -281,7 +280,7 @@ $('startAutoBtn').addEventListener('click', async () => {
     sym: d.sym,
     token: d.token,
     mother_high: d.mother_high,
-    sector: d.sector // <-- ADD THIS
+    sector: d.sector
   }));
 
   if (stocksToTrade.length === 0) {

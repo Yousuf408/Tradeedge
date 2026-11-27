@@ -92,6 +92,7 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
 
     const list = stocks.map(s => ({
       sym: s.sym, token: String(s.token), mother_high: Number(s.mother_high), 
+      sector: s.sector, // <-- ADD THIS
       state: 'WAITING',
       armed_high: null,
       triggered: false
@@ -138,13 +139,16 @@ export function registerBtstRoutes(app, db, getSectorRanks) {
         stock.triggered = true;
         const config = data.config || {};
         
-        let sectorName = 'UNKNOWN';
+        let sectorName = 'MISC';
         let sectorRank = null;
         try {
           const ranks = getSectorRanks();
+          // Use the real sector name passed from the frontend watchlist
           sectorName = stock.sector || 'MISC'; 
           sectorRank = ranks[sectorName] || null;
-        } catch (e) {}
+        } catch (e) {
+          console.error('Sector Rank error:', e.message);
+        }
 
         const pos = {
           userId, token: tk, sym: stock.sym, qty: config.qty || 1,

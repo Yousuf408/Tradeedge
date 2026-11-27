@@ -421,8 +421,8 @@
 {"sym":"RVNL","token":"9552"},
 {"sym":"SHREECEM","token":"3103","disabled":true},
 {"sym":"TECHNOE","token":"6445"},
-{"sym":"ULTRACEMCO","token":"11532","disabled":true}
-{"sym":"GRASIM","token":"1232"},
+{"sym":"ULTRACEMCO","token":"11532","disabled":true},
+{"sym":"GRASIM","token":"1232"}
 ],
 "CAPITAL_GOODS": [
 {"sym":"ABB","token":"13","disabled":true},
@@ -498,7 +498,7 @@
 {"sym":"SRF","token":"3273"},
 {"sym":"SUMICHEM","token":"17105"},
 {"sym":"TATACHEM","token":"3405"},
-{"sym":"UPL","token":"11287"}
+{"sym":"UPL","token":"11287"},
 {"sym":"SWANCORP","token":"27095"}
 
 ],
@@ -534,5 +534,5 @@
 {"sym":"THELEELA","token":"757014"},
 {"sym":"TRAVELFOOD","token":"757545"},
 {"sym":"URBANCO","token":"759084"}
-],
+]
 }
